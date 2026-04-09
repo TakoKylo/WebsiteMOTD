@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>WebsiteMOTD</AssemblyName>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <OutputPath>C:\Program Files (x86)\Steam\steamapps\common\Puck\Plugins\WebsiteMOTD\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <Description>Website MOTD - Shows a rules webpage when players join</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Reference game DLLs from libs/ without copying them to output -->
+    <Libs Include="libs\*.dll" Exclude="libs\System.*.dll" />
+    <Reference Include="@(Libs)">
+      <HintPath>%(Libs.FullPath)</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

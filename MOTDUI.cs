@@ -29,6 +29,12 @@ namespace WebsiteMOTD
         private static readonly List<Coroutine>     _gifCoroutines = new List<Coroutine>();
         private static string _homeUrl;
 
+        // ── WebView mode ──
+        private static MOTDWebView _webView;
+        private static VisualElement _webViewElement;
+        private static bool _useWebView;
+        private static Button _webViewToggleBtn;
+
         public static bool IsVisible => _isVisible;
 
         // ─── Public API ─────────────────────────────────────────────
@@ -78,6 +84,7 @@ namespace WebsiteMOTD
                 _history.Clear();
                 _forwardHistory.Clear();
                 CleanupVideoHosts();
+                CleanupWebView();
                 UnityEngine.Cursor.visible = true;
                 UnityEngine.Cursor.lockState = CursorLockMode.None;
                 _isVisible = false;
@@ -112,6 +119,15 @@ namespace WebsiteMOTD
             UpdateBackButton();
             UpdateForwardButton();
             ClearContent();
+
+            // ── WebView mode: let the real browser handle everything ──
+            if (_useWebView && _webView != null)
+            {
+                EnsureWebViewVisible();
+                _webView.LoadURL(url);
+                Plugin.Log("WebView navigating to: " + url);
+                return;
+            }
 
             // ── Direct image URL → show it inline without HTML parsing ──
             if (IsDirectImageUrl(url))
@@ -296,6 +312,11 @@ namespace WebsiteMOTD
 
         private static void GoBack()
         {
+            if (_useWebView && _webView != null)
+            {
+                _webView.GoBack();
+                return;
+            }
             if (_history.Count == 0) return;
             if (!string.IsNullOrEmpty(_url))
                 _forwardHistory.Push(_url);
@@ -333,6 +354,11 @@ namespace WebsiteMOTD
 
         private static void GoForward()
         {
+            if (_useWebView && _webView != null)
+            {
+                _webView.GoForward();
+                return;
+            }
             if (_forwardHistory.Count == 0) return;
             if (!string.IsNullOrEmpty(_url))
                 _history.Push(_url);
@@ -392,6 +418,129 @@ namespace WebsiteMOTD
             CleanupVideoHosts();
             _contentArea.Clear();
             _statusLabel = null;
+
+            // Hide webview element when clearing for HTML mode
+            if (_webViewElement != null && !_useWebView)
+                _webViewElement.style.display = DisplayStyle.None;
+        }
+
+        // ─── WebView Mode ──────────────────────────────────────────
+
+        private static void ToggleWebViewMode()
+        {
+            if (_useWebView)
+            {
+                // Switch back to HTML parser mode
+                _useWebView = false;
+                HideWebViewElement();
+                if (_scrollView != null)
+                    _scrollView.style.display = DisplayStyle.Flex;
+                UpdateWebViewToggleButton();
+                // Re-navigate in HTML mode
+                if (!string.IsNullOrEmpty(_url))
+                    NavigateTo(_url, addToHistory: false);
+            }
+            else
+            {
+                // Switch to WebView mode
+                if (!InitWebViewIfNeeded())
+                {
+                    Plugin.LogError("WebView not available — WebView.dll not found.");
+                    return;
+                }
+                _useWebView = true;
+                if (_scrollView != null)
+                    _scrollView.style.display = DisplayStyle.None;
+                EnsureWebViewVisible();
+                UpdateWebViewToggleButton();
+                if (!string.IsNullOrEmpty(_url))
+                    _webView.LoadURL(_url);
+            }
+        }
+
+        private static bool InitWebViewIfNeeded()
+        {
+            if (_webView != null) return true;
+            if (!MOTDWebView.PreloadNativeDLL()) return false;
+
+            // Create the VisualElement that will display the webview texture
+            _webViewElement = new VisualElement();
+            _webViewElement.name = "WebViewDisplay";
+            _webViewElement.style.flexGrow = 1f;
+            _webViewElement.style.display = DisplayStyle.None;
+            _webViewElement.style.backgroundPositionX = new BackgroundPosition(BackgroundPositionKeyword.Center);
+            _webViewElement.style.backgroundPositionY = new BackgroundPosition(BackgroundPositionKeyword.Center);
+            _webViewElement.style.backgroundSize = new BackgroundSize(BackgroundSizeType.Contain);
+
+            // Insert webview element as sibling to scrollview (inside the card)
+            if (_scrollView != null && _scrollView.parent != null)
+                _scrollView.parent.Insert(_scrollView.parent.IndexOf(_scrollView) + 1, _webViewElement);
+
+            // Create the webview — use a reasonable default size, will be updated
+            _webView = MOTDWebView.Create(
+                _webViewElement,
+                1280, 800,
+                onLoaded: url =>
+                {
+                    Plugin.Log("WebView loaded: " + url);
+                    if (_urlField != null && _useWebView)
+                        _urlField.value = url;
+                },
+                onStarted: url =>
+                {
+                    Plugin.Log("WebView started: " + url);
+                },
+                onError: err =>
+                {
+                    Plugin.LogError("WebView error: " + err);
+                }
+            );
+
+            return _webView != null;
+        }
+
+        private static void EnsureWebViewVisible()
+        {
+            if (_webViewElement != null)
+                _webViewElement.style.display = DisplayStyle.Flex;
+            if (_scrollView != null)
+                _scrollView.style.display = DisplayStyle.None;
+        }
+
+        private static void HideWebViewElement()
+        {
+            if (_webViewElement != null)
+                _webViewElement.style.display = DisplayStyle.None;
+        }
+
+        private static void CleanupWebView()
+        {
+            _useWebView = false;
+            if (_webView != null)
+            {
+                _webView.Cleanup();
+                _webView = null;
+            }
+            if (_webViewElement != null)
+            {
+                _webViewElement.RemoveFromHierarchy();
+                _webViewElement = null;
+            }
+        }
+
+        private static void UpdateWebViewToggleButton()
+        {
+            if (_webViewToggleBtn == null) return;
+            if (_useWebView)
+            {
+                _webViewToggleBtn.text = "HTML Mode";
+                _webViewToggleBtn.style.backgroundColor = new Color(0.3f, 0.55f, 0.3f);
+            }
+            else
+            {
+                _webViewToggleBtn.text = "WebView";
+                _webViewToggleBtn.style.backgroundColor = new Color(0.5f, 0.3f, 0.6f);
+            }
         }
 
         private static void CleanupVideoHosts()
@@ -698,6 +847,16 @@ namespace WebsiteMOTD
             goBtn.style.height = 28f;
             goBtn.style.marginRight = 6f;
             titleBar.Add(goBtn);
+
+            // WebView toggle button
+            _webViewToggleBtn = CreateStyledButton("WebView", new Color(0.5f, 0.3f, 0.6f), ToggleWebViewMode);
+            _webViewToggleBtn.style.paddingLeft  = 8f;
+            _webViewToggleBtn.style.paddingRight = 8f;
+            _webViewToggleBtn.style.height = 28f;
+            _webViewToggleBtn.style.marginRight = 6f;
+            _webViewToggleBtn.style.fontSize = 11f;
+            titleBar.Add(_webViewToggleBtn);
+            UpdateWebViewToggleButton();
 
             // Close button
             var closeBtn = new Button(Hide);

@@ -16,6 +16,7 @@ using System;
 using System.IO;
 using System.Runtime.InteropServices;
 using UnityEngine;
+using UnityEngine.InputSystem;
 using UnityEngine.Rendering;
 using UnityEngine.UIElements;
 
@@ -78,6 +79,10 @@ namespace WebsiteMOTD
         private static extern void _CWebViewPlugin_Render(IntPtr instance, IntPtr textureBuffer);
         [DllImport("WebView")]
         private static extern string _CWebViewPlugin_GetMessage(IntPtr instance);
+        [DllImport("WebView")]
+        private static extern ulong _CWebViewPlugin_BitmapGeneration(IntPtr instance);
+        [DllImport("WebView")]
+        private static extern ulong _CWebViewPlugin_LastInteractionTick(IntPtr instance);
 
         // ─── State ─────────────────────────────────────────────────
         private IntPtr _webView = IntPtr.Zero;
@@ -85,11 +90,11 @@ namespace WebsiteMOTD
         private byte[] _textureDataBuffer;
         private bool _visible = true;
         private bool _hasFocus;
-        private string _inputString = "";
         private int _viewWidth;
         private int _viewHeight;
+        private ulong _lastBitmapGen;   // skip texture upload when bitmap hasn't changed
+        private float _lastInteractTime; // Unity time of last mouse/key input
 
-        // UI Toolkit target element where the web content is displayed
         private VisualElement _targetElement;
 
         // Callbacks
@@ -187,6 +192,17 @@ namespace WebsiteMOTD
             return wv;
         }
 
+        private void OnTextInput(char c)
+        {
+            if (!_hasFocus || _webView == IntPtr.Zero) return;
+            // Skip control characters handled by PollKeyboard
+            if (c == '\b' || c == '\r' || c == '\n' || c == '\t' || c == '\x1b') return;
+            _lastInteractTime = Time.unscaledTime;
+            // Send character only via keyChars; the native side derives the virtual key
+            // via VkKeyScanW and sends the full WM_KEYDOWN → WM_CHAR → WM_KEYUP sequence.
+            _CWebViewPlugin_SendKeyEvent(_webView, 0, 0, c.ToString(), 0, 1);
+        }
+
         private void InitWebView()
         {
             if (!_staticInitDone)
@@ -227,10 +243,14 @@ namespace WebsiteMOTD
             _targetElement.RegisterCallback<PointerMoveEvent>(OnPointerMove);
             _targetElement.RegisterCallback<PointerUpEvent>(OnPointerUp);
             _targetElement.RegisterCallback<WheelEvent>(OnWheel);
-            _targetElement.RegisterCallback<KeyDownEvent>(OnKeyDown);
+            // Capture ALL key events at the panel level so game binds can't fire while webview has focus
+            _targetElement.RegisterCallback<KeyDownEvent>(OnKeyDown, TrickleDown.TrickleDown);
+            _targetElement.RegisterCallback<KeyUpEvent>(OnKeyUp, TrickleDown.TrickleDown);
 
-            // Make focusable so we can receive key events
             _targetElement.focusable = true;
+
+            if (Keyboard.current != null)
+                Keyboard.current.onTextInput += OnTextInput;
         }
 
         private (int x, int y) ToWebViewCoords(Vector2 localPos)
@@ -240,6 +260,9 @@ namespace WebsiteMOTD
             if (elW <= 0) elW = _viewWidth;
             if (elH <= 0) elH = _viewHeight;
 
+            // localPosition is pre-transform (before scaleY(-1)), so y=0 is layout top.
+            // WebView2 DLL expects y=0 at bottom (matching Unity screen coords).
+            // With scaleY(-1), layout y=0 IS the visual bottom = WebView y=0, so map directly.
             int x = Mathf.Clamp((int)(localPos.x / elW * _viewWidth), 0, _viewWidth);
             int y = Mathf.Clamp((int)(localPos.y / elH * _viewHeight), 0, _viewHeight);
             return (x, y);
@@ -249,6 +272,7 @@ namespace WebsiteMOTD
         {
             if (_webView == IntPtr.Zero) return;
             _hasFocus = true;
+            _lastInteractTime = Time.unscaledTime;
             _targetElement.Focus();
             var (x, y) = ToWebViewCoords(evt.localPosition);
             _CWebViewPlugin_SendMouseEvent(_webView, x, y, 0f, 1); // 1 = down
@@ -259,6 +283,7 @@ namespace WebsiteMOTD
         private void OnPointerMove(PointerMoveEvent evt)
         {
             if (_webView == IntPtr.Zero) return;
+            _lastInteractTime = Time.unscaledTime;
             var (x, y) = ToWebViewCoords(evt.localPosition);
             int state = _targetElement.HasPointerCapture(evt.pointerId) ? 2 : 0; // 2 = drag, 0 = move
             _CWebViewPlugin_SendMouseEvent(_webView, x, y, 0f, state);
@@ -277,6 +302,7 @@ namespace WebsiteMOTD
         private void OnWheel(WheelEvent evt)
         {
             if (_webView == IntPtr.Zero || !_hasFocus) return;
+            _lastInteractTime = Time.unscaledTime;
             var (x, y) = ToWebViewCoords(evt.localMousePosition);
             _CWebViewPlugin_SendMouseEvent(_webView, x, y, -evt.delta.y, 0);
             evt.StopPropagation();
@@ -284,12 +310,35 @@ namespace WebsiteMOTD
 
         private void OnKeyDown(KeyDownEvent evt)
         {
-            if (_webView == IntPtr.Zero || !_hasFocus) return;
-            char c = evt.character;
-            if (c == 0) return;
-            string keyChars = c.ToString();
-            ushort keyCode = (ushort)c;
-            _CWebViewPlugin_SendKeyEvent(_webView, 0, 0, keyChars, keyCode, 1);
+            if (!_hasFocus) return;
+            // Consume so UI Toolkit doesn't propagate — actual characters come via onTextInput
+            evt.StopPropagation();
+        }
+
+        private void OnKeyUp(KeyUpEvent evt)
+        {
+            if (!_hasFocus) return;
+            evt.StopPropagation();
+        }
+
+        /// <summary>
+        /// Polls the new Input System keyboard for text input each frame
+        /// and forwards characters to the WebView.
+        /// </summary>
+        private void PollKeyboard()
+        {
+            if (!_hasFocus || _webView == IntPtr.Zero) return;
+            var kb = Keyboard.current;
+            if (kb == null) return;
+
+            if (kb.backspaceKey.wasPressedThisFrame)
+            { _lastInteractTime = Time.unscaledTime; _CWebViewPlugin_SendKeyEvent(_webView, 0, 0, "", 8, 1); }
+            if (kb.enterKey.wasPressedThisFrame)
+            { _lastInteractTime = Time.unscaledTime; _CWebViewPlugin_SendKeyEvent(_webView, 0, 0, "\n", 13, 1); }
+            if (kb.tabKey.wasPressedThisFrame)
+            { _lastInteractTime = Time.unscaledTime; _CWebViewPlugin_SendKeyEvent(_webView, 0, 0, "\t", 9, 1); }
+            if (kb.escapeKey.wasPressedThisFrame)
+            { _lastInteractTime = Time.unscaledTime; _CWebViewPlugin_SendKeyEvent(_webView, 0, 0, "", 27, 1); }
         }
 
         // ─── Public API ─────────────────────────────────────────────
@@ -297,6 +346,7 @@ namespace WebsiteMOTD
         public void LoadURL(string url)
         {
             if (_webView == IntPtr.Zero) return;
+            _lastInteractTime = Time.unscaledTime;
             Plugin.Log("WebView loading: " + url);
             _CWebViewPlugin_LoadURL(_webView, url);
         }
@@ -341,15 +391,19 @@ namespace WebsiteMOTD
 
         // ─── Per-frame update ───────────────────────────────────────
 
+        // Refresh rate tiers based on how recently the user interacted
+        private const float ActiveWindowSec  = 1.0f;  // full-speed capture for 1s after input
+        private const float WindDownSec      = 3.0f;  // half-speed capture for next 2s
+        // After WindDownSec: low-rate (4fps) to catch CSS animations / async content
+
         void Update()
         {
             if (_webView == IntPtr.Zero) return;
 
-            // Collect keyboard input from legacy Input system as backup
-            if (_hasFocus)
-                _inputString += Input.inputString;
+            // Poll keyboard for special keys
+            PollKeyboard();
 
-            // Pump message queue
+            // Pump message queue (always — even when not refreshing bitmap)
             for (;;)
             {
                 string s = _CWebViewPlugin_GetMessage(_webView);
@@ -360,23 +414,45 @@ namespace WebsiteMOTD
                 string body = s.Substring(sep + 1);
                 switch (type)
                 {
-                    case "CallFromJS":   _onJS?.Invoke(body); break;
-                    case "CallOnError":  _onError?.Invoke(body); break;
-                    case "CallOnLoaded": _onLoaded?.Invoke(body); break;
-                    case "CallOnStarted": _onStarted?.Invoke(body); break;
+                    case "CallFromJS":    _onJS?.Invoke(body); break;
+                    case "CallOnError":   _onError?.Invoke(body); break;
+                    case "CallOnLoaded":
+                        _lastInteractTime = Time.unscaledTime; // page loaded — capture it
+                        _onLoaded?.Invoke(body);
+                        break;
+                    case "CallOnStarted":
+                        _lastInteractTime = Time.unscaledTime;
+                        _onStarted?.Invoke(body);
+                        break;
                 }
             }
 
             if (!_visible) return;
 
-            // Refresh bitmap every frame (1) for smooth rendering
-            _CWebViewPlugin_Update(_webView, true, 1);
+            // Decide whether to request a new bitmap capture this frame.
+            // Active interaction → every frame.  Winding down → every 2nd frame.  Idle → every 15th frame (~4fps).
+            float idleSec = Time.unscaledTime - _lastInteractTime;
+            bool shouldRefresh;
+            if (idleSec < ActiveWindowSec)
+                shouldRefresh = true;                              // full speed
+            else if (idleSec < WindDownSec)
+                shouldRefresh = (Time.frameCount % 2 == 0);       // ~30fps
+            else
+                shouldRefresh = (Time.frameCount % 15 == 0);      // ~4fps idle
+
+            _CWebViewPlugin_Update(_webView, shouldRefresh, 1);
+
+            if (!shouldRefresh) return;
+
+            // Check if the native bitmap actually changed since last upload
+            ulong gen = _CWebViewPlugin_BitmapGeneration(_webView);
+            if (gen == _lastBitmapGen) return; // nothing new — skip texture upload entirely
 
             int w = _CWebViewPlugin_BitmapWidth(_webView);
             int h = _CWebViewPlugin_BitmapHeight(_webView);
             if (w <= 0 || h <= 0) return;
 
-            // (Re)create texture if size changed
+            // Recreate texture only when size changes
             if (_texture == null || _texture.width != w || _texture.height != h)
             {
                 if (_texture != null) Destroy(_texture);
@@ -385,33 +461,22 @@ namespace WebsiteMOTD
                 _texture.filterMode = FilterMode.Bilinear;
                 _texture.wrapMode = TextureWrapMode.Clamp;
                 _textureDataBuffer = new byte[w * h * 4];
-            }
-
-            // Render to buffer and apply
-            if (_textureDataBuffer != null && _textureDataBuffer.Length > 0)
-            {
-                var gch = GCHandle.Alloc(_textureDataBuffer, GCHandleType.Pinned);
-                _CWebViewPlugin_Render(_webView, gch.AddrOfPinnedObject());
-                gch.Free();
-                _texture.LoadRawTextureData(_textureDataBuffer);
-                _texture.Apply();
-
-                // Update the UI Toolkit background
                 if (_targetElement != null)
-                {
                     _targetElement.style.backgroundImage = new StyleBackground(_texture);
-                }
             }
 
-            // Send buffered keyboard input
-            while (!string.IsNullOrEmpty(_inputString))
-            {
-                var keyChars = _inputString.Substring(0, 1);
-                var keyCode = (ushort)_inputString[0];
-                _inputString = _inputString.Substring(1);
-                if (keyCode != 0)
-                    _CWebViewPlugin_SendKeyEvent(_webView, 0, 0, keyChars, keyCode, 1);
-            }
+            if (_textureDataBuffer == null) return;
+
+            // Copy bitmap from native, upload to GPU
+            var gch = GCHandle.Alloc(_textureDataBuffer, GCHandleType.Pinned);
+            _CWebViewPlugin_Render(_webView, gch.AddrOfPinnedObject());
+            gch.Free();
+
+            _texture.LoadRawTextureData(_textureDataBuffer);
+            _texture.Apply(false);
+            _lastBitmapGen = gen;
+
+            _targetElement?.MarkDirtyRepaint();
         }
 
         // ─── Cleanup ────────────────────────────────────────────────
@@ -424,10 +489,14 @@ namespace WebsiteMOTD
                 _targetElement.UnregisterCallback<PointerMoveEvent>(OnPointerMove);
                 _targetElement.UnregisterCallback<PointerUpEvent>(OnPointerUp);
                 _targetElement.UnregisterCallback<WheelEvent>(OnWheel);
-                _targetElement.UnregisterCallback<KeyDownEvent>(OnKeyDown);
+                _targetElement.UnregisterCallback<KeyDownEvent>(OnKeyDown, TrickleDown.TrickleDown);
+                _targetElement.UnregisterCallback<KeyUpEvent>(OnKeyUp, TrickleDown.TrickleDown);
                 _targetElement.style.backgroundImage = new StyleBackground();
                 _targetElement = null;
             }
+
+            if (Keyboard.current != null)
+                Keyboard.current.onTextInput -= OnTextInput;
 
             if (_webView != IntPtr.Zero)
             {

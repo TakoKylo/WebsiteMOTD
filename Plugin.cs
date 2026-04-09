@@ -1,5 +1,6 @@
 using System;
 using System.Text;
+using HarmonyLib;
 using Steamworks;
 using Unity.Collections;
 using Unity.Netcode;
@@ -11,6 +12,8 @@ namespace WebsiteMOTD
     {
         public static string MOD_NAME = "WebsiteMOTD";
         public static string MOD_VERSION = "1.0.0";
+
+        private Harmony _harmony;
 
         /// <summary>
         /// The URL shown in the MOTD overlay when clients connect.
@@ -27,6 +30,10 @@ namespace WebsiteMOTD
             Log("Enabling v" + MOD_VERSION + "...");
             try
             {
+                _harmony = new Harmony("WebsiteMOTD");
+                _harmony.PatchAll();
+                Log("Harmony patches applied.");
+
                 Setup();
                 Log("Enabled!");
                 return true;
@@ -43,6 +50,7 @@ namespace WebsiteMOTD
             try
             {
                 Log("Disabling...");
+                _harmony?.UnpatchSelf();
                 Teardown();
                 Log("Disabled!");
                 return true;
@@ -104,6 +112,7 @@ namespace WebsiteMOTD
             if (!IsDedicatedServer())
             {
                 MOTDUI.Hide();
+                MOTDWorldScreen.DestroyScreens();
             }
 
             MOTDWebContent.Cleanup();
@@ -206,6 +215,10 @@ namespace WebsiteMOTD
                 if (!IsDedicatedServer())
                 {
                     MOTDUI.Show(url);
+
+                    // Spawn world screens behind the goals
+                    MOTDWorldScreen.SpawnScreens();
+                    MOTDWorldScreen.LoadOnAllScreens(url);
                 }
             }
             catch (Exception ex)
@@ -229,6 +242,43 @@ namespace WebsiteMOTD
         public static void LogError(string message)
         {
             Debug.LogError("[" + MOD_NAME + "] " + message);
+        }
+    }
+
+    /// <summary>
+    /// Client-side chat command interceptor.
+    /// Catches /web before it's sent to the server.
+    /// </summary>
+    [HarmonyPatch(typeof(ChatManager), "Client_SendChatMessage")]
+    public static class ChatCommandPatch
+    {
+        public static bool Prefix(string content)
+        {
+            if (string.IsNullOrEmpty(content)) return true;
+            string msg = content.Trim();
+            if (!msg.StartsWith("/")) return true;
+
+            string[] parts = msg.Split(new[] { ' ' }, 2, StringSplitOptions.RemoveEmptyEntries);
+            string cmd = parts[0].ToLowerInvariant();
+
+            if (cmd == "/web" || cmd == "/motd" || cmd == "/browser")
+            {
+                string url = parts.Length > 1 ? parts[1].Trim() : Plugin.MOTD_URL;
+                Plugin.Log("Chat command: opening browser for " + url);
+                MOTDUI.Show(url);
+                return false;
+            }
+
+            if (cmd == "/screen")
+            {
+                string url = parts.Length > 1 ? parts[1].Trim() : Plugin.MOTD_URL;
+                Plugin.Log("Chat command: loading world screens for " + url);
+                MOTDWorldScreen.SpawnScreens();
+                MOTDWorldScreen.LoadOnAllScreens(url);
+                return false;
+            }
+
+            return true; // let all other messages through
         }
     }
 }

@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using Steamworks;
 using UnityEngine;
 using UnityEngine.UIElements;
@@ -35,6 +36,11 @@ namespace WebsiteMOTD
         private static bool _useWebView;
         private static Button _webViewToggleBtn;
 
+        // ── Site confirmation ──
+        private static HashSet<string> _trustedDomains;
+        private static string _trustedDomainsPath;
+        private static VisualElement _confirmOverlay; // the confirmation dialog
+
         public static bool IsVisible => _isVisible;
 
         // ─── Public API ─────────────────────────────────────────────
@@ -43,6 +49,29 @@ namespace WebsiteMOTD
         {
             if (Application.isBatchMode) return;
 
+            url = (url ?? "").Trim();
+            if (!url.StartsWith("http://") && !url.StartsWith("https://"))
+                url = "https://" + url;
+
+            string domain = GetDomain(url);
+            LoadTrustedDomains();
+
+            // If this domain is already trusted, go straight to the browser
+            if (_trustedDomains.Contains(domain))
+            {
+                ShowConfirmed(url);
+                return;
+            }
+
+            // Otherwise, show a confirmation dialog first
+            ShowConfirmDialog(url, domain);
+        }
+
+        /// <summary>
+        /// Actually show the MOTD overlay after the user has approved (or the domain was trusted).
+        /// </summary>
+        private static void ShowConfirmed(string url)
+        {
             _url = url;
             _homeUrl = url;
             _history.Clear();
@@ -57,6 +86,7 @@ namespace WebsiteMOTD
             }
 
             _overlay?.RemoveFromHierarchy();
+            _confirmOverlay?.RemoveFromHierarchy();
 
             Build();
             root.Add(_overlay);
@@ -66,11 +96,25 @@ namespace WebsiteMOTD
             _isVisible = true;
 
             Plugin.Log("MOTD overlay shown for URL: " + url);
+
+            // Start in WebView mode by default if available
+            if (InitWebViewIfNeeded())
+            {
+                _useWebView = true;
+                EnsureWebViewVisible();
+                UpdateWebViewToggleButton();
+            }
+
             NavigateTo(url, addToHistory: false);
         }
 
         public static void Hide()
         {
+            if (_confirmOverlay != null)
+            {
+                _confirmOverlay.RemoveFromHierarchy();
+                _confirmOverlay = null;
+            }
             if (_overlay != null)
             {
                 _overlay.RemoveFromHierarchy();
@@ -468,18 +512,23 @@ namespace WebsiteMOTD
             _webViewElement.name = "WebViewDisplay";
             _webViewElement.style.flexGrow = 1f;
             _webViewElement.style.display = DisplayStyle.None;
-            _webViewElement.style.backgroundPositionX = new BackgroundPosition(BackgroundPositionKeyword.Center);
-            _webViewElement.style.backgroundPositionY = new BackgroundPosition(BackgroundPositionKeyword.Center);
-            _webViewElement.style.backgroundSize = new BackgroundSize(BackgroundSizeType.Contain);
+            // Stretch to fill — webview aspect ratio is set to match the card
+            _webViewElement.style.backgroundSize = new BackgroundSize(new Length(100f, LengthUnit.Percent), new Length(100f, LengthUnit.Percent));
+            // Flip Y: WebView2 bitmap is top-down, Unity texture row 0 is bottom
+            _webViewElement.style.scale = new StyleScale(new Scale(new Vector3(1f, -1f, 1f)));
 
             // Insert webview element as sibling to scrollview (inside the card)
             if (_scrollView != null && _scrollView.parent != null)
                 _scrollView.parent.Insert(_scrollView.parent.IndexOf(_scrollView) + 1, _webViewElement);
 
-            // Create the webview — use a reasonable default size, will be updated
+            // Match WebView resolution to player's display resolution
+            int wvWidth = Screen.width;
+            int wvHeight = Screen.height;
+            Plugin.Log("WebView resolution: " + wvWidth + "x" + wvHeight);
+
             _webView = MOTDWebView.Create(
                 _webViewElement,
-                1280, 800,
+                wvWidth, wvHeight,
                 onLoaded: url =>
                 {
                     Plugin.Log("WebView loaded: " + url);
@@ -526,6 +575,200 @@ namespace WebsiteMOTD
                 _webViewElement.RemoveFromHierarchy();
                 _webViewElement = null;
             }
+        }
+
+        // ─── Site Confirmation Dialog ───────────────────────────────
+
+        private static string GetDomain(string url)
+        {
+            try
+            {
+                var uri = new Uri(url);
+                return uri.Host.ToLowerInvariant();
+            }
+            catch { return url; }
+        }
+
+        private static void LoadTrustedDomains()
+        {
+            if (_trustedDomains != null) return;
+            _trustedDomains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            string modDir = Path.GetDirectoryName(typeof(MOTDUI).Assembly.Location) ?? "";
+            _trustedDomainsPath = Path.Combine(modDir, "trusted_sites.txt");
+
+            if (File.Exists(_trustedDomainsPath))
+            {
+                try
+                {
+                    foreach (string line in File.ReadAllLines(_trustedDomainsPath))
+                    {
+                        string d = line.Trim();
+                        if (!string.IsNullOrEmpty(d) && !d.StartsWith("#"))
+                            _trustedDomains.Add(d);
+                    }
+                    Plugin.Log("Loaded " + _trustedDomains.Count + " trusted domains.");
+                }
+                catch (Exception ex)
+                {
+                    Plugin.LogError("Failed to load trusted_sites.txt: " + ex.Message);
+                }
+            }
+        }
+
+        private static void SaveTrustedDomain(string domain)
+        {
+            _trustedDomains.Add(domain);
+            try
+            {
+                File.AppendAllText(_trustedDomainsPath, domain + Environment.NewLine);
+                Plugin.Log("Saved trusted domain: " + domain);
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("Failed to save trusted domain: " + ex.Message);
+            }
+        }
+
+        private static void ShowConfirmDialog(string url, string domain)
+        {
+            var uiManager = MonoBehaviourSingleton<UIManager>.Instance;
+            var root = uiManager?.RootVisualElement;
+            if (root == null) return;
+
+            _confirmOverlay?.RemoveFromHierarchy();
+
+            // Full-screen dark backdrop
+            _confirmOverlay = new VisualElement();
+            _confirmOverlay.style.position = Position.Absolute;
+            _confirmOverlay.style.left = 0f;
+            _confirmOverlay.style.top = 0f;
+            _confirmOverlay.style.right = 0f;
+            _confirmOverlay.style.bottom = 0f;
+            _confirmOverlay.style.alignItems = Align.Center;
+            _confirmOverlay.style.justifyContent = Justify.Center;
+            _confirmOverlay.style.backgroundColor = new Color(0f, 0f, 0f, 0.85f);
+
+            // Dialog card
+            var dialog = new VisualElement();
+            dialog.style.width = 520f;
+            dialog.style.backgroundColor = new Color(0.12f, 0.12f, 0.14f, 0.98f);
+            dialog.style.borderTopLeftRadius = 10f;
+            dialog.style.borderTopRightRadius = 10f;
+            dialog.style.borderBottomLeftRadius = 10f;
+            dialog.style.borderBottomRightRadius = 10f;
+            dialog.style.paddingLeft = 28f;
+            dialog.style.paddingRight = 28f;
+            dialog.style.paddingTop = 24f;
+            dialog.style.paddingBottom = 24f;
+            dialog.style.borderTopWidth = 1f;
+            dialog.style.borderBottomWidth = 1f;
+            dialog.style.borderLeftWidth = 1f;
+            dialog.style.borderRightWidth = 1f;
+            dialog.style.borderTopColor = new Color(0.35f, 0.35f, 0.4f);
+            dialog.style.borderBottomColor = new Color(0.35f, 0.35f, 0.4f);
+            dialog.style.borderLeftColor = new Color(0.35f, 0.35f, 0.4f);
+            dialog.style.borderRightColor = new Color(0.35f, 0.35f, 0.4f);
+            _confirmOverlay.Add(dialog);
+
+            // Shield icon + title
+            var title = new Label("Website Confirmation");
+            title.style.fontSize = 20f;
+            title.style.color = new Color(1f, 1f, 1f);
+            title.style.unityFontStyleAndWeight = FontStyle.Bold;
+            title.style.unityTextAlign = TextAnchor.MiddleCenter;
+            title.style.marginBottom = 16f;
+            dialog.Add(title);
+
+            // Warning message
+            var msg = new Label("The server wants to open a webpage in the MOTD browser:");
+            msg.style.fontSize = 14f;
+            msg.style.color = new Color(0.8f, 0.8f, 0.8f);
+            msg.style.whiteSpace = WhiteSpace.Normal;
+            msg.style.marginBottom = 10f;
+            dialog.Add(msg);
+
+            // URL display
+            var urlLabel = new Label(url);
+            urlLabel.style.fontSize = 13f;
+            urlLabel.style.color = new Color(0.5f, 0.8f, 1f);
+            urlLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
+            urlLabel.style.whiteSpace = WhiteSpace.Normal;
+            urlLabel.style.overflow = Overflow.Hidden;
+            urlLabel.style.backgroundColor = new Color(0.06f, 0.06f, 0.08f);
+            urlLabel.style.borderTopLeftRadius = 4f;
+            urlLabel.style.borderTopRightRadius = 4f;
+            urlLabel.style.borderBottomLeftRadius = 4f;
+            urlLabel.style.borderBottomRightRadius = 4f;
+            urlLabel.style.paddingLeft = 10f;
+            urlLabel.style.paddingRight = 10f;
+            urlLabel.style.paddingTop = 8f;
+            urlLabel.style.paddingBottom = 8f;
+            urlLabel.style.marginBottom = 16f;
+            dialog.Add(urlLabel);
+
+            // "Don't ask again" toggle
+            bool dontAskAgain = false;
+            var toggleRow = new VisualElement();
+            toggleRow.style.flexDirection = FlexDirection.Row;
+            toggleRow.style.alignItems = Align.Center;
+            toggleRow.style.marginBottom = 20f;
+
+            var toggle = new Toggle();
+            toggle.value = false;
+            toggle.style.marginRight = 8f;
+            toggle.RegisterValueChangedCallback(e => dontAskAgain = e.newValue);
+            toggleRow.Add(toggle);
+
+            var toggleLabel = new Label("Don't ask again for " + domain);
+            toggleLabel.style.fontSize = 13f;
+            toggleLabel.style.color = new Color(0.7f, 0.7f, 0.7f);
+            toggleRow.Add(toggleLabel);
+            dialog.Add(toggleRow);
+
+            // Button row
+            var btnRow = new VisualElement();
+            btnRow.style.flexDirection = FlexDirection.Row;
+            btnRow.style.justifyContent = Justify.Center;
+
+            // Allow button
+            var allowBtn = CreateStyledButton("Open Website", new Color(0.2f, 0.5f, 0.3f), () =>
+            {
+                if (dontAskAgain)
+                    SaveTrustedDomain(domain);
+                _confirmOverlay?.RemoveFromHierarchy();
+                _confirmOverlay = null;
+                ShowConfirmed(url);
+            });
+            allowBtn.style.paddingLeft = 24f;
+            allowBtn.style.paddingRight = 24f;
+            allowBtn.style.paddingTop = 10f;
+            allowBtn.style.paddingBottom = 10f;
+            allowBtn.style.height = 38f;
+            allowBtn.style.fontSize = 15f;
+            allowBtn.style.marginRight = 12f;
+            btnRow.Add(allowBtn);
+
+            // Deny button
+            var denyBtn = CreateStyledButton("Deny", new Color(0.5f, 0.2f, 0.2f), () =>
+            {
+                Plugin.Log("User denied MOTD for: " + url);
+                _confirmOverlay?.RemoveFromHierarchy();
+                _confirmOverlay = null;
+            });
+            denyBtn.style.paddingLeft = 24f;
+            denyBtn.style.paddingRight = 24f;
+            denyBtn.style.paddingTop = 10f;
+            denyBtn.style.paddingBottom = 10f;
+            denyBtn.style.height = 38f;
+            denyBtn.style.fontSize = 15f;
+            btnRow.Add(denyBtn);
+
+            dialog.Add(btnRow);
+
+            UnityEngine.Cursor.visible = true;
+            UnityEngine.Cursor.lockState = CursorLockMode.None;
+            root.Add(_confirmOverlay);
         }
 
         private static void UpdateWebViewToggleButton()
@@ -698,9 +941,9 @@ namespace WebsiteMOTD
             _overlay.style.backgroundColor = new Color(0f, 0f, 0f, 0.75f);
 
             var card = new VisualElement();
-            card.style.width  = new Length(75f, LengthUnit.Percent);
-            card.style.maxWidth  = 1000f;
-            card.style.height = new Length(82f, LengthUnit.Percent);
+            card.style.width  = new Length(88f, LengthUnit.Percent);
+            card.style.maxWidth  = 1600f;
+            card.style.height = new Length(88f, LengthUnit.Percent);
             card.style.backgroundColor       = new Color(0.10f, 0.10f, 0.12f, 0.98f);
             card.style.borderTopLeftRadius    = 10f;
             card.style.borderTopRightRadius   = 10f;
@@ -765,7 +1008,9 @@ namespace WebsiteMOTD
             // Refresh button
             var refreshBtn = CreateStyledButton("\u21BB", new Color(0.25f, 0.25f, 0.3f), () =>
             {
-                if (!string.IsNullOrEmpty(_url))
+                if (_useWebView && _webView != null)
+                    _webView.Reload();
+                else if (!string.IsNullOrEmpty(_url))
                     NavigateTo(_url, addToHistory: false);
             });
             refreshBtn.style.paddingLeft  = 10f;

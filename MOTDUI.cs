@@ -36,6 +36,18 @@ namespace WebsiteMOTD
         private static bool _useWebView;
         private static Button _webViewToggleBtn;
 
+        // ── Queue panel ──
+        private static VisualElement _queuePanel;          // outer container (tab + content)
+        private static VisualElement _queueTab;            // thin clickable tab (always visible)
+        private static Label _queueTabLabel;               // arrow/label inside the tab
+        private static VisualElement _queueContent;        // expanded content (300px)
+        private static VisualElement _queueNowPlayingBox;
+        private static VisualElement _queueListBox;
+        private static Button _voteSkipBtn;
+        private static TextField _queueUrlField;
+        private static bool _queueEventSubscribed;
+        private static bool _queueExpanded; // persists across Show/Hide calls
+
         // ── Site confirmation ──
         private static HashSet<string> _trustedDomains;
         private static string _trustedDomainsPath;
@@ -125,6 +137,14 @@ namespace WebsiteMOTD
                 _urlField = null;
                 _backBtn = null;
                 _fwdBtn = null;
+                _queuePanel = null;
+                _queueTab = null;
+                _queueTabLabel = null;
+                _queueContent = null;
+                _queueNowPlayingBox = null;
+                _queueListBox = null;
+                _voteSkipBtn = null;
+                _queueUrlField = null;
                 _history.Clear();
                 _forwardHistory.Clear();
                 CleanupVideoHosts();
@@ -132,6 +152,12 @@ namespace WebsiteMOTD
                 UnityEngine.Cursor.visible = true;
                 UnityEngine.Cursor.lockState = CursorLockMode.None;
                 _isVisible = false;
+            }
+
+            if (_queueEventSubscribed)
+            {
+                Plugin.OnQueueChanged -= RefreshQueuePanel;
+                _queueEventSubscribed = false;
             }
         }
 
@@ -1124,16 +1150,328 @@ namespace WebsiteMOTD
 
         private static void BuildContentArea(VisualElement card)
         {
+            // Horizontal container: queue panel on left, browser on right
+            var body = new VisualElement();
+            body.style.flexDirection = FlexDirection.Row;
+            body.style.flexGrow = 1f;
+            body.style.backgroundColor = new Color(0.12f, 0.12f, 0.14f);
+            card.Add(body);
+
+            // Queue panel on the left
+            BuildQueuePanel(body);
+
+            // Browser scroll view on the right
             _scrollView = new ScrollView(ScrollViewMode.Vertical);
             _scrollView.style.flexGrow = 1f;
             _scrollView.style.backgroundColor = new Color(0.12f, 0.12f, 0.14f);
-            card.Add(_scrollView);
+            body.Add(_scrollView);
 
             _contentArea = _scrollView.contentContainer;
             _contentArea.style.paddingLeft   = 28f;
             _contentArea.style.paddingRight  = 28f;
             _contentArea.style.paddingTop    = 20f;
             _contentArea.style.paddingBottom = 24f;
+
+            // Initial queue render
+            RefreshQueuePanel();
+
+            // Subscribe to queue updates (once per session)
+            if (!_queueEventSubscribed)
+            {
+                Plugin.OnQueueChanged += RefreshQueuePanel;
+                _queueEventSubscribed = true;
+            }
+        }
+
+        // ─── Queue Panel ────────────────────────────────────────────
+
+        private static void BuildQueuePanel(VisualElement parent)
+        {
+            // Outer wrapper: horizontal row containing a thin tab + (optional) expanded content.
+            _queuePanel = new VisualElement();
+            _queuePanel.style.flexDirection = FlexDirection.Row;
+            _queuePanel.style.flexShrink = 0f;
+            parent.Add(_queuePanel);
+
+            // ── Thin clickable tab (always visible) ──
+            _queueTab = new VisualElement();
+            _queueTab.style.width = 28f;
+            _queueTab.style.flexShrink = 0f;
+            _queueTab.style.backgroundColor = new Color(0.05f, 0.05f, 0.07f);
+            _queueTab.style.borderRightWidth = 1f;
+            _queueTab.style.borderRightColor = new Color(0.25f, 0.25f, 0.3f);
+            _queueTab.style.alignItems = Align.Center;
+            _queueTab.style.justifyContent = Justify.Center;
+            _queueTab.style.paddingTop = 8f;
+            _queueTab.style.paddingBottom = 8f;
+            _queuePanel.Add(_queueTab);
+
+            _queueTabLabel = new Label(_queueExpanded ? "◀\nQ\nU\nE\nU\nE" : "▶\nQ\nU\nE\nU\nE");
+            _queueTabLabel.style.fontSize = 12f;
+            _queueTabLabel.style.color = new Color(0.85f, 0.85f, 0.9f);
+            _queueTabLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
+            _queueTabLabel.style.unityTextAlign = TextAnchor.MiddleCenter;
+            _queueTabLabel.style.whiteSpace = WhiteSpace.Normal;
+            _queueTab.Add(_queueTabLabel);
+
+            _queueTab.RegisterCallback<MouseEnterEvent>(e =>
+                _queueTab.style.backgroundColor = new Color(0.12f, 0.12f, 0.16f));
+            _queueTab.RegisterCallback<MouseLeaveEvent>(e =>
+                _queueTab.style.backgroundColor = new Color(0.05f, 0.05f, 0.07f));
+            _queueTab.RegisterCallback<ClickEvent>(e => ToggleQueuePanel());
+
+            // ── Expanded content (hidden when collapsed) ──
+            _queueContent = new VisualElement();
+            _queueContent.style.width = 300f;
+            _queueContent.style.flexShrink = 0f;
+            _queueContent.style.backgroundColor = new Color(0.08f, 0.08f, 0.10f);
+            _queueContent.style.borderRightWidth = 1f;
+            _queueContent.style.borderRightColor = new Color(0.25f, 0.25f, 0.3f);
+            _queueContent.style.paddingLeft = 12f;
+            _queueContent.style.paddingRight = 12f;
+            _queueContent.style.paddingTop = 12f;
+            _queueContent.style.paddingBottom = 12f;
+            _queueContent.style.display = _queueExpanded ? DisplayStyle.Flex : DisplayStyle.None;
+            _queuePanel.Add(_queueContent);
+
+            var header = new Label("Screen Queue");
+            header.style.fontSize = 16f;
+            header.style.unityFontStyleAndWeight = FontStyle.Bold;
+            header.style.color = Color.white;
+            header.style.marginBottom = 10f;
+            _queueContent.Add(header);
+
+            // Now playing box
+            _queueNowPlayingBox = new VisualElement();
+            _queueNowPlayingBox.style.backgroundColor = new Color(0.14f, 0.14f, 0.18f);
+            _queueNowPlayingBox.style.borderTopLeftRadius = 6f;
+            _queueNowPlayingBox.style.borderTopRightRadius = 6f;
+            _queueNowPlayingBox.style.borderBottomLeftRadius = 6f;
+            _queueNowPlayingBox.style.borderBottomRightRadius = 6f;
+            _queueNowPlayingBox.style.paddingLeft = 10f;
+            _queueNowPlayingBox.style.paddingRight = 10f;
+            _queueNowPlayingBox.style.paddingTop = 10f;
+            _queueNowPlayingBox.style.paddingBottom = 10f;
+            _queueNowPlayingBox.style.marginBottom = 10f;
+            _queueContent.Add(_queueNowPlayingBox);
+
+            // Queue list
+            var queueHeader = new Label("Up Next");
+            queueHeader.style.fontSize = 13f;
+            queueHeader.style.unityFontStyleAndWeight = FontStyle.Bold;
+            queueHeader.style.color = new Color(0.75f, 0.75f, 0.8f);
+            queueHeader.style.marginBottom = 6f;
+            _queueContent.Add(queueHeader);
+
+            var listScroll = new ScrollView(ScrollViewMode.Vertical);
+            listScroll.style.flexGrow = 1f;
+            listScroll.style.marginBottom = 10f;
+            _queueContent.Add(listScroll);
+            _queueListBox = listScroll.contentContainer;
+
+            // Add-to-queue input
+            var addHeader = new Label("Add URL");
+            addHeader.style.fontSize = 13f;
+            addHeader.style.unityFontStyleAndWeight = FontStyle.Bold;
+            addHeader.style.color = new Color(0.75f, 0.75f, 0.8f);
+            addHeader.style.marginBottom = 4f;
+            _queueContent.Add(addHeader);
+
+            _queueUrlField = new TextField();
+            _queueUrlField.value = "";
+            _queueUrlField.style.height = 28f;
+            _queueUrlField.style.marginBottom = 6f;
+            var qInput = _queueUrlField.Q<VisualElement>("unity-text-input");
+            if (qInput != null)
+            {
+                qInput.style.backgroundColor = new Color(0.15f, 0.15f, 0.18f);
+                qInput.style.color = new Color(0.9f, 0.9f, 0.9f);
+                qInput.style.fontSize = 12f;
+                qInput.style.paddingLeft = 8f;
+                qInput.style.paddingRight = 8f;
+            }
+            _queueUrlField.RegisterCallback<KeyDownEvent>(e =>
+            {
+                if (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter)
+                {
+                    SubmitQueueUrl();
+                    e.StopPropagation();
+                }
+            });
+            _queueContent.Add(_queueUrlField);
+
+            var addRow = new VisualElement();
+            addRow.style.flexDirection = FlexDirection.Row;
+            _queueContent.Add(addRow);
+
+            var addBtn = CreateStyledButton("Add to Queue", new Color(0.25f, 0.55f, 0.3f), SubmitQueueUrl);
+            addBtn.style.flexGrow = 1f;
+            addBtn.style.height = 30f;
+            addBtn.style.marginRight = 4f;
+            addRow.Add(addBtn);
+
+            var useCurrentBtn = CreateStyledButton("Use Current", new Color(0.3f, 0.4f, 0.6f), () =>
+            {
+                if (!string.IsNullOrEmpty(_url))
+                {
+                    _queueUrlField.value = _url;
+                    SubmitQueueUrl();
+                }
+            });
+            useCurrentBtn.style.height = 30f;
+            useCurrentBtn.style.paddingLeft = 8f;
+            useCurrentBtn.style.paddingRight = 8f;
+            addRow.Add(useCurrentBtn);
+        }
+
+        private static void ToggleQueuePanel()
+        {
+            _queueExpanded = !_queueExpanded;
+            if (_queueContent != null)
+                _queueContent.style.display = _queueExpanded ? DisplayStyle.Flex : DisplayStyle.None;
+            if (_queueTabLabel != null)
+                _queueTabLabel.text = _queueExpanded ? "◀\nQ\nU\nE\nU\nE" : "▶\nQ\nU\nE\nU\nE";
+        }
+
+        private static void SubmitQueueUrl()
+        {
+            if (_queueUrlField == null) return;
+            string url = _queueUrlField.value?.Trim();
+            if (string.IsNullOrEmpty(url)) return;
+            Plugin.AddToQueue(url);
+            _queueUrlField.value = "";
+        }
+
+        private static void RefreshQueuePanel()
+        {
+            if (_queueNowPlayingBox == null || _queueListBox == null) return;
+
+            // ── Now playing ──
+            _queueNowPlayingBox.Clear();
+
+            var current = Plugin.Current;
+            if (current == null)
+            {
+                var empty = new Label("Nothing playing");
+                empty.style.fontSize = 13f;
+                empty.style.color = new Color(0.6f, 0.6f, 0.6f);
+                empty.style.unityFontStyleAndWeight = FontStyle.Italic;
+                _queueNowPlayingBox.Add(empty);
+            }
+            else
+            {
+                var nowHeader = new Label("Now Playing");
+                nowHeader.style.fontSize = 11f;
+                nowHeader.style.color = new Color(0.5f, 0.8f, 0.5f);
+                nowHeader.style.unityFontStyleAndWeight = FontStyle.Bold;
+                nowHeader.style.marginBottom = 2f;
+                _queueNowPlayingBox.Add(nowHeader);
+
+                var playerLabel = new Label(current.Username);
+                playerLabel.style.fontSize = 14f;
+                playerLabel.style.color = Color.white;
+                playerLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
+                _queueNowPlayingBox.Add(playerLabel);
+
+                var urlLabel = new Label(Truncate(current.Url, 48));
+                urlLabel.style.fontSize = 11f;
+                urlLabel.style.color = new Color(0.65f, 0.8f, 1f);
+                urlLabel.style.whiteSpace = WhiteSpace.Normal;
+                urlLabel.style.marginBottom = 8f;
+                _queueNowPlayingBox.Add(urlLabel);
+
+                // Vote skip button
+                int votes = current.VoteSkippers.Count;
+                int needed = Plugin.GetVoteSkipThreshold();
+                bool voted = Plugin.HasLocalVotedSkip();
+
+                _voteSkipBtn = CreateStyledButton(
+                    (voted ? "✔ Voted Skip " : "Vote Skip ") + "(" + votes + "/" + needed + ")",
+                    voted ? new Color(0.55f, 0.4f, 0.25f) : new Color(0.6f, 0.25f, 0.25f),
+                    Plugin.ToggleVoteSkip);
+                _voteSkipBtn.style.height = 28f;
+                _voteSkipBtn.style.flexGrow = 1f;
+                _queueNowPlayingBox.Add(_voteSkipBtn);
+            }
+
+            // ── Queue list ──
+            _queueListBox.Clear();
+
+            var queue = Plugin.Queue;
+            if (queue.Count == 0)
+            {
+                var empty = new Label("(empty)");
+                empty.style.fontSize = 12f;
+                empty.style.color = new Color(0.5f, 0.5f, 0.5f);
+                empty.style.unityFontStyleAndWeight = FontStyle.Italic;
+                _queueListBox.Add(empty);
+            }
+            else
+            {
+                var nm = Unity.Netcode.NetworkManager.Singleton;
+                ulong localClientId = nm != null ? nm.LocalClientId : ulong.MaxValue;
+
+                for (int i = 0; i < queue.Count; i++)
+                {
+                    var item = queue[i];
+                    int idx = i; // capture for lambda
+
+                    var row = new VisualElement();
+                    row.style.flexDirection = FlexDirection.Row;
+                    row.style.alignItems = Align.Center;
+                    row.style.backgroundColor = new Color(0.14f, 0.14f, 0.18f);
+                    row.style.marginBottom = 4f;
+                    row.style.paddingLeft = 8f;
+                    row.style.paddingRight = 6f;
+                    row.style.paddingTop = 6f;
+                    row.style.paddingBottom = 6f;
+                    row.style.borderTopLeftRadius = 4f;
+                    row.style.borderTopRightRadius = 4f;
+                    row.style.borderBottomLeftRadius = 4f;
+                    row.style.borderBottomRightRadius = 4f;
+
+                    var info = new VisualElement();
+                    info.style.flexGrow = 1f;
+                    info.style.flexShrink = 1f;
+                    row.Add(info);
+
+                    var posLabel = new Label((i + 1) + ". " + item.Username);
+                    posLabel.style.fontSize = 12f;
+                    posLabel.style.color = Color.white;
+                    posLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
+                    info.Add(posLabel);
+
+                    var urlLabel = new Label(Truncate(item.Url, 36));
+                    urlLabel.style.fontSize = 10f;
+                    urlLabel.style.color = new Color(0.6f, 0.75f, 0.95f);
+                    urlLabel.style.whiteSpace = WhiteSpace.Normal;
+                    info.Add(urlLabel);
+
+                    // Remove button (only for your own items)
+                    if (item.ClientId == localClientId)
+                    {
+                        var rmBtn = CreateStyledButton("✕", new Color(0.55f, 0.2f, 0.2f), () =>
+                        {
+                            Plugin.RemoveFromQueue(idx);
+                        });
+                        rmBtn.style.width = 24f;
+                        rmBtn.style.height = 24f;
+                        rmBtn.style.paddingLeft = 0f;
+                        rmBtn.style.paddingRight = 0f;
+                        rmBtn.style.fontSize = 12f;
+                        rmBtn.style.marginLeft = 4f;
+                        row.Add(rmBtn);
+                    }
+
+                    _queueListBox.Add(row);
+                }
+            }
+        }
+
+        private static string Truncate(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return s.Length <= max ? s : s.Substring(0, max - 1) + "…";
         }
 
         private static void BuildFooter(VisualElement card)

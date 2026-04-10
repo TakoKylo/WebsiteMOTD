@@ -6,13 +6,13 @@ using UnityEngine.Rendering;
 namespace WebsiteMOTD
 {
     /// <summary>
-    /// Spawns a quad in the 3D world that displays the WebView content.
-    /// Two instances are placed behind each goal net.
-    /// Each screen has its own WebView instance so the texture stays independent.
+    /// Spawns quads in the 3D world that display WebView content.
+    /// Two screens are placed behind each goal net, sharing a single WebView2 instance.
+    /// Screen A is the primary (owns the webview + audio), Screen B mirrors the texture.
     /// </summary>
     public class MOTDWorldScreen : MonoBehaviour
     {
-        // Reuse the same DllImports from MOTDWebView (same native DLL)
+        // ─── Native DLL imports (same DLL as MOTDWebView) ───────────
         [DllImport("WebView")]
         private static extern void _CWebViewPlugin_InitStatic(bool inEditor, bool useDirect3D11);
         [DllImport("WebView")]
@@ -34,35 +34,33 @@ namespace WebsiteMOTD
         [DllImport("WebView")]
         private static extern void _CWebViewPlugin_Render(IntPtr instance, IntPtr textureBuffer);
         [DllImport("WebView")]
-        private static extern string _CWebViewPlugin_GetMessage(IntPtr instance);
-        [DllImport("WebView")]
         private static extern ulong _CWebViewPlugin_BitmapGeneration(IntPtr instance);
         [DllImport("WebView")]
         private static extern bool _CWebViewPlugin_IsInitialized(IntPtr instance);
 
-        private IntPtr _webView = IntPtr.Zero;
-        private Texture2D _texture;
-        private byte[] _textureBuffer;
-        private ulong _lastGen;
-        private MeshRenderer _renderer;
-        private AudioSource _audio;
-
+        // ─── Shared state (single webview for all screens) ──────────
+        private static IntPtr _sharedWebView = IntPtr.Zero;
+        private static Texture2D _sharedTexture;
+        private static byte[] _sharedTextureBuffer;
+        private static ulong _sharedLastGen;
         private static bool _staticInitDone;
+        private static string _currentUrl;
 
         private const int TEX_WIDTH = 1280;
         private const int TEX_HEIGHT = 720;
 
-        // ─── Static API ─────────────────────────────────────────────
+        // ─── Per-instance ───────────────────────────────────────────
+        private MeshRenderer _renderer;
+        private bool _isPrimary;
 
         private static MOTDWorldScreen _screenA;
         private static MOTDWorldScreen _screenB;
 
-        /// <summary>
-        /// Spawn two screens behind the goal nets. Call once after joining a game.
-        /// </summary>
+        // ─── Static API ─────────────────────────────────────────────
+
         public static void SpawnScreens()
         {
-            if (_screenA != null) return; // already spawned
+            if (_screenA != null) return;
 
             if (!MOTDWebView.PreloadNativeDLL())
             {
@@ -70,33 +68,33 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // Find goal positions by searching for GoalTrigger components in the scene
             Vector3 posA, posB;
             Quaternion rotA, rotB;
             FindGoalPositions(out posA, out rotA, out posB, out rotB);
 
-            _screenA = CreateScreen("MOTD_WorldScreen_A", posA, rotA);
-            _screenB = CreateScreen("MOTD_WorldScreen_B", posB, rotB);
+            _screenA = CreateScreen("MOTD_WorldScreen_A", posA, rotA, true);
+            _screenB = CreateScreen("MOTD_WorldScreen_B", posB, rotB, false);
 
             Plugin.Log("World screens spawned at " + posA + " and " + posB);
         }
 
         /// <summary>
-        /// Load a URL on both world screens.
+        /// Load a URL on the shared world screen webview. Uses a raw LoadURL call
+        /// to match the behavior of the UI webview (which handles YouTube/Twitch fine).
         /// </summary>
         public static void LoadOnAllScreens(string url)
         {
-            if (_screenA != null) _screenA.LoadURL(url);
-            if (_screenB != null) _screenB.LoadURL(url);
+            if (_sharedWebView == IntPtr.Zero) return;
+            _currentUrl = url;
+            Plugin.Log("WorldScreen loading: " + url);
+            _CWebViewPlugin_LoadURL(_sharedWebView, url);
         }
 
-        /// <summary>
-        /// Destroy both world screens.
-        /// </summary>
         public static void DestroyScreens()
         {
             if (_screenA != null) { _screenA.Cleanup(); _screenA = null; }
             if (_screenB != null) { _screenB.Cleanup(); _screenB = null; }
+            DestroySharedWebView();
         }
 
         // ─── Goal Finding ───────────────────────────────────────────
@@ -104,8 +102,6 @@ namespace WebsiteMOTD
         private static void FindGoalPositions(out Vector3 posA, out Quaternion rotA,
                                                out Vector3 posB, out Quaternion rotB)
         {
-            // Try to find Goal objects in the scene
-            // Puck has "GoalTrigger" components on the goal objects
             var goals = UnityEngine.Object.FindObjectsByType<Collider>(FindObjectsSortMode.None);
             Vector3? redGoalPos = null;
             Vector3? blueGoalPos = null;
@@ -119,7 +115,6 @@ namespace WebsiteMOTD
 
                 if (fullPath.Contains("goal") || name.Contains("goal"))
                 {
-                    // Try to distinguish red vs blue by name or x position
                     Vector3 p = col.transform.position;
                     if (name.Contains("red") || parentName.Contains("red") ||
                         (name.Contains("goal") && !name.Contains("blue") && p.x < 0))
@@ -134,40 +129,34 @@ namespace WebsiteMOTD
                 }
             }
 
-            // If we found goals, place screens behind them (offset along their facing direction)
-            // Puck rinks typically run along the Z axis with goals at each end
             if (redGoalPos.HasValue && blueGoalPos.HasValue)
             {
                 Vector3 rg = redGoalPos.Value;
                 Vector3 bg = blueGoalPos.Value;
 
-                // Direction from center to each goal
                 Vector3 center = (rg + bg) * 0.5f;
                 Vector3 dirA = (rg - center).normalized;
                 Vector3 dirB = (bg - center).normalized;
 
-                // Place screen 3m behind each goal, 3m up
-                posA = rg + dirA * 3f + Vector3.up * 3f;
-                posB = bg + dirB * 3f + Vector3.up * 3f;
+                posA = rg + dirA * 6f + Vector3.up * 5f;
+                posB = bg + dirB * 6f + Vector3.up * 5f;
 
-                // Face toward center of rink
                 rotA = Quaternion.LookRotation(-dirA, Vector3.up);
                 rotB = Quaternion.LookRotation(-dirB, Vector3.up);
             }
             else
             {
-                // Fallback: place at fixed positions along Z axis (typical hockey rink)
                 Plugin.Log("WorldScreen: Could not find goal objects, using fallback positions.");
-                posA = new Vector3(0f, 4f, -30f);
+                posA = new Vector3(0f, 6f, -35f);
                 rotA = Quaternion.LookRotation(Vector3.forward, Vector3.up);
-                posB = new Vector3(0f, 4f, 30f);
+                posB = new Vector3(0f, 6f, 35f);
                 rotB = Quaternion.LookRotation(Vector3.back, Vector3.up);
             }
         }
 
-        // ─── Instance ───────────────────────────────────────────────
+        // ─── Instance Creation ──────────────────────────────────────
 
-        private static MOTDWorldScreen CreateScreen(string name, Vector3 position, Quaternion rotation)
+        private static MOTDWorldScreen CreateScreen(string name, Vector3 position, Quaternion rotation, bool isPrimary)
         {
             var go = new GameObject(name);
             go.hideFlags = HideFlags.DontSave;
@@ -175,29 +164,35 @@ namespace WebsiteMOTD
             go.transform.position = position;
             go.transform.rotation = rotation;
 
-            // Create a quad mesh (6m x 3.375m = 16:9 aspect)
             var mf = go.AddComponent<MeshFilter>();
-            mf.mesh = CreateQuadMesh(6f, 3.375f);
+            mf.mesh = CreateQuadMesh(10f, 5.625f);
 
             var mr = go.AddComponent<MeshRenderer>();
-            // Use an unlit material so it's visible regardless of lighting
-            var mat = new Material(Shader.Find("Unlit/Texture"));
+            Shader shader = Shader.Find("Unlit/Texture")
+                         ?? Shader.Find("UI/Default")
+                         ?? Shader.Find("Sprites/Default")
+                         ?? Shader.Find("Standard");
+            var mat = new Material(shader);
+            mat.color = Color.white;
             mr.material = mat;
             mr.shadowCastingMode = ShadowCastingMode.Off;
             mr.receiveShadows = false;
 
-            // Audio source for ambient web audio (if ever needed)
-            var audio = go.AddComponent<AudioSource>();
-            audio.spatialBlend = 1f; // full 3D
-            audio.minDistance = 5f;
-            audio.maxDistance = 40f;
-            audio.rolloffMode = AudioRolloffMode.Linear;
-            audio.playOnAwake = false;
-
             var screen = go.AddComponent<MOTDWorldScreen>();
             screen._renderer = mr;
-            screen._audio = audio;
-            screen.InitWebView();
+            screen._isPrimary = isPrimary;
+
+            if (isPrimary)
+            {
+                var audio = go.AddComponent<AudioSource>();
+                audio.spatialBlend = 1f;
+                audio.minDistance = 5f;
+                audio.maxDistance = 40f;
+                audio.rolloffMode = AudioRolloffMode.Linear;
+                audio.playOnAwake = false;
+
+                InitSharedWebView(go.name);
+            }
 
             return screen;
         }
@@ -215,21 +210,24 @@ namespace WebsiteMOTD
                 new Vector3( hw,  hh, 0f),
                 new Vector3(-hw,  hh, 0f),
             };
-            // Flip UVs vertically — WebView2 bitmap is top-down
             mesh.uv = new[]
             {
-                new Vector2(0f, 1f),
                 new Vector2(1f, 1f),
-                new Vector2(1f, 0f),
+                new Vector2(0f, 1f),
                 new Vector2(0f, 0f),
+                new Vector2(1f, 0f),
             };
-            mesh.triangles = new[] { 0, 2, 1, 0, 3, 2 };
+            mesh.triangles = new[] { 0, 1, 2, 0, 2, 3 };
             mesh.RecalculateNormals();
             return mesh;
         }
 
-        private void InitWebView()
+        // ─── Shared WebView ─────────────────────────────────────────
+
+        private static void InitSharedWebView(string goName)
         {
+            if (_sharedWebView != IntPtr.Zero) return;
+
             if (!_staticInitDone)
             {
                 bool isDX11 = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11;
@@ -237,107 +235,105 @@ namespace WebsiteMOTD
                 _staticInitDone = true;
             }
 
-            _webView = _CWebViewPlugin_Init(
-                gameObject.name, true, false,
+            _sharedWebView = _CWebViewPlugin_Init(
+                goName, true, false,
                 TEX_WIDTH, TEX_HEIGHT, "", false);
 
-            if (_webView == IntPtr.Zero)
+            if (_sharedWebView == IntPtr.Zero)
             {
-                Plugin.LogError("WorldScreen: native init failed for " + gameObject.name);
+                Plugin.LogError("WorldScreen: shared webview init failed.");
                 return;
             }
 
-            _CWebViewPlugin_SetVisibility(_webView, true);
-            _CWebViewPlugin_SetRect(_webView, TEX_WIDTH, TEX_HEIGHT);
+            _CWebViewPlugin_SetVisibility(_sharedWebView, true);
+            _CWebViewPlugin_SetRect(_sharedWebView, TEX_WIDTH, TEX_HEIGHT);
         }
 
-        public void LoadURL(string url)
+        private static void DestroySharedWebView()
         {
-            if (_webView == IntPtr.Zero) return;
-            Plugin.Log("WorldScreen loading: " + url);
-            _CWebViewPlugin_LoadURL(_webView, url);
-        }
-
-        void Update()
-        {
-            if (_webView == IntPtr.Zero) return;
-
-            // Pump messages (discard — world screens don't need callbacks)
-            for (;;)
+            if (_sharedWebView != IntPtr.Zero)
             {
-                string s = _CWebViewPlugin_GetMessage(_webView);
-                if (s == null) break;
-            }
-
-            // Refresh at ~10fps for world screens (saves perf, no interaction needed)
-            bool refresh = (Time.frameCount % 6 == 0);
-            _CWebViewPlugin_Update(_webView, refresh, 1);
-            if (!refresh) return;
-
-            ulong gen = _CWebViewPlugin_BitmapGeneration(_webView);
-            if (gen == _lastGen) return;
-
-            int w = _CWebViewPlugin_BitmapWidth(_webView);
-            int h = _CWebViewPlugin_BitmapHeight(_webView);
-            if (w <= 0 || h <= 0) return;
-
-            if (_texture == null || _texture.width != w || _texture.height != h)
-            {
-                if (_texture != null) Destroy(_texture);
-                bool linear = QualitySettings.activeColorSpace == ColorSpace.Linear;
-                _texture = new Texture2D(w, h, TextureFormat.RGBA32, false, !linear);
-                _texture.filterMode = FilterMode.Bilinear;
-                _texture.wrapMode = TextureWrapMode.Clamp;
-                _textureBuffer = new byte[w * h * 4];
-
-                if (_renderer != null && _renderer.material != null)
-                    _renderer.material.mainTexture = _texture;
-            }
-
-            if (_textureBuffer == null) return;
-
-            var gch = GCHandle.Alloc(_textureBuffer, GCHandleType.Pinned);
-            _CWebViewPlugin_Render(_webView, gch.AddrOfPinnedObject());
-            gch.Free();
-
-            _texture.LoadRawTextureData(_textureBuffer);
-            _texture.Apply(false);
-            _lastGen = gen;
-        }
-
-        public void Cleanup()
-        {
-            if (_webView != IntPtr.Zero)
-            {
-                var ptr = _webView;
-                _webView = IntPtr.Zero;
+                var ptr = _sharedWebView;
+                _sharedWebView = IntPtr.Zero;
                 _CWebViewPlugin_Destroy(ptr);
             }
 
-            if (_texture != null)
+            if (_sharedTexture != null)
             {
-                Destroy(_texture);
-                _texture = null;
+                Destroy(_sharedTexture);
+                _sharedTexture = null;
             }
 
-            _textureBuffer = null;
+            _sharedTextureBuffer = null;
+            _sharedLastGen = 0;
+            _currentUrl = null;
+        }
+
+        // ─── Per-frame update ───────────────────────────────────────
+
+        void Update()
+        {
+            // Only the primary screen drives the shared webview
+            if (_isPrimary && _sharedWebView != IntPtr.Zero)
+            {
+                bool refresh = (Time.frameCount % 6 == 0);
+                _CWebViewPlugin_Update(_sharedWebView, refresh, 1);
+
+                if (refresh)
+                {
+                    ulong gen = _CWebViewPlugin_BitmapGeneration(_sharedWebView);
+                    if (gen != _sharedLastGen)
+                    {
+                        int w = _CWebViewPlugin_BitmapWidth(_sharedWebView);
+                        int h = _CWebViewPlugin_BitmapHeight(_sharedWebView);
+                        if (w > 0 && h > 0)
+                        {
+                            if (_sharedTexture == null || _sharedTexture.width != w || _sharedTexture.height != h)
+                            {
+                                if (_sharedTexture != null) Destroy(_sharedTexture);
+                                bool linear = QualitySettings.activeColorSpace == ColorSpace.Linear;
+                                _sharedTexture = new Texture2D(w, h, TextureFormat.RGBA32, false, !linear);
+                                _sharedTexture.filterMode = FilterMode.Bilinear;
+                                _sharedTexture.wrapMode = TextureWrapMode.Clamp;
+                                _sharedTextureBuffer = new byte[w * h * 4];
+                            }
+
+                            if (_sharedTextureBuffer != null)
+                            {
+                                var gch = GCHandle.Alloc(_sharedTextureBuffer, GCHandleType.Pinned);
+                                _CWebViewPlugin_Render(_sharedWebView, gch.AddrOfPinnedObject());
+                                gch.Free();
+
+                                _sharedTexture.LoadRawTextureData(_sharedTextureBuffer);
+                                _sharedTexture.Apply(false);
+                            }
+
+                            _sharedLastGen = gen;
+                        }
+                    }
+                }
+            }
+
+            // All screens apply the shared texture to their material
+            if (_sharedTexture != null && _renderer != null && _renderer.material != null
+                && _renderer.material.mainTexture != _sharedTexture)
+            {
+                _renderer.material.mainTexture = _sharedTexture;
+            }
+        }
+
+        // ─── Cleanup ────────────────────────────────────────────────
+
+        public void Cleanup()
+        {
             Destroy(gameObject);
         }
 
         void OnDestroy()
         {
-            if (_webView != IntPtr.Zero)
-            {
-                var ptr = _webView;
-                _webView = IntPtr.Zero;
-                _CWebViewPlugin_Destroy(ptr);
-            }
-
-            if (_texture != null)
-            {
-                Destroy(_texture);
-                _texture = null;
-            }
+            if (_isPrimary)
+                DestroySharedWebView();
         }
+
     }
 }

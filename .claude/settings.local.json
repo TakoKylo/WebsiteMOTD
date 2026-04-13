@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "WebFetch(domain:raw.githubusercontent.com)",
-      "Read(//c/Users/Amiki/OneDrive/Desktop/Desk/Development/unity-webview-src/plugins/Windows/**)",
-      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/MSBuild.exe\" WebViewPlugin.sln -p:Configuration=Release -p:Platform=x64)"
-    ]
-  }
-}

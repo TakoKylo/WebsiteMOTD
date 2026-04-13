@@ -37,6 +37,10 @@ namespace WebsiteMOTD
         private static extern ulong _CWebViewPlugin_BitmapGeneration(IntPtr instance);
         [DllImport("WebView")]
         private static extern bool _CWebViewPlugin_IsInitialized(IntPtr instance);
+        [DllImport("WebView")]
+        private static extern void _CWebViewPlugin_EvaluateJS(IntPtr instance, string js);
+        [DllImport("WebView")]
+        private static extern string _CWebViewPlugin_GetMessage(IntPtr instance);
 
         // ─── Shared state (single webview for all screens) ──────────
         private static IntPtr _sharedWebView = IntPtr.Zero;
@@ -45,6 +49,7 @@ namespace WebsiteMOTD
         private static ulong _sharedLastGen;
         private static bool _staticInitDone;
         private static string _currentUrl;
+        private static bool _bitmapGenSupported = true; // false if DLL lacks _CWebViewPlugin_BitmapGeneration
 
         private const int TEX_WIDTH = 1280;
         private const int TEX_HEIGHT = 720;
@@ -85,9 +90,10 @@ namespace WebsiteMOTD
         public static void LoadOnAllScreens(string url)
         {
             if (_sharedWebView == IntPtr.Zero) return;
-            _currentUrl = url;
-            Plugin.Log("WorldScreen loading: " + url);
-            _CWebViewPlugin_LoadURL(_sharedWebView, url);
+            string embedUrl = MOTDUI.ConvertToEmbedUrl(url);
+            _currentUrl = embedUrl;
+            Plugin.Log("WorldScreen loading: " + embedUrl);
+            _CWebViewPlugin_LoadURL(_sharedWebView, embedUrl);
         }
 
         public static void DestroyScreens()
@@ -279,10 +285,42 @@ namespace WebsiteMOTD
                 bool refresh = (Time.frameCount % 6 == 0);
                 _CWebViewPlugin_Update(_sharedWebView, refresh, 1);
 
+                    // Process webview messages (detect page load for ad-block/volume injection)
+                    for (;;)
+                    {
+                        string msg = _CWebViewPlugin_GetMessage(_sharedWebView);
+                        if (msg == null) break;
+                        if (msg.StartsWith("CallOnLoaded:"))
+                        {
+                            InjectWorldAdBlockJS();
+                            InjectWorldVolumeJS();
+                            InjectWorldVideoEndedJS();
+                        }
+                        else if (msg.StartsWith("CallFromJS:"))
+                        {
+                            if (msg.Substring(11) == "videoEnded")
+                                Plugin.VideoEnded();
+                        }
+                    }
+
                 if (refresh)
                 {
-                    ulong gen = _CWebViewPlugin_BitmapGeneration(_sharedWebView);
-                    if (gen != _sharedLastGen)
+                    bool bitmapChanged = true;
+                    if (_bitmapGenSupported)
+                    {
+                        try
+                        {
+                            ulong gen = _CWebViewPlugin_BitmapGeneration(_sharedWebView);
+                            bitmapChanged = (gen != _sharedLastGen);
+                            if (bitmapChanged) _sharedLastGen = gen;
+                        }
+                        catch (System.EntryPointNotFoundException)
+                        {
+                            _bitmapGenSupported = false;
+                            Plugin.LogError("WorldScreen: _CWebViewPlugin_BitmapGeneration not found in DLL — falling back to unconditional refresh.");
+                        }
+                    }
+                    if (bitmapChanged)
                     {
                         int w = _CWebViewPlugin_BitmapWidth(_sharedWebView);
                         int h = _CWebViewPlugin_BitmapHeight(_sharedWebView);
@@ -307,8 +345,6 @@ namespace WebsiteMOTD
                                 _sharedTexture.LoadRawTextureData(_sharedTextureBuffer);
                                 _sharedTexture.Apply(false);
                             }
-
-                            _sharedLastGen = gen;
                         }
                     }
                 }
@@ -333,6 +369,84 @@ namespace WebsiteMOTD
         {
             if (_isPrimary)
                 DestroySharedWebView();
+        }
+
+        // ─── Client-side Controls ───────────────────────────────
+
+        public static void SetScreensVisible(bool visible)
+        {
+            if (_screenA != null && _screenA._renderer != null)
+                _screenA._renderer.enabled = visible;
+            if (_screenB != null && _screenB._renderer != null)
+                _screenB._renderer.enabled = visible;
+        }
+
+        public static void SetVolume(float volume)
+        {
+            if (_sharedWebView == IntPtr.Zero) return;
+            string volStr = volume.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+            _CWebViewPlugin_EvaluateJS(_sharedWebView,
+                "window.__motdVol=" + volStr + ";" +
+                "document.querySelectorAll('video,audio').forEach(function(e){e.volume=window.__motdVol;});" +
+                "if(!window.__motdVolWatch){window.__motdVolWatch=true;" +
+                "new MutationObserver(function(){document.querySelectorAll('video,audio').forEach(function(e){e.volume=window.__motdVol;});}).observe(document.body||document.documentElement,{childList:true,subtree:true});}");
+        }
+
+        private static void InjectWorldAdBlockJS()
+        {
+            if (_sharedWebView == IntPtr.Zero) return;
+            _CWebViewPlugin_EvaluateJS(_sharedWebView, MOTDUI.AdBlockJS);
+        }
+
+        private static void InjectWorldVolumeJS()
+        {
+            SetVolume(MOTDUI.EffectiveVolume);
+        }
+
+        private static void InjectWorldVideoEndedJS()
+        {
+            if (_sharedWebView == IntPtr.Zero) return;
+            _CWebViewPlugin_EvaluateJS(_sharedWebView,
+                "(function(){" +
+                "if(window.__motdMedia)return;" +
+                "window.__motdMedia=true;" +
+                // YouTube CSS maximise (world screens show same URLs)
+                "if(location.hostname.indexOf('youtube.com')>=0){" +
+                "var s=document.createElement('style');" +
+                "s.textContent=" +
+                "'html,body{overflow:hidden!important;background:#000!important}'" +
+                "+'#masthead-container,tp-yt-app-header-layout,ytd-mini-guide-renderer{display:none!important}'" +
+                "+'ytd-watch-flexy #secondary,#secondary{display:none!important}'" +
+                "+'ytd-watch-metadata,#below-the-fold,ytd-comments,ytd-item-section-renderer{display:none!important}'" +
+                "+'ytd-watch-flexy[is-two-columns_] #primary{max-width:100%!important}'" +
+                "+'#ytd-player,#movie_player{position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;max-height:none!important;z-index:9999!important}';" +
+                "(document.head||document.documentElement).appendChild(s);" +
+                "}" +
+                // Event-listener based ended detection — fires before YouTube changes src
+                "var _sent=false;" +
+                "function notifyEnded(){" +
+                "if(window.Unity&&typeof window.Unity.call==='function')" +
+                "window.Unity.call('videoEnded');" +
+                "}" +
+                "function onEnded(e){" +
+                "var v=e.target;" +
+                "if(!v||v.duration<=5)return;" +
+                "if(document.querySelector('.ad-showing'))return;" +
+                "if(_sent)return;" +
+                "_sent=true;" +
+                "setTimeout(notifyEnded,1500);" +
+                "}" +
+                "function attach(v){" +
+                "if(!v||v.__motdBound)return;" +
+                "v.__motdBound=true;" +
+                "v.addEventListener('ended',onEnded);" +
+                "}" +
+                "document.querySelectorAll('video').forEach(attach);" +
+                "new MutationObserver(function(){" +
+                "document.querySelectorAll('video').forEach(attach);" +
+                "}).observe(document.body||document.documentElement,{childList:true,subtree:true});" +
+                "})();"
+            );
         }
 
     }

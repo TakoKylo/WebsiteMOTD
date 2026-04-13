@@ -1,13 +1,543 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// MOTDHtmlRenderer.cs
+// Consolidates all HTML-mode rendering helpers:
+//   • GifFrame / GifDecoder    — pure-C# GIF89a decoder
+//   • MOTDVideoHost            — downloads + plays videos via Unity VideoPlayer
+//   • ContentElement           — parsed HTML element model
+//   • MOTDWebContent           — fetches & parses HTML pages into ContentElements
+// ─────────────────────────────────────────────────────────────────────────────
+
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
 using UnityEngine;
 using UnityEngine.Networking;
+using UnityEngine.UIElements;
+using UnityEngine.Video;
 
 namespace WebsiteMOTD
 {
+    // ═════════════════════════════════════════════════════════════════════════
+    // GIF Decoder
+    // ═════════════════════════════════════════════════════════════════════════
+
+    public struct GifFrame
+    {
+        public Texture2D Texture;
+        public float Delay; // seconds
+    }
+
+    /// <summary>
+    /// Pure-C# GIF89a decoder. Handles animated GIFs with LZW decompression,
+    /// local/global color tables, transparency, and basic disposal methods.
+    /// </summary>
+    public static class GifDecoder
+    {
+        public static GifFrame[] Decode(byte[] data)
+        {
+            if (data == null || data.Length < 13) return null;
+
+            string sig = System.Text.Encoding.ASCII.GetString(data, 0, 6);
+            if (sig != "GIF87a" && sig != "GIF89a") return null;
+
+            int pos = 6;
+
+            // Logical Screen Descriptor
+            int screenW = ReadU16(data, pos); pos += 2;
+            int screenH = ReadU16(data, pos); pos += 2;
+            byte lsd    = data[pos++];
+            int bgIdx   = data[pos++];
+            pos++; // pixel aspect ratio
+
+            bool hasGct  = (lsd & 0x80) != 0;
+            int  gctSize = (lsd & 0x07);
+
+            Color32[] gct = null;
+            if (hasGct)
+                gct = ReadColorTable(data, ref pos, 2 << gctSize);
+
+            var frames = new List<GifFrame>();
+
+            // Per-frame graphics control state
+            float delay        = 0.1f;
+            bool  transparent  = false;
+            int   transIdx     = 0;
+            int   disposal     = 0;
+
+            // Compositing canvas (RGBA)
+            var canvas    = new Color32[screenW * screenH];
+            var prevCanvas = new Color32[screenW * screenH];
+            var bgColor   = (gct != null && bgIdx < gct.Length) ? gct[bgIdx] : new Color32(0, 0, 0, 0);
+
+            for (int i = 0; i < canvas.Length; i++) canvas[i] = bgColor;
+
+            while (pos < data.Length)
+            {
+                byte b = data[pos++];
+
+                // ── Trailer ──
+                if (b == 0x3B) break;
+
+                // ── Extension ──
+                if (b == 0x21)
+                {
+                    byte label = data[pos++];
+                    if (label == 0xF9) // Graphic Control Extension
+                    {
+                        pos++; // block size (always 4)
+                        byte gce = data[pos++];
+                        delay      = Mathf.Max(ReadU16(data, pos) * 0.01f, 0.02f); pos += 2;
+                        transIdx   = data[pos++];
+                        pos++;   // block terminator
+
+                        transparent = (gce & 0x01) != 0;
+                        disposal    = (gce >> 3) & 0x07;
+                    }
+                    else
+                    {
+                        SkipSubBlocks(data, ref pos);
+                    }
+                    continue;
+                }
+
+                // ── Image Separator ──
+                if (b == 0x2C)
+                {
+                    int imgLeft = ReadU16(data, pos); pos += 2;
+                    int imgTop  = ReadU16(data, pos); pos += 2;
+                    int imgW    = ReadU16(data, pos); pos += 2;
+                    int imgH    = ReadU16(data, pos); pos += 2;
+                    byte ipk    = data[pos++];
+
+                    bool hasLct    = (ipk & 0x80) != 0;
+                    bool interlace = (ipk & 0x40) != 0;
+                    int  lctSize   = (ipk & 0x07);
+
+                    Color32[] ct = gct;
+                    if (hasLct)
+                        ct = ReadColorTable(data, ref pos, 2 << lctSize);
+
+                    byte lzwMin   = data[pos++];
+                    byte[] imgData = ReadSubBlocks(data, ref pos);
+
+                    int[] indices = LzwDecode(imgData, lzwMin, imgW * imgH);
+                    if (indices == null || ct == null) continue;
+
+                    if (interlace) indices = Deinterlace(indices, imgW, imgH);
+
+                    // Apply disposal of previous frame
+                    if (disposal == 2) // restore to background
+                        for (int i = 0; i < canvas.Length; i++) canvas[i] = bgColor;
+                    // disposal == 3 (restore to previous) is rare, skip for now
+
+                    // Blit indices onto canvas
+                    for (int row = 0; row < imgH; row++)
+                    {
+                        for (int col = 0; col < imgW; col++)
+                        {
+                            int si = row * imgW + col;
+                            if (si >= indices.Length) continue;
+                            int ci = indices[si];
+                            if (transparent && ci == transIdx) continue;
+                            int canvasIdx = (imgTop + row) * screenW + (imgLeft + col);
+                            if (canvasIdx < 0 || canvasIdx >= canvas.Length) continue;
+                            if (ci < 0 || ci >= ct.Length) continue;
+                            canvas[canvasIdx] = ct[ci];
+                        }
+                    }
+
+                    // Create texture (GIF origin is top-left; Unity is bottom-left → flip Y)
+                    var tex = new Texture2D(screenW, screenH, TextureFormat.RGBA32, false);
+                    var pixels = new Color32[canvas.Length];
+                    for (int row = 0; row < screenH; row++)
+                        Array.Copy(canvas, (screenH - 1 - row) * screenW, pixels, row * screenW, screenW);
+                    tex.SetPixels32(pixels);
+                    tex.Apply();
+
+                    frames.Add(new GifFrame { Texture = tex, Delay = delay });
+
+                    // Save canvas if next frame might want to restore to previous
+                    Array.Copy(canvas, prevCanvas, canvas.Length);
+
+                    // Reset per-frame state
+                    delay       = 0.1f;
+                    transparent = false;
+                    disposal    = 0;
+                    continue;
+                }
+
+                // Unknown block — try to skip
+                if (pos < data.Length)
+                    SkipSubBlocks(data, ref pos);
+            }
+
+            return frames.Count > 0 ? frames.ToArray() : null;
+        }
+
+        // ─── LZW Decompression ────────────────────────────────────────
+
+        private static int[] LzwDecode(byte[] data, int minCodeSize, int pixelCount)
+        {
+            int clearCode  = 1 << minCodeSize;
+            int eoiCode    = clearCode + 1;
+            int codeSize   = minCodeSize + 1;
+            int nextCode   = eoiCode + 1;
+            int codeMask   = (1 << codeSize) - 1;
+
+            var dict = new List<int[]>(4096);
+            ResetDict(dict, clearCode);
+
+            var result = new List<int>(pixelCount + 64);
+            int bitBuf = 0, bitsLeft = 0, dataPos = 0;
+            int[] prev = null;
+
+            while (result.Count < pixelCount)
+            {
+                while (bitsLeft < codeSize)
+                {
+                    if (dataPos >= data.Length) goto done;
+                    bitBuf |= data[dataPos++] << bitsLeft;
+                    bitsLeft += 8;
+                }
+                int code = bitBuf & codeMask;
+                bitBuf   >>= codeSize;
+                bitsLeft  -= codeSize;
+
+                if (code == clearCode)
+                {
+                    codeSize = minCodeSize + 1;
+                    codeMask = (1 << codeSize) - 1;
+                    nextCode = eoiCode + 1;
+                    ResetDict(dict, clearCode);
+                    prev = null;
+                    continue;
+                }
+
+                if (code == eoiCode) break;
+
+                int[] entry;
+                if (code < dict.Count && dict[code] != null)
+                {
+                    entry = dict[code];
+                }
+                else if (code == nextCode && prev != null)
+                {
+                    entry = new int[prev.Length + 1];
+                    Array.Copy(prev, entry, prev.Length);
+                    entry[prev.Length] = prev[0];
+                }
+                else break;
+
+                result.AddRange(entry);
+
+                if (prev != null && nextCode < 4096)
+                {
+                    var ne = new int[prev.Length + 1];
+                    Array.Copy(prev, ne, prev.Length);
+                    ne[prev.Length] = entry[0];
+
+                    if (nextCode < dict.Count) dict[nextCode] = ne;
+                    else dict.Add(ne);
+                    nextCode++;
+
+                    if (nextCode > codeMask && codeSize < 12)
+                    {
+                        codeSize++;
+                        codeMask = (1 << codeSize) - 1;
+                    }
+                }
+
+                prev = entry;
+            }
+
+            done:
+            return result.ToArray();
+        }
+
+        private static void ResetDict(List<int[]> dict, int clearCode)
+        {
+            dict.Clear();
+            for (int i = 0; i < clearCode; i++) dict.Add(new[] { i });
+            dict.Add(null); // clearCode placeholder
+            dict.Add(null); // eoiCode placeholder
+        }
+
+        // ─── Helpers ─────────────────────────────────────────────────
+
+        private static Color32[] ReadColorTable(byte[] data, ref int pos, int count)
+        {
+            var t = new Color32[count];
+            for (int i = 0; i < count; i++)
+            {
+                t[i] = new Color32(data[pos], data[pos + 1], data[pos + 2], 255);
+                pos += 3;
+            }
+            return t;
+        }
+
+        private static byte[] ReadSubBlocks(byte[] data, ref int pos)
+        {
+            var buf = new List<byte>(256);
+            while (pos < data.Length)
+            {
+                int sz = data[pos++];
+                if (sz == 0) break;
+                for (int i = 0; i < sz && pos < data.Length; i++)
+                    buf.Add(data[pos++]);
+            }
+            return buf.ToArray();
+        }
+
+        private static void SkipSubBlocks(byte[] data, ref int pos)
+        {
+            while (pos < data.Length)
+            {
+                int sz = data[pos++];
+                if (sz == 0) break;
+                pos += sz;
+            }
+        }
+
+        private static int ReadU16(byte[] data, int pos)
+            => data[pos] | (data[pos + 1] << 8);
+
+        private static int[] Deinterlace(int[] src, int w, int h)
+        {
+            var dst = new int[src.Length];
+            int s = 0;
+            foreach (int start in new[] { 0, 4, 2, 1 })
+                foreach (int step in new[] { 8, 8, 4, 2 })
+                    for (int y = start; y < h; y += step)
+                        for (int x = 0; x < w; x++)
+                            dst[y * w + x] = src[s++];
+            return dst;
+        }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Video Host
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Downloads a video to a temp file (with proper Referer/UA headers) then plays it.
+    /// Progress and volume are communicated via Action callbacks — no dependency on
+    /// Unity's Slider type, so any visual element can be used as a control.
+    /// </summary>
+    public class MOTDVideoHost : MonoBehaviour
+    {
+        private VideoPlayer _player;
+        private RenderTexture _rt;
+        private VisualElement _target;
+        private Label _statusLabel;
+        private bool _prepared;
+        private string _videoUrl;
+        private string _tempFile;
+
+        private Action<float>  _progressSetter;
+        private Action<string> _timeSetter;
+
+        public bool IsPlaying  => _player != null && _player.isPlaying;
+        public bool IsPrepared => _prepared;
+
+        // ─── Factory ────────────────────────────────────────────────
+
+        public static MOTDVideoHost Create(
+            string url, string referer,
+            VisualElement target, Label statusLabel)
+        {
+            var go = new GameObject("MOTD_Video");
+            go.hideFlags = HideFlags.HideAndDontSave;
+            DontDestroyOnLoad(go);
+
+            var host = go.AddComponent<MOTDVideoHost>();
+            host._target      = target;
+            host._statusLabel = statusLabel;
+            host._videoUrl    = url;
+            host.StartCoroutine(host.DownloadThenPlay(url, referer));
+            return host;
+        }
+
+        /// <summary>Call after Create() to wire up progress bar and time label.</summary>
+        public void ConnectControls(Action<float> progressSetter, Action<string> timeSetter)
+        {
+            _progressSetter = progressSetter;
+            _timeSetter     = timeSetter;
+        }
+
+        /// <summary>Seek to a normalised position [0, 1].</summary>
+        public void SeekTo(float normalized)
+        {
+            if (_player != null && _prepared && _player.length > 0)
+                _player.time = normalized * _player.length;
+        }
+
+        /// <summary>Set audio volume [0, 1].</summary>
+        public void SetVolume(float volume)
+        {
+            if (_player != null)
+                _player.SetDirectAudioVolume(0, Mathf.Clamp01(volume));
+        }
+
+        // ─── Download → Play ────────────────────────────────────────
+
+        private IEnumerator DownloadThenPlay(string url, string referer)
+        {
+            SetStatus("Downloading video...");
+
+            string ext = ".mp4";
+            string clean = url.Split('?')[0];
+            int dot = clean.LastIndexOf('.');
+            if (dot >= 0 && clean.Length - dot <= 5) ext = clean.Substring(dot);
+
+            _tempFile = Path.Combine(Application.temporaryCachePath,
+                "motd_" + Mathf.Abs(url.GetHashCode()) + ext);
+
+            if (!File.Exists(_tempFile))
+            {
+                using (var req = new UnityWebRequest(url, UnityWebRequest.kHttpVerbGET))
+                {
+                    req.downloadHandler = new DownloadHandlerFile(_tempFile);
+                    req.timeout = 60;
+                    req.SetRequestHeader("User-Agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
+                    req.SetRequestHeader("Accept", "video/webm,video/mp4,video/*,*/*;q=0.8");
+                    if (!string.IsNullOrEmpty(referer))
+                        req.SetRequestHeader("Referer", referer);
+
+                    yield return req.SendWebRequest();
+
+                    if (req.result != UnityWebRequest.Result.Success)
+                    {
+                        Plugin.LogError("Video download failed: " + req.error + " (" + url + ")");
+                        SetStatus("Download failed:\n" + req.error);
+                        yield break;
+                    }
+                }
+            }
+
+            SetStatus("Loading video...");
+            PreparePlayer("file://" + _tempFile);
+        }
+
+        private void PreparePlayer(string localUrl)
+        {
+            _player = gameObject.AddComponent<VideoPlayer>();
+            _player.source          = VideoSource.Url;
+            _player.url             = localUrl;
+            _player.playOnAwake     = false;
+            _player.renderMode      = VideoRenderMode.RenderTexture;
+            _player.audioOutputMode = VideoAudioOutputMode.Direct;
+            _player.isLooping       = true;
+            _player.skipOnDrop      = true;
+            _player.prepareCompleted += OnPrepared;
+            _player.errorReceived    += OnError;
+            _player.Prepare();
+        }
+
+        private void OnPrepared(VideoPlayer vp)
+        {
+            int w = (int)vp.width;  if (w <= 0) w = 640;
+            int h = (int)vp.height; if (h <= 0) h = 360;
+
+            _rt = new RenderTexture(w, h, 0, RenderTextureFormat.ARGB32);
+            _rt.Create();
+            _player.targetTexture = _rt;
+            _prepared = true;
+
+            float maxW  = 700f;
+            float scale = w > maxW ? maxW / w : 1f;
+            _target.style.width  = w * scale;
+            _target.style.height = h * scale;
+            var bg = new Background();
+            bg.renderTexture = _rt;
+            _target.style.backgroundImage = new StyleBackground(bg);
+            _target.style.backgroundPositionX = new BackgroundPosition(BackgroundPositionKeyword.Center);
+            _target.style.backgroundPositionY = new BackgroundPosition(BackgroundPositionKeyword.Center);
+            _target.style.backgroundSize = new BackgroundSize(BackgroundSizeType.Cover);
+
+            if (_statusLabel != null && _statusLabel.parent != null)
+                _statusLabel.RemoveFromHierarchy();
+
+            _player.Play();
+            Plugin.Log("Video playing: " + w + "x" + h + " from " + _videoUrl);
+        }
+
+        private void OnError(VideoPlayer vp, string msg)
+        {
+            Plugin.LogError("Video error: " + msg);
+            SetStatus("Video error: " + msg);
+            if (_tempFile != null && File.Exists(_tempFile))
+            {
+                try { File.Delete(_tempFile); } catch { }
+                _tempFile = null;
+            }
+        }
+
+        private void SetStatus(string text)
+        {
+            if (_statusLabel == null) return;
+            _statusLabel.text  = text;
+            _statusLabel.style.color = new Color(0.6f, 0.6f, 0.6f);
+        }
+
+        // ─── Per-frame update ────────────────────────────────────────
+
+        void Update()
+        {
+            if (!_prepared || _player == null || _player.length <= 0) return;
+
+            _progressSetter?.Invoke((float)(_player.time / _player.length));
+
+            if (_timeSetter != null)
+            {
+                var cur = TimeSpan.FromSeconds(_player.time);
+                var dur = TimeSpan.FromSeconds(_player.length);
+                _timeSetter(string.Format("{0}:{1:D2} / {2}:{3:D2}",
+                    (int)cur.TotalMinutes, cur.Seconds,
+                    (int)dur.TotalMinutes, dur.Seconds));
+            }
+        }
+
+        // ─── Controls ───────────────────────────────────────────────
+
+        public void Play()  { if (_player != null && _prepared) _player.Play(); }
+        public void Pause() { if (_player != null) _player.Pause(); }
+
+        public void TogglePlayPause()
+        {
+            if (_player == null) return;
+            if (_player.isPlaying) _player.Pause();
+            else if (_prepared)    _player.Play();
+        }
+
+        // ─── Cleanup ────────────────────────────────────────────────
+
+        public void Cleanup()
+        {
+            StopAllCoroutines();
+            if (_player != null)
+            {
+                _player.Stop();
+                _player.prepareCompleted -= OnPrepared;
+                _player.errorReceived    -= OnError;
+                _player.targetTexture     = null;
+            }
+            if (_target != null)
+                _target.style.backgroundImage = new StyleBackground();
+            if (_rt != null) { _rt.Release(); Destroy(_rt); _rt = null; }
+            Destroy(gameObject);
+        }
+
+        void OnDestroy() { if (_rt != null) _rt.Release(); }
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // Web Content — HTML Element Model + Parser + Fetcher
+    // ═════════════════════════════════════════════════════════════════════════
+
     public class ContentElement
     {
         public enum ElementType
@@ -75,7 +605,6 @@ namespace WebsiteMOTD
                 _runner.StopCoroutine(c);
         }
 
-        // Derive a plausible Referer for known CDN hosts
         public static string DeriveReferer(string url)
         {
             if (string.IsNullOrEmpty(url)) return null;
@@ -83,7 +612,7 @@ namespace WebsiteMOTD
             {
                 var uri = new Uri(url);
                 string host = uri.Host.ToLowerInvariant();
-                if (host.EndsWith(".poncepuck.net") || host == "poncepuck.net")       return "https://poncepuck.net/";
+                if (host.EndsWith(".poncepuck.net") || host == "poncepuck.net") return "https://poncepuck.net/";
                 return uri.GetLeftPart(UriPartial.Authority) + "/";
             }
             catch { return null; }
@@ -126,7 +655,6 @@ namespace WebsiteMOTD
 
         private static IEnumerator FetchImageCoroutine(string imageUrl, Action<Texture2D> onDone, string referer)
         {
-            // First do a HEAD-style byte-range check to avoid downloading a 50MB JPEG raw
             using (var req = UnityWebRequestTexture.GetTexture(imageUrl))
             {
                 req.timeout = 20;
@@ -145,7 +673,6 @@ namespace WebsiteMOTD
                 Texture2D tex = DownloadHandlerTexture.GetContent(req);
                 if (tex == null) { onDone?.Invoke(null); yield break; }
 
-                // Cap to 2048 on either dimension to prevent OOM on huge images
                 const int MAX_DIM = 2048;
                 if (tex.width > MAX_DIM || tex.height > MAX_DIM)
                 {
@@ -203,15 +730,12 @@ namespace WebsiteMOTD
         {
             var out_ = new List<ContentElement>();
 
-            // Strip truly non-content blocks
             html = RxDel(html, @"<script[^>]*>[\s\S]*?</script>");
             html = RxDel(html, @"<style[^>]*>[\s\S]*?</style>");
             html = RxDel(html, @"<head[^>]*>[\s\S]*?</head>");
             html = RxDel(html, @"<noscript[^>]*>[\s\S]*?</noscript>");
             html = RxDel(html, @"<!--[\s\S]*?-->");
 
-            // Convert GET search forms → synthetic <motd-search> tags (preserves position).
-            // POST forms and forms with no visible text/search input are stripped entirely.
             int _formCount = 0;
             html = Regex.Replace(html, @"<form([^>]*)>([\s\S]*?)</form>", m =>
             {
@@ -221,28 +745,23 @@ namespace WebsiteMOTD
                     @"method\s*=\s*[""']post[""']", RegexOptions.IgnoreCase);
                 if (isPost) { Plugin.Log("[MOTD ParseHtml] Skipping POST form"); return ""; }
 
-                // Extract action attribute (may be relative or absent)
                 string actionAttr = AttrVal(formAttrs, "action");
-                // Decode HTML entities in the action URL (&amp; → &, etc.)
                 if (!string.IsNullOrEmpty(actionAttr))
                     actionAttr = DecodeEntities(actionAttr);
                 string action;
-                
+
                 if (string.IsNullOrEmpty(actionAttr))
                 {
-                    // HTML spec: if action is missing, default to the form's current location (baseUrl)
                     action = baseUrl;
                     Plugin.Log("[MOTD ParseHtml] GET form has no action — defaulting to baseUrl: " + baseUrl);
                 }
                 else
                 {
-                    // Resolve relative URLs (e.g., "/search" → "https://domain.com/search")
                     action = ResolveUrl(actionAttr, baseUrl);
                     Plugin.Log("[MOTD ParseHtml] GET form action resolved: " + action);
                 }
 
-                // Collect hidden inputs so they become part of the encoded URL
-                var hiddenSb = new System.Text.StringBuilder();
+                var hiddenSb = new StringBuilder();
                 foreach (Match hi in Regex.Matches(inner,
                     @"<input[^>]*type\s*=\s*[""']hidden[""'][^>]*>", RegexOptions.IgnoreCase))
                 {
@@ -258,32 +777,25 @@ namespace WebsiteMOTD
                 }
                 if (hiddenSb.Length > 0 && action.Contains("?"))
                 {
-                    // action already has query string: swap ? → & for our hidden params
                     string hidden = hiddenSb.ToString().TrimStart('?');
                     action = action + "&" + hidden;
                     hiddenSb.Clear();
                 }
                 string fullAction = action + hiddenSb;
 
-                // Find the primary text/search input
-                // Be more lenient: accept inputs without explicit type (defaults to text),
-                // or with type=text, type=search, type=email, etc.
                 var inputM = Regex.Match(inner, @"<input([^>]*)>", RegexOptions.IgnoreCase);
                 while (inputM.Success)
                 {
                     string typeAttr = AttrVal(inputM.Value, "type");
                     string type = string.IsNullOrEmpty(typeAttr) ? "text" : typeAttr.ToLowerInvariant();
-                    
-                    // Accept text-like inputs: text, search, email, url (but not hidden, submit, checkbox, etc.)
+
                     if (type == "text" || type == "search" || type == "email" || type == "url")
                     {
                         string name = AttrVal(inputM.Value, "name") ?? "q";
                         string ph   = AttrVal(inputM.Value, "placeholder");
-                        
-                        // If no placeholder, try to find a label for this input
+
                         if (string.IsNullOrEmpty(ph))
                         {
-                            // Look for <label for="inputId">...</label>
                             string inputId = AttrVal(inputM.Value, "id");
                             if (!string.IsNullOrEmpty(inputId))
                             {
@@ -294,8 +806,8 @@ namespace WebsiteMOTD
                                     ph = ToRichText(labelM.Groups[1].Value).Trim();
                             }
                         }
-                        
-                        ph = (ph ?? "Search...").Replace("\"", "'"); // avoid breaking the synthetic tag
+
+                        ph = (ph ?? "Search...").Replace("\"", "'");
                         string tag = string.Format(
                             "<motd-search action=\"{0}\" name=\"{1}\" placeholder=\"{2}\">",
                             fullAction, name, ph);
@@ -310,12 +822,9 @@ namespace WebsiteMOTD
             }, RegexOptions.IgnoreCase);
             Plugin.Log("[MOTD ParseHtml] Form conversion done: " + _formCount + " search bar(s) generated from baseUrl=" + baseUrl);
 
-            // Strip <button> elements (JS-only, can't navigate) but keep <a class="btn">
             html = RxDel(html, @"<button[^>]*>[\s\S]*?</button>");
-
             html = Regex.Replace(html, @"<br\s*/?>", "\n", RegexOptions.IgnoreCase);
 
-            // Block-level split pattern — ordered from most-specific to least
             const string split =
                 @"(<header[^>]*>[\s\S]*?</header>" +
                 @"|<nav[^>]*>[\s\S]*?</nav>" +
@@ -346,18 +855,15 @@ namespace WebsiteMOTD
         {
             Match m;
 
-            // ── Header / Nav / Footer ──
             m = Rx(t, @"<(?:header|nav|footer)[^>]*>([\s\S]*?)</(?:header|nav|footer)>");
             if (m.Success)
             {
                 string inner = m.Groups[1].Value;
-                // Pull out any search bars embedded in the nav/header before link extraction
                 ExtractSearchBars(inner, baseUrl, out_);
                 ExtractLinks(inner, baseUrl, out_);
                 return;
             }
 
-            // ── Video (native <video>) ──
             m = Rx(t, @"<video[^>]*(?:src\s*=\s*[""']([^""']+)[""'])?[^>]*>([\s\S]*?)</video>");
             if (m.Success)
             {
@@ -372,7 +878,6 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Self-closing <video .../>  ──
             m = Rx(t, @"<video[^>]*src\s*=\s*[""']([^""']+)[""'][^>]*/>");
             if (m.Success)
             {
@@ -380,7 +885,6 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Iframe (YouTube / Vimeo embed) ──
             m = Rx(t, @"<iframe[^>]*src\s*=\s*[""']([^""']+)[""']");
             if (m.Success)
             {
@@ -400,11 +904,9 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Figure (image + caption) ──
             m = Rx(t, @"<figure[^>]*>([\s\S]*?)</figure>");
             if (m.Success) { ParseBlock(m.Groups[1].Value, baseUrl, out_); return; }
 
-            // ── Headings ──
             m = Rx(t, @"<h([1-6])[^>]*>([\s\S]*?)</h\1>");
             if (m.Success)
             {
@@ -420,7 +922,6 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Ordered list ──
             m = Rx(t, @"<ol[^>]*>([\s\S]*?)</ol>");
             if (m.Success)
             {
@@ -434,7 +935,6 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Unordered list ──
             m = Rx(t, @"<ul[^>]*>([\s\S]*?)</ul>");
             if (m.Success)
             {
@@ -447,7 +947,6 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Standalone list item ──
             m = Rx(t, @"<li[^>]*>([\s\S]*?)</li>");
             if (m.Success)
             {
@@ -457,7 +956,6 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Blockquote ──
             m = Rx(t, @"<blockquote[^>]*>([\s\S]*?)</blockquote>");
             if (m.Success)
             {
@@ -467,7 +965,6 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Pre/Code ──
             m = Rx(t, @"<pre[^>]*>([\s\S]*?)</pre>");
             if (m.Success)
             {
@@ -477,7 +974,6 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Paragraph ──
             m = Rx(t, @"<p[^>]*>([\s\S]*?)</p>");
             if (m.Success)
             {
@@ -486,7 +982,6 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Table cells / figcaption / dt / dd ──
             m = Rx(t, @"<(?:td|th|caption|figcaption|dt|dd)[^>]*>([\s\S]*?)</(?:td|th|caption|figcaption|dt|dd)>");
             if (m.Success)
             {
@@ -494,11 +989,9 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Images ──
             m = Rx(t, @"<img[^>]*>");
             if (m.Success)
             {
-                // Try src first, but skip data: URIs and obvious placeholder blobs
                 string src = AttrVal(t, "src");
                 if (src != null && (src.StartsWith("data:") || src.StartsWith("blob:")))
                     src = null;
@@ -511,7 +1004,6 @@ namespace WebsiteMOTD
                     ?? AttrVal(t, "data-cfsrc")
                     ?? AttrVal(t, "data-actual-src");
 
-                // Also try srcset (pick first URL)
                 if (string.IsNullOrEmpty(src))
                 {
                     string ss = AttrVal(t, "srcset") ?? AttrVal(t, "data-srcset");
@@ -527,18 +1019,16 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Horizontal rule ──
             if (Regex.IsMatch(t, @"<hr\s*/?>", RegexOptions.IgnoreCase))
             {
                 out_.Add(new ContentElement { Type = ContentElement.ElementType.Separator });
                 return;
             }
 
-            // ── Search bar (synthetic motd-search tag) ──
             m = Rx(t, @"<motd-search([^>]*)>");
             if (m.Success)
             {
-                string tagAttrs = m.Groups[1].Value; // use only this tag's own attributes
+                string tagAttrs = m.Groups[1].Value;
                 string action = AttrVal(tagAttrs, "action")      ?? baseUrl;
                 string name   = AttrVal(tagAttrs, "name")        ?? "q";
                 string ph     = AttrVal(tagAttrs, "placeholder") ?? "Search...";
@@ -553,7 +1043,6 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Remaining text — extract any links, fall back to paragraph ──
             ExtractLinks(t, baseUrl, out_);
         }
 
@@ -597,7 +1086,6 @@ namespace WebsiteMOTD
             int last = 0;
             foreach (Match lm in matches)
             {
-                // Text before link
                 if (lm.Index > last)
                 {
                     string before = ToRichText(html.Substring(last, lm.Index - last));
@@ -620,7 +1108,6 @@ namespace WebsiteMOTD
                 last = lm.Index + lm.Length;
             }
 
-            // Text after last link
             if (last < html.Length)
             {
                 string after = ToRichText(html.Substring(last));
@@ -631,38 +1118,21 @@ namespace WebsiteMOTD
 
         // ─── Rich Text Conversion ────────────────────────────────────
 
-        /// <summary>
-        /// Converts HTML inline formatting to Unity rich text tags.
-        /// Preserves bold, italic, underline, and CSS color spans.
-        /// Strips all other tags.
-        /// </summary>
         public static string ToRichText(string html)
         {
             if (string.IsNullOrEmpty(html)) return "";
 
-            // Strip nested block tags we don't want here
             html = RxDel(html, @"<(?:script|style)[^>]*>[\s\S]*?</(?:script|style)>");
-
-            // <br>
             html = Regex.Replace(html, @"<br\s*/?>", "\n", RegexOptions.IgnoreCase);
-
-            // Bold
             html = Regex.Replace(html, @"<(?:strong|b)(?:\s[^>]*)?>", "<b>", RegexOptions.IgnoreCase);
             html = Regex.Replace(html, @"</(?:strong|b)>", "</b>", RegexOptions.IgnoreCase);
-
-            // Italic
             html = Regex.Replace(html, @"<(?:em|i)(?:\s[^>]*)?>", "<i>", RegexOptions.IgnoreCase);
             html = Regex.Replace(html, @"</(?:em|i)>", "</i>", RegexOptions.IgnoreCase);
-
-            // Underline
             html = Regex.Replace(html, @"<u(?:\s[^>]*)?>", "<u>", RegexOptions.IgnoreCase);
             html = Regex.Replace(html, @"</u>", "</u>", RegexOptions.IgnoreCase);
-
-            // Strikethrough → remove text (can't render strikethrough in UI Toolkit)
             html = Regex.Replace(html, @"<(?:s|strike|del)(?:\s[^>]*)?>", "", RegexOptions.IgnoreCase);
             html = Regex.Replace(html, @"</(?:s|strike|del)>", "", RegexOptions.IgnoreCase);
 
-            // Colored spans
             html = Regex.Replace(html,
                 @"<span[^>]*style\s*=\s*[""'][^""']*color\s*:\s*([^;""'\s]+)[^""']*[""'][^>]*>",
                 m =>
@@ -673,21 +1143,12 @@ namespace WebsiteMOTD
                 }, RegexOptions.IgnoreCase);
             html = Regex.Replace(html, @"<span[^>]*>", "", RegexOptions.IgnoreCase);
             html = Regex.Replace(html, @"</span>", "</color>", RegexOptions.IgnoreCase);
-
-            // Strip links (keep link text, urls handled separately)
             html = Regex.Replace(html, @"<a[^>]*>", "", RegexOptions.IgnoreCase);
             html = Regex.Replace(html, @"</a>", "", RegexOptions.IgnoreCase);
-
-            // Strip all remaining tags
             html = Regex.Replace(html, @"<[^>]+>", "");
-
-            // Decode entities
             html = DecodeEntities(html);
-
-            // Collapse whitespace
             html = Regex.Replace(html, @"[ \t]+", " ");
             html = Regex.Replace(html, @"\n{3,}", "\n\n");
-
             return html.Trim();
         }
 
@@ -713,7 +1174,6 @@ namespace WebsiteMOTD
                     int.Parse(rgba.Groups[2].Value),
                     int.Parse(rgba.Groups[3].Value));
 
-            // Named colors
             switch (css)
             {
                 case "white":   return "#FFFFFF"; case "black":   return "#000000";

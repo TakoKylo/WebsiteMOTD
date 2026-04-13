@@ -105,6 +105,7 @@ namespace WebsiteMOTD
 
         private static bool _nativeLoaded;
         private static bool _staticInitDone;
+        private static bool _bitmapGenSupported = true; // false if DLL lacks _CWebViewPlugin_BitmapGeneration
 
         public Texture2D Texture => _texture;
         public bool IsInitialized => _webView != IntPtr.Zero && _CWebViewPlugin_IsInitialized(_webView);
@@ -431,9 +432,15 @@ namespace WebsiteMOTD
 
             // Decide whether to request a new bitmap capture this frame.
             // Active interaction → every frame.  Winding down → every 2nd frame.  Idle → every 15th frame (~4fps).
+            // When bitmapGen is unavailable we cap to every 6 frames (~10fps) to avoid
+            // uploading a full-resolution bitmap unconditionally at 60fps.
             float idleSec = Time.unscaledTime - _lastInteractTime;
             bool shouldRefresh;
-            if (idleSec < ActiveWindowSec)
+            if (!_bitmapGenSupported)
+            {
+                shouldRefresh = (Time.frameCount % 6 == 0);        // ~10fps — safe without change-detection
+            }
+            else if (idleSec < ActiveWindowSec)
                 shouldRefresh = true;                              // full speed
             else if (idleSec < WindDownSec)
                 shouldRefresh = (Time.frameCount % 2 == 0);       // ~30fps
@@ -444,9 +451,22 @@ namespace WebsiteMOTD
 
             if (!shouldRefresh) return;
 
-            // Check if the native bitmap actually changed since last upload
-            ulong gen = _CWebViewPlugin_BitmapGeneration(_webView);
-            if (gen == _lastBitmapGen) return; // nothing new — skip texture upload entirely
+            // Check if the native bitmap actually changed since last upload.
+            // Fall back to always-upload if this DLL export is missing.
+            if (_bitmapGenSupported)
+            {
+                try
+                {
+                    ulong gen = _CWebViewPlugin_BitmapGeneration(_webView);
+                    if (gen == _lastBitmapGen) return;
+                    _lastBitmapGen = gen;
+                }
+                catch (System.EntryPointNotFoundException)
+                {
+                    _bitmapGenSupported = false;
+                    Plugin.LogError("WebView: _CWebViewPlugin_BitmapGeneration not found in DLL — falling back to unconditional refresh.");
+                }
+            }
 
             int w = _CWebViewPlugin_BitmapWidth(_webView);
             int h = _CWebViewPlugin_BitmapHeight(_webView);
@@ -474,7 +494,6 @@ namespace WebsiteMOTD
 
             _texture.LoadRawTextureData(_textureDataBuffer);
             _texture.Apply(false);
-            _lastBitmapGen = gen;
 
             _targetElement?.MarkDirtyRepaint();
         }

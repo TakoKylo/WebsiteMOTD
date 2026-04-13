@@ -48,6 +48,31 @@ namespace WebsiteMOTD
         private static bool _queueEventSubscribed;
         private static bool _queueExpanded; // persists across Show/Hide calls
 
+        // ── Audio / screen controls (client-side only) ──
+        private static float _globalVolume = 0.5f;
+        private static bool _isMuted;
+        private static bool _screensDisabled;
+        private static Action<float> _volumeSliderSetter;
+        private static Button _muteBtn;
+        private static Button _screenToggleBtn;
+
+        // ── Settings panel & minimize ──
+        private static VisualElement _settingsPanel;
+        private static Button _settingsBtn;
+        private static Button _minimizeBtn;
+        private static bool _settingsOpen;
+        private static float _zoomLevel = 1.25f;
+        private static bool _isMinimized;
+        private static VisualElement _card;
+        private static VisualElement _cardBody;
+        private static VisualElement _miniBar;
+        private static Button _miniMuteBtn;
+        private static Action<float> _zoomSliderSetter;
+        private static Button _muteSettingsBtn;
+
+        // ── Settings persistence ──
+        private static string _settingsPath;
+
         // ── Site confirmation ──
         private static HashSet<string> _trustedDomains;
         private static string _trustedDomainsPath;
@@ -97,8 +122,18 @@ namespace WebsiteMOTD
                 return;
             }
 
+            DestroyMiniBar();
+            _isMinimized = false;
             _overlay?.RemoveFromHierarchy();
             _confirmOverlay?.RemoveFromHierarchy();
+
+            // If we already had a WebView, clean it up so InitWebViewIfNeeded() will
+            // re-create _webViewElement and insert it into the new overlay hierarchy.
+            if (_webView != null) CleanupWebView();
+
+            LoadSettings();
+            if (_screensDisabled)
+                MOTDWorldScreen.SetScreensVisible(false);
 
             Build();
             root.Add(_overlay);
@@ -122,6 +157,7 @@ namespace WebsiteMOTD
 
         public static void Hide()
         {
+            DestroyMiniBar();
             if (_confirmOverlay != null)
             {
                 _confirmOverlay.RemoveFromHierarchy();
@@ -145,6 +181,19 @@ namespace WebsiteMOTD
                 _queueListBox = null;
                 _voteSkipBtn = null;
                 _queueUrlField = null;
+                _volumeSliderSetter = null;
+                _muteBtn = null;
+                _screenToggleBtn = null;
+                _webViewToggleBtn = null;
+                _settingsBtn = null;
+                _settingsPanel = null;
+                _minimizeBtn = null;
+                _muteSettingsBtn = null;
+                _settingsOpen = false;
+                _isMinimized = false;
+                _card = null;
+                _cardBody = null;
+                _miniBar = null;
                 _history.Clear();
                 _forwardHistory.Clear();
                 CleanupVideoHosts();
@@ -171,6 +220,9 @@ namespace WebsiteMOTD
         {
             if (string.IsNullOrWhiteSpace(url)) return;
 
+            // Auto-restore if the player navigates while the browser is minimized
+            if (_isMinimized) ToggleMinimize();
+
             url = url.Trim();
             if (!url.StartsWith("http://") && !url.StartsWith("https://"))
                 url = "https://" + url;
@@ -194,8 +246,9 @@ namespace WebsiteMOTD
             if (_useWebView && _webView != null)
             {
                 EnsureWebViewVisible();
-                _webView.LoadURL(url);
-                Plugin.Log("WebView navigating to: " + url);
+                string embedUrl = ConvertToEmbedUrl(url);
+                _webView.LoadURL(embedUrl);
+                Plugin.Log("WebView navigating to: " + embedUrl);
                 return;
             }
 
@@ -385,6 +438,7 @@ namespace WebsiteMOTD
             if (_useWebView && _webView != null)
             {
                 _webView.GoBack();
+                UpdateBackForwardButtons();
                 return;
             }
             if (_history.Count == 0) return;
@@ -427,6 +481,7 @@ namespace WebsiteMOTD
             if (_useWebView && _webView != null)
             {
                 _webView.GoForward();
+                UpdateBackForwardButtons();
                 return;
             }
             if (_forwardHistory.Count == 0) return;
@@ -468,8 +523,9 @@ namespace WebsiteMOTD
         {
             if (_backBtn != null)
             {
-                _backBtn.SetEnabled(_history.Count > 0);
-                _backBtn.style.opacity = _history.Count > 0 ? 1f : 0.35f;
+                bool canBack = _useWebView && _webView != null ? _webView.CanGoBack : _history.Count > 0;
+                _backBtn.SetEnabled(canBack);
+                _backBtn.style.opacity = canBack ? 1f : 0.35f;
             }
         }
 
@@ -477,9 +533,29 @@ namespace WebsiteMOTD
         {
             if (_fwdBtn != null)
             {
-                _fwdBtn.SetEnabled(_forwardHistory.Count > 0);
-                _fwdBtn.style.opacity = _forwardHistory.Count > 0 ? 1f : 0.35f;
+                bool canFwd = _useWebView && _webView != null ? _webView.CanGoForward : _forwardHistory.Count > 0;
+                _fwdBtn.SetEnabled(canFwd);
+                _fwdBtn.style.opacity = canFwd ? 1f : 0.35f;
             }
+        }
+
+        // Called after WebView GoBack/GoForward — schedules a re-check after the
+        // WebView has had a moment to update its own CanGoBack/CanGoForward state.
+        private static void UpdateBackForwardButtons()
+        {
+            // Immediate update (may still read old state)
+            UpdateBackButton();
+            UpdateForwardButton();
+            // Delayed re-check after WebView processes the navigation
+            if (_webView != null)
+                _webView.StartCoroutine(DelayedNavButtonUpdate());
+        }
+
+        private static System.Collections.IEnumerator DelayedNavButtonUpdate()
+        {
+            yield return new WaitForSeconds(0.4f);
+            UpdateBackButton();
+            UpdateForwardButton();
         }
 
         private static void ClearContent()
@@ -500,31 +576,34 @@ namespace WebsiteMOTD
         {
             if (_useWebView)
             {
-                // Switch back to HTML parser mode
                 _useWebView = false;
-                HideWebViewElement();
-                if (_scrollView != null)
-                    _scrollView.style.display = DisplayStyle.Flex;
                 UpdateWebViewToggleButton();
-                // Re-navigate in HTML mode
-                if (!string.IsNullOrEmpty(_url))
-                    NavigateTo(_url, addToHistory: false);
+                // Only touch content visibility when settings panel is closed
+                if (!_settingsOpen)
+                {
+                    HideWebViewElement();
+                    if (_scrollView != null) _scrollView.style.display = DisplayStyle.Flex;
+                    if (!string.IsNullOrEmpty(_url))
+                        NavigateTo(_url, addToHistory: false);
+                }
             }
             else
             {
-                // Switch to WebView mode
                 if (!InitWebViewIfNeeded())
                 {
                     Plugin.LogError("WebView not available — WebView.dll not found.");
                     return;
                 }
                 _useWebView = true;
-                if (_scrollView != null)
-                    _scrollView.style.display = DisplayStyle.None;
-                EnsureWebViewVisible();
                 UpdateWebViewToggleButton();
-                if (!string.IsNullOrEmpty(_url))
-                    _webView.LoadURL(_url);
+                // Only touch content visibility when settings panel is closed
+                if (!_settingsOpen)
+                {
+                    if (_scrollView != null) _scrollView.style.display = DisplayStyle.None;
+                    EnsureWebViewVisible();
+                    if (!string.IsNullOrEmpty(_url))
+                        _webView.LoadURL(_url);
+                }
             }
         }
 
@@ -560,6 +639,10 @@ namespace WebsiteMOTD
                     Plugin.Log("WebView loaded: " + url);
                     if (_urlField != null && _useWebView)
                         _urlField.value = url;
+                    InjectAdBlockJS();
+                    ApplyWebViewVolume();
+                    InjectMediaHelperJS();
+                    ApplyWebViewZoom();
                 },
                 onStarted: url =>
                 {
@@ -568,6 +651,11 @@ namespace WebsiteMOTD
                 onError: err =>
                 {
                     Plugin.LogError("WebView error: " + err);
+                },
+                onJS: msg =>
+                {
+                    if (msg == "videoEnded")
+                        Plugin.VideoEnded();
                 }
             );
 
@@ -601,6 +689,688 @@ namespace WebsiteMOTD
                 _webViewElement.RemoveFromHierarchy();
                 _webViewElement = null;
             }
+        }
+
+        // ─── URL Conversion (autoplay/fullscreen embeds) ────────────
+
+        /// <summary>
+        /// Converts YouTube, YouTube Music, Twitch, and Spotify URLs into
+        /// embeddable autoplay/fullscreen variants for the WebView.
+        /// Returns the original URL unchanged if no conversion applies.
+        /// </summary>
+        public static string ConvertToEmbedUrl(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return url;
+            string lower = url.ToLowerInvariant();
+
+            // ── YouTube watch / short / live links ──
+            string ytId = null;
+            if (lower.Contains("youtube.com/watch"))
+            {
+                ytId = ExtractQueryParam(url, "v");
+            }
+            else if (lower.Contains("youtu.be/"))
+            {
+                try { ytId = new Uri(url).AbsolutePath.TrimStart('/').Split('?')[0].Split('/')[0]; } catch { }
+            }
+            else if (lower.Contains("youtube.com/shorts/"))
+            {
+                try
+                {
+                    int idx = lower.IndexOf("/shorts/") + 8;
+                    ytId = url.Substring(idx).Split('?')[0].Split('/')[0];
+                }
+                catch { }
+            }
+            else if (lower.Contains("youtube.com/live/"))
+            {
+                try
+                {
+                    int idx = lower.IndexOf("/live/") + 6;
+                    ytId = url.Substring(idx).Split('?')[0].Split('/')[0];
+                }
+                catch { }
+            }
+            // YouTube Music – music.youtube.com/watch?v=ID
+            else if (lower.Contains("music.youtube.com/watch"))
+            {
+                ytId = ExtractQueryParam(url, "v");
+            }
+
+            if (!string.IsNullOrEmpty(ytId))
+            {
+                // Use the full watch page, NOT the /embed/ URL.
+                // The embed player requires an iframe origin and returns error 153 when loaded
+                // directly in WebView2. youtube.com/watch works natively in WebView2 (Edge).
+                return "https://www.youtube.com/watch?v=" + ytId + "&autoplay=1";
+            }
+
+            // ── Twitch channels and VODs ──
+            if (lower.Contains("twitch.tv"))
+            {
+                try
+                {
+                    var uri = new Uri(url);
+                    string path = uri.AbsolutePath.TrimStart('/');
+                    if (path.StartsWith("videos/"))
+                    {
+                        string vodId = path.Substring(7).Split('/')[0].Split('?')[0];
+                        return "https://player.twitch.tv/?video=" + vodId
+                            + "&parent=localhost&autoplay=true&muted=false";
+                    }
+                    string channel = path.Split('/')[0];
+                    if (!string.IsNullOrEmpty(channel)
+                        && channel != "directory" && channel != "settings"
+                        && channel != "downloads" && channel != "subscriptions")
+                    {
+                        return "https://player.twitch.tv/?channel=" + channel
+                            + "&parent=localhost&autoplay=true&muted=false";
+                    }
+                }
+                catch { }
+            }
+
+            // ── Spotify ──
+            if (lower.Contains("open.spotify.com/"))
+            {
+                try
+                {
+                    var uri = new Uri(url);
+                    string path = uri.AbsolutePath.TrimStart('/');
+                    if (path.StartsWith("embed/")) return url;
+                    if (path.StartsWith("track/") || path.StartsWith("album/")
+                        || path.StartsWith("playlist/") || path.StartsWith("episode/")
+                        || path.StartsWith("show/"))
+                    {
+                        return "https://open.spotify.com/embed/" + path;
+                    }
+                }
+                catch { }
+            }
+
+            return url;
+        }
+
+        private static string ExtractQueryParam(string url, string key)
+        {
+            int q = url.IndexOf('?');
+            if (q < 0) return null;
+            string queryStr = url.Substring(q + 1);
+            string[] pairs = queryStr.Split('&');
+            foreach (var pair in pairs)
+            {
+                int eq = pair.IndexOf('=');
+                if (eq > 0 && pair.Substring(0, eq).Equals(key, StringComparison.OrdinalIgnoreCase))
+                    return Uri.UnescapeDataString(pair.Substring(eq + 1));
+            }
+            return null;
+        }
+
+        // ─── Ad-Block & Volume JS Injection ─────────────────────────
+
+        internal static readonly string AdBlockJS =
+            "(function(){" +
+            "if(window.__motdAdBlock)return;" +
+            "window.__motdAdBlock=true;" +
+            "var s=document.createElement('style');" +
+            "s.textContent='" +
+            ".ytp-ad-module,.ytp-ad-overlay-container,.video-ads," +
+            ".ytd-promoted-sparkles-web-renderer,.ytd-display-ad-renderer," +
+            ".ytd-companion-slot-renderer,.ytd-action-companion-ad-renderer," +
+            ".ytd-in-feed-ad-layout-renderer,.ytp-ad-text,.ytp-ad-image," +
+            "#player-ads,.ytd-merch-shelf-renderer,.ad-container,.ad-banner," +
+            "[id^=google_ads],.adsbygoogle," +
+            "[data-a-target=video-ad-countdown]," +
+            "[data-test-selector=sad-overlay],.stream-display-ad," +
+            ".ad-slot,[data-testid=ad-slot]" +
+            "{display:none!important;visibility:hidden!important;height:0!important;}';" +
+            "document.head.appendChild(s);" +
+            "setInterval(function(){" +
+            "var skip=document.querySelector('.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.ytp-skip-ad-button');" +
+            "if(skip)skip.click();" +
+            "var v=document.querySelector('video');" +
+            "if(v&&document.querySelector('.ad-showing')){v.currentTime=v.duration||9999;v.playbackRate=16;}" +
+            "},300);" +
+            "})();";
+
+        public static float EffectiveVolume => _isMuted ? 0f : _globalVolume;
+
+        private static void InjectAdBlockJS()
+        {
+            if (_webView == null) return;
+            _webView.EvaluateJS(AdBlockJS);
+        }
+
+        /// <summary>
+        /// Injected on every page load in the overlay WebView.
+        /// Listens for the video 'ended' event (fires synchronously before the player
+        /// can change src or navigate away) and notifies C# to advance the queue.
+        /// A MutationObserver attaches the listener to video elements added after inject.
+        /// (YouTube chrome is NOT hidden here — the user is browsing interactively.)
+        /// </summary>
+        private static void InjectMediaHelperJS()
+        {
+            if (_webView == null) return;
+            _webView.EvaluateJS(
+                "(function(){" +
+                "if(window.__motdMedia)return;" +
+                "window.__motdMedia=true;" +
+                "var _sent=false;" +
+                "function notifyEnded(){" +
+                "if(window.Unity&&typeof window.Unity.call==='function')" +
+                "window.Unity.call('videoEnded');" +
+                "}" +
+                // onEnded: guard against ads and duplicate signals
+                "function onEnded(e){" +
+                "var v=e.target;" +
+                "if(!v||v.duration<=5)return;" +
+                "if(document.querySelector('.ad-showing'))return;" +
+                "if(_sent)return;" +
+                "_sent=true;" +
+                "setTimeout(notifyEnded,1500);" +
+                "}" +
+                // Attach the ended listener once per element
+                "function attach(v){" +
+                "if(!v||v.__motdBound)return;" +
+                "v.__motdBound=true;" +
+                "v.addEventListener('ended',onEnded);" +
+                "}" +
+                // Attach to any video elements already in the DOM
+                "document.querySelectorAll('video').forEach(attach);" +
+                // Watch for video elements added later (async player init, SPA navigation)
+                "new MutationObserver(function(){" +
+                "document.querySelectorAll('video').forEach(attach);" +
+                "}).observe(document.body||document.documentElement,{childList:true,subtree:true});" +
+                "})();"
+            );
+        }
+
+        private static void ApplyWebViewVolume()
+        {
+            if (_webView == null) return;
+            float vol = _isMuted ? 0f : _globalVolume;
+            string volStr = vol.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+            _webView.EvaluateJS(
+                "window.__motdVol=" + volStr + ";" +
+                "document.querySelectorAll('video,audio').forEach(function(e){e.volume=window.__motdVol;});" +
+                "if(!window.__motdVolWatch){window.__motdVolWatch=true;" +
+                "new MutationObserver(function(){document.querySelectorAll('video,audio').forEach(function(e){e.volume=window.__motdVol;});}).observe(document.body||document.documentElement,{childList:true,subtree:true});}");
+        }
+
+        private static void ApplyWorldScreenVolume()
+        {
+            float vol = _isMuted ? 0f : _globalVolume;
+            MOTDWorldScreen.SetVolume(vol);
+        }
+
+        private static void ApplyAllVolumes()
+        {
+            float effectiveVol = _isMuted ? 0f : _globalVolume;
+            ApplyWebViewVolume();
+            ApplyWorldScreenVolume();
+            foreach (var h in _videoHosts)
+                if (h != null) h.SetVolume(effectiveVol);
+        }
+
+        // ─── Audio / Screen Toggle ──────────────────────────────────
+
+        private static void ToggleMute()
+        {
+            _isMuted = !_isMuted;
+            UpdateMuteButton();
+            if (_volumeSliderSetter != null)
+                _volumeSliderSetter(_isMuted ? 0f : _globalVolume);
+            ApplyAllVolumes();
+            SaveSettings();
+        }
+
+        private static void UpdateMuteButton()
+        {
+            if (_muteBtn != null)
+            {
+                _muteBtn.text = _isMuted ? "🔇" : "🔊";
+                _muteBtn.tooltip = _isMuted ? "Unmute" : "Mute";
+                _muteBtn.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
+                _muteBtn.style.color = _isMuted ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f);
+            }
+            if (_muteSettingsBtn != null)
+            {
+                _muteSettingsBtn.text = _isMuted ? "Muted" : "Unmuted";
+                _muteSettingsBtn.style.backgroundColor = _isMuted ? new Color(0.4f, 0.12f, 0.12f) : new Color(0.18f, 0.25f, 0.35f);
+                _muteSettingsBtn.style.color = _isMuted ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f);
+            }
+            if (_miniMuteBtn != null)
+            {
+                _miniMuteBtn.text    = _isMuted ? "\ud83d\udd07" : "\ud83d\udd0a";
+                _miniMuteBtn.tooltip = _isMuted ? "Unmute" : "Mute";
+                _miniMuteBtn.style.color = _isMuted ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f);
+            }
+        }
+
+        private static void ToggleScreens()
+        {
+            _screensDisabled = !_screensDisabled;
+            MOTDWorldScreen.SetScreensVisible(!_screensDisabled);
+            UpdateScreenToggleButton();
+            SaveSettings();
+        }
+
+        private static void UpdateScreenToggleButton()
+        {
+            if (_screenToggleBtn == null) return;
+            _screenToggleBtn.text = _screensDisabled ? "Screens Off" : "Screens On";
+            _screenToggleBtn.tooltip = _screensDisabled ? "Enable Screens" : "Disable Screens";
+            _screenToggleBtn.style.backgroundColor = _screensDisabled
+                ? new Color(0.5f, 0.15f, 0.15f) : new Color(0.15f, 0.42f, 0.22f);
+        }
+
+        // ─── Settings Panel & Minimize ──────────────────────────────
+
+        private static void ToggleSettings()
+        {
+            _settingsOpen = !_settingsOpen;
+            if (_settingsPanel != null)
+                _settingsPanel.style.display = _settingsOpen ? DisplayStyle.Flex : DisplayStyle.None;
+            if (_settingsOpen)
+            {
+                if (_scrollView != null)    _scrollView.style.display     = DisplayStyle.None;
+                if (_webViewElement != null) _webViewElement.style.display = DisplayStyle.None;
+            }
+            else
+            {
+                // Restore whatever rendering mode is currently active
+                if (_useWebView && _webView != null) EnsureWebViewVisible();
+                else if (_scrollView != null)        _scrollView.style.display = DisplayStyle.Flex;
+            }
+            UpdateSettingsButton();
+        }
+
+        private static void UpdateSettingsButton()
+        {
+            if (_settingsBtn == null) return;
+            if (_settingsOpen)
+            {
+                _settingsBtn.style.color        = new Color(0.85f, 0.55f, 1.0f);
+                _settingsBtn.style.borderTopWidth    = 0f;
+                _settingsBtn.style.borderBottomWidth = 0f;
+                _settingsBtn.style.borderLeftWidth   = 0f;
+                _settingsBtn.style.borderRightWidth  = 0f;
+            }
+            else
+            {
+                _settingsBtn.style.color        = new Color(0.7f, 0.7f, 0.7f);
+                _settingsBtn.style.borderTopWidth    = 0f;
+                _settingsBtn.style.borderBottomWidth = 0f;
+                _settingsBtn.style.borderLeftWidth   = 0f;
+                _settingsBtn.style.borderRightWidth  = 0f;
+            }
+        }
+
+        private static void ToggleMinimize()
+        {
+            _isMinimized = !_isMinimized;
+            if (_isMinimized)
+            {
+                // Hide the main overlay (card + backdrop)
+                if (_overlay != null) _overlay.style.display = DisplayStyle.None;
+                // Build and show floating mini-bar in bottom-right of root
+                BuildAndShowMiniBar();
+            }
+            else
+            {
+                // Restore main overlay
+                if (_overlay != null) _overlay.style.display = DisplayStyle.Flex;
+                DestroyMiniBar();
+                if (_minimizeBtn != null) _minimizeBtn.text = "\u2212";
+            }
+        }
+
+        private static void BuildAndShowMiniBar()
+        {
+            DestroyMiniBar();
+            var uiManager = MonoBehaviourSingleton<UIManager>.Instance;
+            var root = uiManager?.RootVisualElement;
+            if (root == null) return;
+
+            _miniBar = new VisualElement();
+            _miniBar.style.position = Position.Absolute;
+            _miniBar.style.right    = 20f;
+            _miniBar.style.bottom   = 20f;
+            _miniBar.style.flexDirection   = FlexDirection.Row;
+            _miniBar.style.alignItems      = Align.Center;
+            _miniBar.style.backgroundColor = new Color(0.08f, 0.08f, 0.10f, 0.95f);
+            _miniBar.style.paddingLeft  = 10f;
+            _miniBar.style.paddingRight = 10f;
+            _miniBar.style.paddingTop    = 6f;
+            _miniBar.style.paddingBottom = 6f;
+            _miniBar.style.borderTopLeftRadius    = 8f;
+            _miniBar.style.borderTopRightRadius   = 8f;
+            _miniBar.style.borderBottomLeftRadius  = 8f;
+            _miniBar.style.borderBottomRightRadius = 8f;
+            _miniBar.style.borderTopWidth    = 1f;
+            _miniBar.style.borderBottomWidth = 1f;
+            _miniBar.style.borderLeftWidth   = 1f;
+            _miniBar.style.borderRightWidth  = 1f;
+            _miniBar.style.borderTopColor    = new Color(0.25f, 0.25f, 0.3f);
+            _miniBar.style.borderBottomColor = new Color(0.25f, 0.25f, 0.3f);
+            _miniBar.style.borderLeftColor   = new Color(0.25f, 0.25f, 0.3f);
+            _miniBar.style.borderRightColor  = new Color(0.25f, 0.25f, 0.3f);
+
+            // Mute button
+            _miniMuteBtn = new Button(ToggleMute);
+            _miniMuteBtn.text    = _isMuted ? "\ud83d\udd07" : "\ud83d\udd0a";
+            _miniMuteBtn.tooltip = _isMuted ? "Unmute" : "Mute";
+            _miniMuteBtn.style.fontSize = 15f;
+            _miniMuteBtn.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
+            _miniMuteBtn.style.color = _isMuted ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f);
+            _miniMuteBtn.style.borderTopWidth = _miniMuteBtn.style.borderBottomWidth =
+                _miniMuteBtn.style.borderLeftWidth = _miniMuteBtn.style.borderRightWidth = 0f;
+            _miniMuteBtn.style.paddingLeft = _miniMuteBtn.style.paddingRight = 4f;
+            _miniMuteBtn.style.paddingTop  = _miniMuteBtn.style.paddingBottom = 2f;
+            _miniMuteBtn.style.height = 26f;
+            _miniMuteBtn.RegisterCallback<MouseEnterEvent>(e => _miniMuteBtn.style.color = Color.white);
+            _miniMuteBtn.RegisterCallback<MouseLeaveEvent>(e => _miniMuteBtn.style.color = _isMuted
+                ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f));
+            // Keep in sync with global mute state — mutate on toggle
+            Action<float> _;  // unused setter
+            AddCustomSlider(_miniBar, 80f, _isMuted ? 0f : _globalVolume,
+                onChange: v =>
+                {
+                    _globalVolume = v;
+                    if (_isMuted) { _isMuted = false; UpdateMuteButton(); }
+                    _volumeSliderSetter?.Invoke(v);
+                    ApplyAllVolumes();
+                    SaveSettings();
+                },
+                setter: out _);
+            _miniBar.Insert(0, _miniMuteBtn); // mute goes before the slider
+
+            // Maximize button
+            var maxBtn = new Button(ToggleMinimize);
+            maxBtn.text    = "\u26F6";
+            maxBtn.tooltip = "Maximize";
+            maxBtn.style.fontSize   = 20f;
+            maxBtn.style.color      = new Color(0.7f, 0.7f, 0.7f);
+            maxBtn.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
+            maxBtn.style.borderTopWidth = maxBtn.style.borderBottomWidth =
+                maxBtn.style.borderLeftWidth = maxBtn.style.borderRightWidth = 0f;
+            maxBtn.style.paddingLeft  = maxBtn.style.paddingRight  = 6f;
+            maxBtn.style.paddingBottom = 6f;
+            maxBtn.style.height    = 26f;
+            maxBtn.style.marginLeft = 6f;
+            maxBtn.RegisterCallback<MouseEnterEvent>(e => maxBtn.style.color = Color.white);
+            maxBtn.RegisterCallback<MouseLeaveEvent>(e => maxBtn.style.color = new Color(0.7f, 0.7f, 0.7f));
+            _miniBar.Add(maxBtn);
+
+            // Close button
+            var miniClose = new Button(Hide);
+            miniClose.text    = "\u2715";
+            miniClose.tooltip = "Close";
+            miniClose.style.fontSize = 15f;
+            miniClose.style.color    = new Color(0.7f, 0.7f, 0.7f);
+            miniClose.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
+            miniClose.style.borderTopWidth = miniClose.style.borderBottomWidth =
+                miniClose.style.borderLeftWidth = miniClose.style.borderRightWidth = 0f;
+            miniClose.style.paddingLeft  = miniClose.style.paddingRight  = 6f;
+            miniClose.style.paddingBottom = 2f;
+            miniClose.style.paddingTop   = 4f;
+            miniClose.style.height    = 26f;
+            miniClose.style.marginLeft = 2f;
+            miniClose.RegisterCallback<MouseEnterEvent>(e => miniClose.style.color = new Color(1f, 0.4f, 0.4f));
+            miniClose.RegisterCallback<MouseLeaveEvent>(e => miniClose.style.color = new Color(0.7f, 0.7f, 0.7f));
+            _miniBar.Add(miniClose);
+
+            root.Add(_miniBar);
+        }
+
+        private static void DestroyMiniBar()
+        {
+            if (_miniBar != null)
+            {
+                _miniBar.RemoveFromHierarchy();
+                _miniBar = null;
+            }
+            _miniMuteBtn = null;
+        }
+
+        private static void ApplyWebViewZoom()
+        {
+            if (_webView == null) return;
+            string zStr = _zoomLevel.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+            _webView.EvaluateJS("document.documentElement.style.zoom='" + zStr + "';");
+        }
+
+        // ─── Build Settings Panel ──────────────────────────────────
+
+        private static void BuildSettingsPanel(VisualElement body)
+        {
+            _settingsPanel = new VisualElement();
+            _settingsPanel.name = "MOTDSettings";
+            _settingsPanel.style.flexGrow = 1f;
+            _settingsPanel.style.display  = DisplayStyle.None;
+            _settingsPanel.style.backgroundColor = new Color(0.10f, 0.10f, 0.12f);
+            body.Add(_settingsPanel);
+
+            var scroll = new ScrollView(ScrollViewMode.Vertical);
+            scroll.style.flexGrow = 1f;
+            _settingsPanel.Add(scroll);
+
+            var inner = scroll.contentContainer;
+            inner.style.paddingLeft   = 48f;
+            inner.style.paddingRight  = 48f;
+            inner.style.paddingTop    = 32f;
+            inner.style.paddingBottom = 48f;
+            inner.style.maxWidth  = 820f;
+            inner.style.alignSelf = Align.Center;
+
+            // ── Page header ──────────────────────────────────────────
+            var pageHeader = new Label("\u2699  Browser Settings");
+            pageHeader.style.fontSize = 22f;
+            pageHeader.style.unityFontStyleAndWeight = FontStyle.Bold;
+            pageHeader.style.color = Color.white;
+            pageHeader.style.marginBottom = 28f;
+            inner.Add(pageHeader);
+
+            // ════════════════════════════════════════════════════════
+            // RENDERING
+            // ════════════════════════════════════════════════════════
+            AddSettingsSectionHeader(inner, "RENDERING");
+
+            AddSettingsRow(inner, "Rendering Mode",
+                "Switch between the built-in WebView2 engine (full browser) and the lightweight HTML parser.",
+                container =>
+                {
+                    _webViewToggleBtn = CreateStyledButton(
+                        _useWebView ? "HTML" : "WebView",
+                        _useWebView ? new Color(0.3f, 0.55f, 0.3f) : new Color(0.5f, 0.3f, 0.6f),
+                        ToggleWebViewMode);
+                    _webViewToggleBtn.style.width  = 100f;
+                    _webViewToggleBtn.style.height = 32f;
+                    container.Add(_webViewToggleBtn);
+                });
+
+            // ════════════════════════════════════════════════════════
+            // DISPLAY
+            // ════════════════════════════════════════════════════════
+            AddSettingsSectionHeader(inner, "DISPLAY", firstSection: false);
+
+            // Page Zoom
+            AddSettingsRow(inner, "Page Zoom",
+                "Scale page content in WebView mode. 100% = default size.",
+                container =>
+                {
+                    var zoomLabel = new Label(Mathf.RoundToInt(_zoomLevel * 100f) + "%");
+                    zoomLabel.style.fontSize = 13f;
+                    zoomLabel.style.color    = Color.white;
+                    zoomLabel.style.width    = 42f;
+                    zoomLabel.style.unityTextAlign = TextAnchor.MiddleRight;
+                    zoomLabel.style.marginLeft = 10f;
+
+                    float initZoom = (_zoomLevel - 0.5f) / 1.5f;
+                    AddCustomSlider(container, 200f, initZoom,
+                        onChange: v =>
+                        {
+                            _zoomLevel = 0.5f + v * 1.5f;
+                            zoomLabel.text = Mathf.RoundToInt(_zoomLevel * 100f) + "%";
+                            ApplyWebViewZoom();
+                            SaveSettings();
+                        },
+                        setter: out _zoomSliderSetter);
+                    container.Add(zoomLabel);
+                });
+
+            // Zoom min/max labels
+            var zHint50  = new Label("50%");
+            var zHint200 = new Label("200%");
+            var zoomHints = new VisualElement();
+            zoomHints.style.flexDirection = FlexDirection.Row;
+            zoomHints.style.justifyContent = Justify.SpaceBetween;
+            zoomHints.style.marginBottom = 6f;
+            zHint50.style.fontSize = 11f; zHint50.style.color = new Color(0.45f, 0.45f, 0.5f);
+            zHint200.style.fontSize = 11f; zHint200.style.color = new Color(0.45f, 0.45f, 0.5f);
+            zoomHints.Add(zHint50); zoomHints.Add(zHint200);
+            inner.Add(zoomHints);
+
+            // Level Screens
+            AddSettingsRow(inner, "Level Screens",
+                "Show or hide the video screens displayed on the in-game rink.",
+                container =>
+                {
+                    _screenToggleBtn = new Button(ToggleScreens);
+                    _screenToggleBtn.text    = _screensDisabled ? "Screens Off" : "Screens On";
+                    _screenToggleBtn.tooltip = _screensDisabled ? "Enable Screens" : "Disable Screens";
+                    _screenToggleBtn.style.fontSize    = 13f;
+                    _screenToggleBtn.style.color       = Color.white;
+                    _screenToggleBtn.style.paddingLeft  = 16f;
+                    _screenToggleBtn.style.paddingRight = 16f;
+                    _screenToggleBtn.style.paddingTop    = 7f;
+                    _screenToggleBtn.style.paddingBottom = 7f;
+                    _screenToggleBtn.style.backgroundColor = _screensDisabled
+                        ? new Color(0.5f, 0.15f, 0.15f) : new Color(0.15f, 0.42f, 0.22f);
+                    _screenToggleBtn.style.borderTopLeftRadius    = 4f;
+                    _screenToggleBtn.style.borderTopRightRadius   = 4f;
+                    _screenToggleBtn.style.borderBottomLeftRadius  = 4f;
+                    _screenToggleBtn.style.borderBottomRightRadius = 4f;
+                    _screenToggleBtn.style.borderTopWidth    = 0f;
+                    _screenToggleBtn.style.borderBottomWidth = 0f;
+                    _screenToggleBtn.style.borderLeftWidth   = 0f;
+                    _screenToggleBtn.style.borderRightWidth  = 0f;
+                    _screenToggleBtn.RegisterCallback<MouseEnterEvent>(e =>
+                        _screenToggleBtn.style.backgroundColor = _screensDisabled
+                            ? new Color(0.65f, 0.22f, 0.22f) : new Color(0.22f, 0.55f, 0.3f));
+                    _screenToggleBtn.RegisterCallback<MouseLeaveEvent>(e =>
+                        _screenToggleBtn.style.backgroundColor = _screensDisabled
+                            ? new Color(0.5f, 0.15f, 0.15f) : new Color(0.15f, 0.42f, 0.22f));
+                    container.Add(_screenToggleBtn);
+                });
+
+            // ════════════════════════════════════════════════════════
+            // PLAYBACK
+            // ════════════════════════════════════════════════════════
+            AddSettingsSectionHeader(inner, "PLAYBACK", firstSection: false);
+
+            // Master Volume
+            AddSettingsRow(inner, "Master Volume",
+                "Controls media volume for in-browser video and level screens.",
+                container =>
+                {
+                    var volLabel = new Label(Mathf.RoundToInt(_globalVolume * 100f) + "%");
+                    volLabel.style.fontSize = 13f;
+                    volLabel.style.color    = Color.white;
+                    volLabel.style.width    = 42f;
+                    volLabel.style.unityTextAlign = TextAnchor.MiddleRight;
+                    volLabel.style.marginLeft = 10f;
+
+                    Action<float> _;
+                    AddCustomSlider(container, 200f, _globalVolume,
+                        onChange: v =>
+                        {
+                            _globalVolume = v;
+                            volLabel.text = Mathf.RoundToInt(v * 100f) + "%";
+                            if (_isMuted) { _isMuted = false; UpdateMuteButton(); }
+                            _volumeSliderSetter?.Invoke(v);
+                            ApplyAllVolumes();
+                            SaveSettings();
+                        },
+                        setter: out _);
+                    container.Add(volLabel);
+                });
+
+            // Mute
+            AddSettingsRow(inner, "Audio Mute",
+                "Mute or unmute all media playback including level screens.",
+                container =>
+                {
+                    Color muteAccent = _isMuted ? new Color(0.4f, 0.12f, 0.12f) : new Color(0.18f, 0.25f, 0.35f);
+                    _muteSettingsBtn = CreateStyledButton(
+                        _isMuted ? "🔇  Muted" : "🔊  Unmuted",
+                        muteAccent, ToggleMute);
+                    _muteSettingsBtn.style.color = _isMuted ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f);
+                    container.Add(_muteSettingsBtn);
+                });
+        }
+
+        private static void AddSettingsSectionHeader(VisualElement parent, string title, bool firstSection = true)
+        {
+            if (!firstSection)
+            {
+                var sep = new VisualElement();
+                sep.style.height = 1f;
+                sep.style.backgroundColor = new Color(0.22f, 0.22f, 0.28f);
+                sep.style.marginTop    = 24f;
+                sep.style.marginBottom = 20f;
+                parent.Add(sep);
+            }
+            var label = new Label(title);
+            label.style.fontSize = 11f;
+            label.style.unityFontStyleAndWeight = FontStyle.Bold;
+            label.style.color = new Color(0.5f, 0.5f, 0.6f);
+            label.style.marginBottom = 16f;
+            label.style.unityTextAlign = TextAnchor.MiddleLeft;
+            parent.Add(label);
+        }
+
+        private static void AddSettingsRow(VisualElement parent, string label, string description,
+            Action<VisualElement> buildControl)
+        {
+            var row = new VisualElement();
+            row.style.flexDirection  = FlexDirection.Row;
+            row.style.alignItems     = Align.Center;
+            row.style.justifyContent = Justify.SpaceBetween;
+            row.style.marginBottom   = 22f;
+            parent.Add(row);
+
+            // Left column: name + description
+            var leftCol = new VisualElement();
+            leftCol.style.flexGrow   = 1f;
+            leftCol.style.flexShrink = 1f;
+            leftCol.style.marginRight = 28f;
+            row.Add(leftCol);
+
+            var nameLabel = new Label(label);
+            nameLabel.style.fontSize = 15f;
+            nameLabel.style.color    = new Color(0.92f, 0.92f, 0.95f);
+            nameLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
+            nameLabel.style.marginBottom = 2f;
+            leftCol.Add(nameLabel);
+
+            if (!string.IsNullOrEmpty(description))
+            {
+                var descLabel = new Label(description);
+                descLabel.style.fontSize   = 12f;
+                descLabel.style.color      = new Color(0.55f, 0.55f, 0.62f);
+                descLabel.style.whiteSpace = WhiteSpace.Normal;
+                leftCol.Add(descLabel);
+            }
+
+            // Right column: control
+            var ctrl = new VisualElement();
+            ctrl.style.flexShrink   = 0f;
+            ctrl.style.flexDirection = FlexDirection.Row;
+            ctrl.style.alignItems   = Align.Center;
+            row.Add(ctrl);
+
+            buildControl(ctrl);
         }
 
         // ─── Site Confirmation Dialog ───────────────────────────────
@@ -653,6 +1423,74 @@ namespace WebsiteMOTD
             catch (Exception ex)
             {
                 Plugin.LogError("Failed to save trusted domain: " + ex.Message);
+            }
+        }
+
+        private static void LoadSettings()
+        {
+            if (_settingsPath != null) return; // already loaded
+
+            string modDir = Path.GetDirectoryName(typeof(MOTDUI).Assembly.Location) ?? "";
+            _settingsPath = Path.Combine(modDir, "motd_settings.ini");
+
+            if (!File.Exists(_settingsPath)) return;
+            try
+            {
+                foreach (string line in File.ReadAllLines(_settingsPath))
+                {
+                    string l = line.Trim();
+                    if (l.StartsWith("#") || !l.Contains("=")) continue;
+                    int eq = l.IndexOf('=');
+                    string key = l.Substring(0, eq).Trim().ToLowerInvariant();
+                    string val = l.Substring(eq + 1).Trim();
+                    switch (key)
+                    {
+                        case "volume":
+                            if (float.TryParse(val, System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture, out float v))
+                                _globalVolume = Mathf.Clamp01(v);
+                            break;
+                        case "muted":
+                            _isMuted = val.Equals("true", StringComparison.OrdinalIgnoreCase);
+                            break;
+                        case "screens_disabled":
+                            _screensDisabled = val.Equals("true", StringComparison.OrdinalIgnoreCase);
+                            break;
+                        case "zoom":
+                            if (float.TryParse(val, System.Globalization.NumberStyles.Float,
+                                System.Globalization.CultureInfo.InvariantCulture, out float z))
+                                _zoomLevel = Mathf.Clamp(z, 0.5f, 2.0f);
+                            break;
+                    }
+                }
+                Plugin.Log("MOTD settings loaded.");
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("Failed to load motd_settings.ini: " + ex.Message);
+            }
+        }
+
+        private static void SaveSettings()
+        {
+            if (_settingsPath == null)
+            {
+                string modDir = Path.GetDirectoryName(typeof(MOTDUI).Assembly.Location) ?? "";
+                _settingsPath = Path.Combine(modDir, "motd_settings.ini");
+            }
+            try
+            {
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine("# MOTD client settings - auto-generated, do not edit while game is running");
+                sb.AppendLine("volume=" + _globalVolume.ToString("F3", System.Globalization.CultureInfo.InvariantCulture));
+                sb.AppendLine("muted=" + (_isMuted ? "true" : "false"));
+                sb.AppendLine("screens_disabled=" + (_screensDisabled ? "true" : "false"));
+                sb.AppendLine("zoom=" + _zoomLevel.ToString("F3", System.Globalization.CultureInfo.InvariantCulture));
+                File.WriteAllText(_settingsPath, sb.ToString());
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("Failed to save motd_settings.ini: " + ex.Message);
             }
         }
 
@@ -802,7 +1640,7 @@ namespace WebsiteMOTD
             if (_webViewToggleBtn == null) return;
             if (_useWebView)
             {
-                _webViewToggleBtn.text = "HTML Mode";
+                _webViewToggleBtn.text = "HTML";
                 _webViewToggleBtn.style.backgroundColor = new Color(0.3f, 0.55f, 0.3f);
             }
             else
@@ -985,6 +1823,7 @@ namespace WebsiteMOTD
             card.style.borderBottomColor = new Color(0.25f, 0.25f, 0.3f);
             card.style.borderLeftColor   = new Color(0.25f, 0.25f, 0.3f);
             card.style.borderRightColor  = new Color(0.25f, 0.25f, 0.3f);
+            _card = card;
             _overlay.Add(card);
 
             BuildTitleBar(card);
@@ -1032,7 +1871,7 @@ namespace WebsiteMOTD
             titleBar.Add(_fwdBtn);
 
             // Refresh button
-            var refreshBtn = CreateStyledButton("\u21BB", new Color(0.25f, 0.25f, 0.3f), () =>
+            var refreshBtn = CreateStyledButton("🔄", new Color(0.25f, 0.25f, 0.3f), () =>
             {
                 if (_useWebView && _webView != null)
                     _webView.Reload();
@@ -1046,7 +1885,7 @@ namespace WebsiteMOTD
             titleBar.Add(refreshBtn);
 
             // Home button
-            var homeBtn = CreateStyledButton("\u2302", new Color(0.25f, 0.25f, 0.3f), () =>
+            var homeBtn = CreateStyledButton("🏠", new Color(0.25f, 0.25f, 0.3f), () =>
             {
                 if (!string.IsNullOrEmpty(_homeUrl))
                     NavigateTo(_homeUrl);
@@ -1057,27 +1896,19 @@ namespace WebsiteMOTD
             homeBtn.style.marginRight = 6f;
             titleBar.Add(homeBtn);
 
-            // Title
-            var title = new Label("Browser");
-            title.style.fontSize = 14f;
-            title.style.unityFontStyleAndWeight = FontStyle.Bold;
-            title.style.color = Color.white;
-            title.style.marginRight = 8f;
-            title.style.flexShrink = 0f;
-            titleBar.Add(title);
-
             // Editable URL bar
             _urlField = new TextField();
             _urlField.value = _url ?? "";
-            _urlField.style.flexGrow = 1f;
+            _urlField.style.flexGrow = 0f;
             _urlField.style.height = 28f;
+            _urlField.style.width = 1180f;
             _urlField.style.marginRight = 6f;
 
             var textInput = _urlField.Q<VisualElement>("unity-text-input");
             if (textInput != null)
             {
                 textInput.style.backgroundColor = new Color(0.15f, 0.15f, 0.18f);
-                textInput.style.color = new Color(0.55f, 0.75f, 0.55f);
+                textInput.style.color = new Color(0.9f, 0.9f, 0.9f);
                 textInput.style.fontSize = 14f;
                 textInput.style.unityTextAlign = TextAnchor.MiddleLeft;
                 textInput.style.borderTopLeftRadius    = 4f;
@@ -1119,15 +1950,93 @@ namespace WebsiteMOTD
             goBtn.style.marginRight = 6f;
             titleBar.Add(goBtn);
 
-            // WebView toggle button
-            _webViewToggleBtn = CreateStyledButton("WebView", new Color(0.5f, 0.3f, 0.6f), ToggleWebViewMode);
-            _webViewToggleBtn.style.paddingLeft  = 8f;
-            _webViewToggleBtn.style.paddingRight = 8f;
-            _webViewToggleBtn.style.height = 28f;
-            _webViewToggleBtn.style.marginRight = 6f;
-            _webViewToggleBtn.style.fontSize = 11f;
-            titleBar.Add(_webViewToggleBtn);
-            UpdateWebViewToggleButton();
+            // ── Volume / Mute controls (fixed-size – does not shrink) ──
+            var audioGroup = new VisualElement();
+            audioGroup.style.flexDirection = FlexDirection.Row;
+            audioGroup.style.alignItems = Align.Center;
+            audioGroup.style.flexShrink = 0f;
+            audioGroup.style.marginLeft = 6f;
+            audioGroup.style.marginRight = 6f;
+            titleBar.Add(audioGroup);
+
+            // mute toggle
+            _muteBtn = new Button(ToggleMute);
+            _muteBtn.text = _isMuted ? "🔇" : "🔊";
+            _muteBtn.style.fontSize = 15f;
+            _muteBtn.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
+            _muteBtn.style.color = _isMuted ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f);
+            _muteBtn.style.paddingLeft = 6f;
+            _muteBtn.style.paddingRight = 6f;
+            _muteBtn.style.paddingTop = 3f;
+            _muteBtn.style.paddingBottom = 3f;
+            _muteBtn.style.height = 28f;
+            _muteBtn.style.borderTopWidth = 0f;
+            _muteBtn.style.borderBottomWidth = 0f;
+            _muteBtn.style.borderLeftWidth = 0f;
+            _muteBtn.style.borderRightWidth = 0f;
+            _muteBtn.style.borderTopLeftRadius = 4f;
+            _muteBtn.style.borderTopRightRadius = 4f;
+            _muteBtn.style.borderBottomLeftRadius = 4f;
+            _muteBtn.style.borderBottomRightRadius = 4f;
+            _muteBtn.tooltip = _isMuted ? "Unmute" : "Mute";
+            _muteBtn.RegisterCallback<MouseEnterEvent>(e => _muteBtn.style.color = Color.white);
+            _muteBtn.RegisterCallback<MouseLeaveEvent>(e =>
+                _muteBtn.style.color = _isMuted ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f));
+            audioGroup.Add(_muteBtn);
+
+            Action<float> volSetter;
+            AddCustomSlider(audioGroup, 80f, _isMuted ? 0f : _globalVolume,
+                onChange: v =>
+                {
+                    _globalVolume = v;
+                    if (_isMuted) { _isMuted = false; UpdateMuteButton(); }
+                    ApplyAllVolumes();
+                    SaveSettings();
+                },
+                setter: out volSetter);
+            _volumeSliderSetter = volSetter;
+
+            // Settings button
+            _settingsBtn = new Button(ToggleSettings);
+            _settingsBtn.text = "\u2699";
+            _settingsBtn.tooltip = "Settings";
+            _settingsBtn.style.fontSize = 17f;
+            _settingsBtn.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
+            _settingsBtn.style.color = new Color(0.7f, 0.7f, 0.7f);
+            _settingsBtn.style.paddingLeft = 8f;
+            _settingsBtn.style.paddingRight = 8f;
+            _settingsBtn.style.paddingTop = 8f;
+            _settingsBtn.style.paddingBottom = 2f;
+            _settingsBtn.style.height = 28f;
+            _settingsBtn.style.marginLeft = 4f;
+            _settingsBtn.style.borderTopWidth = 0f;
+            _settingsBtn.style.borderBottomWidth = 0f;
+            _settingsBtn.style.borderLeftWidth = 0f;
+            _settingsBtn.style.borderRightWidth = 0f;
+            _settingsBtn.RegisterCallback<MouseEnterEvent>(e => _settingsBtn.style.color = Color.white);
+            _settingsBtn.RegisterCallback<MouseLeaveEvent>(e => _settingsBtn.style.color = _settingsOpen ? Color.white : new Color(0.7f, 0.7f, 0.7f));
+            titleBar.Add(_settingsBtn);
+
+            // Minimize button
+            _minimizeBtn = new Button(ToggleMinimize);
+            _minimizeBtn.text = "−";
+            _minimizeBtn.tooltip = "Minimize";
+            _minimizeBtn.style.fontSize = 18f;
+            _minimizeBtn.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
+            _minimizeBtn.style.color = new Color(0.7f, 0.7f, 0.7f);
+            _minimizeBtn.style.paddingLeft = 8f;
+            _minimizeBtn.style.paddingRight = 8f;
+            _minimizeBtn.style.paddingTop = 4f;
+            _minimizeBtn.style.paddingBottom = 2f;
+            _minimizeBtn.style.height = 28f;
+            _minimizeBtn.style.marginLeft = 2f;
+            _minimizeBtn.style.borderTopWidth = 0f;
+            _minimizeBtn.style.borderBottomWidth = 0f;
+            _minimizeBtn.style.borderLeftWidth = 0f;
+            _minimizeBtn.style.borderRightWidth = 0f;
+            _minimizeBtn.RegisterCallback<MouseEnterEvent>(e => _minimizeBtn.style.color = Color.white);
+            _minimizeBtn.RegisterCallback<MouseLeaveEvent>(e => _minimizeBtn.style.color = new Color(0.7f, 0.7f, 0.7f));
+            titleBar.Add(_minimizeBtn);
 
             // Close button
             var closeBtn = new Button(Hide);
@@ -1143,7 +2052,7 @@ namespace WebsiteMOTD
             closeBtn.style.paddingRight  = 8f;
             closeBtn.style.paddingTop    = 2f;
             closeBtn.style.paddingBottom = 2f;
-            closeBtn.RegisterCallback<MouseEnterEvent>(e => closeBtn.style.color = Color.white);
+            closeBtn.RegisterCallback<MouseEnterEvent>(e => closeBtn.style.color = new Color(1f, 0.4f, 0.4f));
             closeBtn.RegisterCallback<MouseLeaveEvent>(e => closeBtn.style.color = new Color(0.7f, 0.7f, 0.7f));
             titleBar.Add(closeBtn);
         }
@@ -1155,6 +2064,7 @@ namespace WebsiteMOTD
             body.style.flexDirection = FlexDirection.Row;
             body.style.flexGrow = 1f;
             body.style.backgroundColor = new Color(0.12f, 0.12f, 0.14f);
+            _cardBody = body;
             card.Add(body);
 
             // Queue panel on the left
@@ -1165,6 +2075,9 @@ namespace WebsiteMOTD
             _scrollView.style.flexGrow = 1f;
             _scrollView.style.backgroundColor = new Color(0.12f, 0.12f, 0.14f);
             body.Add(_scrollView);
+
+            // Settings panel (replaces scroll/webview when ⚙ is active)
+            BuildSettingsPanel(body);
 
             _contentArea = _scrollView.contentContainer;
             _contentArea.style.paddingLeft   = 28f;

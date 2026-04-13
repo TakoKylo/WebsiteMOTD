@@ -42,6 +42,7 @@ namespace WebsiteMOTD
         private static readonly List<QueueItem> _queue = new List<QueueItem>();
         private static QueueItem _current;
         private static string _lastLoadedWorldUrl; // prevents reloading on every state broadcast
+        private static string _endedForUrl;        // deduplicates video-ended signals from multiple clients
 
         /// <summary>Read-only snapshot for the UI.</summary>
         public static IReadOnlyList<QueueItem> Queue => _queue;
@@ -117,6 +118,7 @@ namespace WebsiteMOTD
             _queue.Clear();
             _current = null;
             _lastLoadedWorldUrl = null;
+            _endedForUrl = null;
 
             var nm = NetworkManager.Singleton;
             if (nm != null)
@@ -347,6 +349,21 @@ namespace WebsiteMOTD
             return Mathf.Max(1, (total / 2) + 1);
         }
 
+        /// <summary>
+        /// Called when the local client's WebView detects that the current video ended.
+        /// Server advances the queue immediately; clients send a signal to the server.
+        /// </summary>
+        public static void VideoEnded()
+        {
+            var nm = NetworkManager.Singleton;
+            if (nm?.CustomMessagingManager == null) return;
+            Log("VideoEnded: auto-advancing queue.");
+            if (nm.IsServer)
+                ServerPlayNext();
+            else
+                SendScreenMsg("ended");
+        }
+
         // ─── Screen message transport ───────────────────────────────
 
         private static void SendScreenMsg(string msg)
@@ -421,6 +438,17 @@ namespace WebsiteMOTD
                     else if (msg == "vote")
                     {
                         ServerHandleVote(senderClientId);
+                    }
+                    else if (msg == "ended")
+                    {
+                        // Deduplicate: all clients may fire this; only advance once per item
+                        string playingUrl = _current != null ? _current.Url : null;
+                        if (playingUrl != null && playingUrl != _endedForUrl)
+                        {
+                            _endedForUrl = playingUrl;
+                            Log("Client " + senderClientId + " reported video ended — advancing queue.");
+                            ServerPlayNext();
+                        }
                     }
                     else if (msg.StartsWith("remove:"))
                     {
@@ -524,7 +552,7 @@ namespace WebsiteMOTD
                 _queue.RemoveAt(0);
                 Log("Now playing: " + _current.Username + " → " + _current.Url);
             }
-
+            _endedForUrl = null; // allow next video's ended to trigger advance
             LoadCurrentOnWorldScreens();
             ServerBroadcastQueueState();
         }
@@ -542,6 +570,10 @@ namespace WebsiteMOTD
             if (url == _lastLoadedWorldUrl) return;
             _lastLoadedWorldUrl = url;
             MOTDWorldScreen.LoadOnAllScreens(url);
+
+            // Also navigate the overlay WebView when it is open
+            if (MOTDUI.IsVisible)
+                MOTDUI.NavigateTo(url, addToHistory: false);
         }
 
         private static void ServerBroadcastQueueState()

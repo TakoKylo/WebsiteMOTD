@@ -45,6 +45,8 @@ namespace WebsiteMOTD
         private static VisualElement _queueListBox;
         private static Button _voteSkipBtn;
         private static TextField _queueUrlField;
+        private static Label _queueErrorLabel;
+        private static IVisualElementScheduledItem _queueErrorHide;
         private static bool _queueEventSubscribed;
         private static bool _queueExpanded; // persists across Show/Hide calls
 
@@ -70,12 +72,11 @@ namespace WebsiteMOTD
         private static Action<float> _zoomSliderSetter;
         private static Button _muteSettingsBtn;
 
-        // ── Settings persistence ──
-        private static string _settingsPath;
+        // ── Settings persistence (delegated to ClientConfig) ──
+        private static bool _settingsLoaded;
 
         // ── Site confirmation ──
         private static HashSet<string> _trustedDomains;
-        private static string _trustedDomainsPath;
         private static VisualElement _confirmOverlay; // the confirmation dialog
 
         public static bool IsVisible => _isVisible;
@@ -181,6 +182,8 @@ namespace WebsiteMOTD
                 _queueListBox = null;
                 _voteSkipBtn = null;
                 _queueUrlField = null;
+                _queueErrorLabel = null;
+                _queueErrorHide = null;
                 _volumeSliderSetter = null;
                 _muteBtn = null;
                 _screenToggleBtn = null;
@@ -364,7 +367,6 @@ namespace WebsiteMOTD
             if (lower.Contains("discord.com")    || lower.Contains("discord.gg")) return "Discord";
             if (lower.Contains("netflix.com"))                                     return "Netflix";
             if (lower.Contains("spotify.com"))                                     return "Spotify";
-            if (lower.Contains("twitch.tv"))                                       return "Twitch";
 
             return null;
         }
@@ -1385,113 +1387,49 @@ namespace WebsiteMOTD
             catch { return url; }
         }
 
+        // Settings + trusted-sites are persisted through ClientConfig
+        // (single client_config.json). These wrappers hydrate the UI's
+        // in-memory cache fields from disk and push changes back.
+
         private static void LoadTrustedDomains()
         {
             if (_trustedDomains != null) return;
             _trustedDomains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            string modDir = Path.GetDirectoryName(typeof(MOTDUI).Assembly.Location) ?? "";
-            _trustedDomainsPath = Path.Combine(modDir, "trusted_sites.txt");
+            if (Plugin.IsDedicatedServer()) return; // client-only file
 
-            if (File.Exists(_trustedDomainsPath))
-            {
-                try
-                {
-                    foreach (string line in File.ReadAllLines(_trustedDomainsPath))
-                    {
-                        string d = line.Trim();
-                        if (!string.IsNullOrEmpty(d) && !d.StartsWith("#"))
-                            _trustedDomains.Add(d);
-                    }
-                    Plugin.Log("Loaded " + _trustedDomains.Count + " trusted domains.");
-                }
-                catch (Exception ex)
-                {
-                    Plugin.LogError("Failed to load trusted_sites.txt: " + ex.Message);
-                }
-            }
+            ClientConfig.EnsureLoaded();
+            foreach (string d in ClientConfig.TrustedSites)
+                _trustedDomains.Add(d);
         }
 
         private static void SaveTrustedDomain(string domain)
         {
-            _trustedDomains.Add(domain);
-            try
-            {
-                File.AppendAllText(_trustedDomainsPath, domain + Environment.NewLine);
-                Plugin.Log("Saved trusted domain: " + domain);
-            }
-            catch (Exception ex)
-            {
-                Plugin.LogError("Failed to save trusted domain: " + ex.Message);
-            }
+            if (string.IsNullOrEmpty(domain)) return;
+            _trustedDomains?.Add(domain);
+            ClientConfig.AddTrusted(domain);
+            Plugin.Log("Saved trusted domain: " + domain);
         }
 
         private static void LoadSettings()
         {
-            if (_settingsPath != null) return; // already loaded
+            if (_settingsLoaded) return;
+            if (Plugin.IsDedicatedServer()) return; // client-only config
 
-            string modDir = Path.GetDirectoryName(typeof(MOTDUI).Assembly.Location) ?? "";
-            _settingsPath = Path.Combine(modDir, "motd_settings.ini");
-
-            if (!File.Exists(_settingsPath)) return;
-            try
-            {
-                foreach (string line in File.ReadAllLines(_settingsPath))
-                {
-                    string l = line.Trim();
-                    if (l.StartsWith("#") || !l.Contains("=")) continue;
-                    int eq = l.IndexOf('=');
-                    string key = l.Substring(0, eq).Trim().ToLowerInvariant();
-                    string val = l.Substring(eq + 1).Trim();
-                    switch (key)
-                    {
-                        case "volume":
-                            if (float.TryParse(val, System.Globalization.NumberStyles.Float,
-                                System.Globalization.CultureInfo.InvariantCulture, out float v))
-                                _globalVolume = Mathf.Clamp01(v);
-                            break;
-                        case "muted":
-                            _isMuted = val.Equals("true", StringComparison.OrdinalIgnoreCase);
-                            break;
-                        case "screens_disabled":
-                            _screensDisabled = val.Equals("true", StringComparison.OrdinalIgnoreCase);
-                            break;
-                        case "zoom":
-                            if (float.TryParse(val, System.Globalization.NumberStyles.Float,
-                                System.Globalization.CultureInfo.InvariantCulture, out float z))
-                                _zoomLevel = Mathf.Clamp(z, 0.5f, 2.0f);
-                            break;
-                    }
-                }
-                Plugin.Log("MOTD settings loaded.");
-            }
-            catch (Exception ex)
-            {
-                Plugin.LogError("Failed to load motd_settings.ini: " + ex.Message);
-            }
+            ClientConfig.EnsureLoaded();
+            _globalVolume    = ClientConfig.Volume;
+            _isMuted         = ClientConfig.Muted;
+            _screensDisabled = ClientConfig.ScreensDisabled;
+            _zoomLevel       = ClientConfig.Zoom;
+            _settingsLoaded  = true;
+            Plugin.Log("MOTD settings loaded from client_config.json.");
         }
 
         private static void SaveSettings()
         {
-            if (_settingsPath == null)
-            {
-                string modDir = Path.GetDirectoryName(typeof(MOTDUI).Assembly.Location) ?? "";
-                _settingsPath = Path.Combine(modDir, "motd_settings.ini");
-            }
-            try
-            {
-                var sb = new System.Text.StringBuilder();
-                sb.AppendLine("# MOTD client settings - auto-generated, do not edit while game is running");
-                sb.AppendLine("volume=" + _globalVolume.ToString("F3", System.Globalization.CultureInfo.InvariantCulture));
-                sb.AppendLine("muted=" + (_isMuted ? "true" : "false"));
-                sb.AppendLine("screens_disabled=" + (_screensDisabled ? "true" : "false"));
-                sb.AppendLine("zoom=" + _zoomLevel.ToString("F3", System.Globalization.CultureInfo.InvariantCulture));
-                File.WriteAllText(_settingsPath, sb.ToString());
-            }
-            catch (Exception ex)
-            {
-                Plugin.LogError("Failed to save motd_settings.ini: " + ex.Message);
-            }
+            if (Plugin.IsDedicatedServer()) return; // client-only config
+            // Single disk write for all four fields (task 4: batch saves).
+            ClientConfig.SaveSettings(_globalVolume, _isMuted, _screensDisabled, _zoomLevel);
         }
 
         private static void ShowConfirmDialog(string url, string domain)
@@ -1571,22 +1509,62 @@ namespace WebsiteMOTD
             urlLabel.style.marginBottom = 16f;
             dialog.Add(urlLabel);
 
-            // "Don't ask again" toggle
+            // "Don't ask again" toggle. We draw the checkbox ourselves
+            // because Unity's built-in Toggle renders an invisible box on
+            // this dark dialog (its default background image doesn't
+            // contrast with the theme — only the checkmark shows through).
             bool dontAskAgain = false;
             var toggleRow = new VisualElement();
             toggleRow.style.flexDirection = FlexDirection.Row;
             toggleRow.style.alignItems = Align.Center;
             toggleRow.style.marginBottom = 20f;
 
-            var toggle = new Toggle();
-            toggle.value = false;
-            toggle.style.marginRight = 8f;
-            toggle.RegisterValueChangedCallback(e => dontAskAgain = e.newValue);
-            toggleRow.Add(toggle);
+            var checkBox = new VisualElement();
+            checkBox.style.width = 18f;
+            checkBox.style.height = 18f;
+            checkBox.style.marginRight = 10f;
+            checkBox.style.backgroundColor = new Color(0.18f, 0.18f, 0.22f);
+            checkBox.style.borderTopWidth = 1f;
+            checkBox.style.borderBottomWidth = 1f;
+            checkBox.style.borderLeftWidth = 1f;
+            checkBox.style.borderRightWidth = 1f;
+            checkBox.style.borderTopColor = new Color(0.6f, 0.6f, 0.65f);
+            checkBox.style.borderBottomColor = new Color(0.6f, 0.6f, 0.65f);
+            checkBox.style.borderLeftColor = new Color(0.6f, 0.6f, 0.65f);
+            checkBox.style.borderRightColor = new Color(0.6f, 0.6f, 0.65f);
+            checkBox.style.borderTopLeftRadius = 3f;
+            checkBox.style.borderTopRightRadius = 3f;
+            checkBox.style.borderBottomLeftRadius = 3f;
+            checkBox.style.borderBottomRightRadius = 3f;
+            checkBox.style.alignItems = Align.Center;
+            checkBox.style.justifyContent = Justify.Center;
+
+            var checkMark = new Label("✓");
+            checkMark.style.color = new Color(0.4f, 0.9f, 0.5f);
+            checkMark.style.fontSize = 14f;
+            checkMark.style.unityFontStyleAndWeight = FontStyle.Bold;
+            checkMark.style.unityTextAlign = TextAnchor.MiddleCenter;
+            checkMark.style.display = DisplayStyle.None;
+            checkMark.pickingMode = PickingMode.Ignore;
+            checkBox.Add(checkMark);
+
+            Action toggleCheck = () =>
+            {
+                dontAskAgain = !dontAskAgain;
+                checkMark.style.display = dontAskAgain ? DisplayStyle.Flex : DisplayStyle.None;
+                checkBox.style.borderTopColor    = dontAskAgain ? new Color(0.4f, 0.9f, 0.5f) : new Color(0.6f, 0.6f, 0.65f);
+                checkBox.style.borderBottomColor = dontAskAgain ? new Color(0.4f, 0.9f, 0.5f) : new Color(0.6f, 0.6f, 0.65f);
+                checkBox.style.borderLeftColor   = dontAskAgain ? new Color(0.4f, 0.9f, 0.5f) : new Color(0.6f, 0.6f, 0.65f);
+                checkBox.style.borderRightColor  = dontAskAgain ? new Color(0.4f, 0.9f, 0.5f) : new Color(0.6f, 0.6f, 0.65f);
+            };
+            checkBox.RegisterCallback<ClickEvent>(_ => toggleCheck());
+            toggleRow.Add(checkBox);
 
             var toggleLabel = new Label("Don't ask again for " + domain);
             toggleLabel.style.fontSize = 13f;
             toggleLabel.style.color = new Color(0.7f, 0.7f, 0.7f);
+            // Clicking the label also toggles — matches how native checkboxes behave.
+            toggleLabel.RegisterCallback<ClickEvent>(_ => toggleCheck());
             toggleRow.Add(toggleLabel);
             dialog.Add(toggleRow);
 
@@ -2190,6 +2168,24 @@ namespace WebsiteMOTD
             addHeader.style.marginBottom = 4f;
             _queueContent.Add(addHeader);
 
+            // Inline error banner, shown when the server rejects a queue add.
+            _queueErrorLabel = new Label();
+            _queueErrorLabel.style.display = DisplayStyle.None;
+            _queueErrorLabel.style.backgroundColor = new Color(0.4f, 0.12f, 0.12f, 0.9f);
+            _queueErrorLabel.style.color = new Color(1f, 0.85f, 0.85f);
+            _queueErrorLabel.style.fontSize = 12f;
+            _queueErrorLabel.style.paddingLeft = 8f;
+            _queueErrorLabel.style.paddingRight = 8f;
+            _queueErrorLabel.style.paddingTop = 6f;
+            _queueErrorLabel.style.paddingBottom = 6f;
+            _queueErrorLabel.style.borderTopLeftRadius = 4f;
+            _queueErrorLabel.style.borderTopRightRadius = 4f;
+            _queueErrorLabel.style.borderBottomLeftRadius = 4f;
+            _queueErrorLabel.style.borderBottomRightRadius = 4f;
+            _queueErrorLabel.style.marginBottom = 6f;
+            _queueErrorLabel.style.whiteSpace = WhiteSpace.Normal;
+            _queueContent.Add(_queueErrorLabel);
+
             _queueUrlField = new TextField();
             _queueUrlField.value = "";
             _queueUrlField.style.height = 28f;
@@ -2253,6 +2249,24 @@ namespace WebsiteMOTD
             if (string.IsNullOrEmpty(url)) return;
             Plugin.AddToQueue(url);
             _queueUrlField.value = "";
+        }
+
+        /// <summary>
+        /// Show a transient error banner in the queue panel (e.g. when the
+        /// server rejects an add because the URL isn't on the allowlist).
+        /// Auto-hides after ~6 seconds. No-ops if the queue panel isn't built.
+        /// </summary>
+        public static void ShowQueueError(string text)
+        {
+            if (_queueErrorLabel == null) return;
+            _queueErrorLabel.text = text ?? "";
+            _queueErrorLabel.style.display = DisplayStyle.Flex;
+            _queueErrorHide?.Pause();
+            _queueErrorHide = _queueErrorLabel.schedule.Execute(() =>
+            {
+                if (_queueErrorLabel != null)
+                    _queueErrorLabel.style.display = DisplayStyle.None;
+            }).StartingIn(6000);
         }
 
         private static void RefreshQueuePanel()
@@ -2470,11 +2484,6 @@ namespace WebsiteMOTD
             label.style.whiteSpace = WhiteSpace.Normal;
             label.style.marginBottom = 10f;
             parent.Add(label);
-        }
-
-        private static void AddBoldParagraph(VisualElement parent, string text)
-        {
-            AddRichParagraph(parent, "<b>" + text + "</b>", new Color(0.95f, 0.95f, 0.95f));
         }
 
         /// <summary>

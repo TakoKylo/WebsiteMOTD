@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 using HarmonyLib;
-using Steamworks;
 using Unity.Collections;
 using Unity.Netcode;
 using UnityEngine;
@@ -29,9 +28,11 @@ namespace WebsiteMOTD
 
         /// <summary>
         /// The URL shown in the MOTD overlay when clients connect.
-        /// Server sends this to every joining client.
+        /// On a dedicated server this is overwritten from ServerConfig
+        /// at setup time; on clients the server pushes the value via
+        /// the MOTD message and it's updated then.
         /// </summary>
-        public static string MOTD_URL = "https://poncepuck.net/rules/";
+        public static string MOTD_URL = "https://poncepuck.net/motd/";
 
         private static string MESSAGE_CHANNEL = "motd-webpage";
         private static string SCREEN_CHANNEL = "motd-screen";
@@ -43,6 +44,13 @@ namespace WebsiteMOTD
         private static QueueItem _current;
         private static string _lastLoadedWorldUrl; // prevents reloading on every state broadcast
         private static string _endedForUrl;        // deduplicates video-ended signals from multiple clients
+
+        // Server config flags received by clients (default: all enabled)
+        private static bool _serverScreensEnabled = true;
+        private static bool _serverQueueEnabled = true;
+
+        /// <summary>Whether the server allows the queue system (readable by UI).</summary>
+        public static bool IsQueueEnabled => _serverQueueEnabled;
 
         /// <summary>Read-only snapshot for the UI.</summary>
         public static IReadOnlyList<QueueItem> Queue => _queue;
@@ -97,6 +105,15 @@ namespace WebsiteMOTD
             if (_isSetup) return;
             _isSetup = true;
 
+            ServerConfig.Load();
+            // Server applies its own config locally
+            if (IsDedicatedServer())
+            {
+                _serverScreensEnabled = ServerConfig.ScreensEnabled;
+                _serverQueueEnabled   = ServerConfig.QueueEnabled;
+                MOTD_URL              = ServerConfig.MotdUrl;
+            }
+
             var nm = NetworkManager.Singleton;
             if (nm == null)
             {
@@ -119,6 +136,8 @@ namespace WebsiteMOTD
             _current = null;
             _lastLoadedWorldUrl = null;
             _endedForUrl = null;
+            _serverScreensEnabled = true;
+            _serverQueueEnabled = true;
 
             var nm = NetworkManager.Singleton;
             if (nm != null)
@@ -236,29 +255,36 @@ namespace WebsiteMOTD
             Log("Messaging initialized.");
         }
 
-        /// <summary>SERVER → CLIENT: send the MOTD URL.</summary>
+        /// <summary>SERVER → CLIENT: send the MOTD URL + server config flags.</summary>
         private void SendMOTDToClient(ulong clientId)
         {
             var nm = NetworkManager.Singleton;
             if (nm?.CustomMessagingManager == null) return;
 
+            // Payload: ushort urlLen + url bytes + byte flags
+            // flags bit 0 = screens_enabled, bit 1 = queue_enabled
+            byte flags = 0;
+            if (ServerConfig.ScreensEnabled) flags |= 0x01;
+            if (ServerConfig.QueueEnabled)   flags |= 0x02;
+
             byte[] urlBytes = Encoding.UTF8.GetBytes(MOTD_URL);
-            int size = sizeof(ushort) + urlBytes.Length;
+            int size = sizeof(ushort) + urlBytes.Length + 1;
 
             using (var writer = new FastBufferWriter(size, Allocator.Temp))
             {
                 writer.WriteValueSafe((ushort)urlBytes.Length);
                 writer.WriteBytesSafe(urlBytes);
+                writer.WriteValueSafe(flags);
 
                 nm.CustomMessagingManager.SendNamedMessage(
                     MESSAGE_CHANNEL, clientId, writer,
                     NetworkDelivery.ReliableFragmentedSequenced);
             }
 
-            Log("Sent MOTD URL to client " + clientId + ".");
+            Log("Sent MOTD URL to client " + clientId + " (screens=" + ServerConfig.ScreensEnabled + ", queue=" + ServerConfig.QueueEnabled + ").");
         }
 
-        /// <summary>CLIENT: received the MOTD URL from the server.</summary>
+        /// <summary>CLIENT: received the MOTD URL + server config from the server.</summary>
         private static void OnMessageReceived(ulong senderClientId, FastBufferReader reader)
         {
             try
@@ -267,16 +293,32 @@ namespace WebsiteMOTD
                 byte[] urlBytes = new byte[len];
                 reader.ReadBytesSafe(ref urlBytes, len);
 
+                // Read server config flags (backwards-compatible: if missing, defaults to all-enabled)
+                bool screensEnabled = true;
+                bool queueEnabled = true;
+                try
+                {
+                    reader.ReadValueSafe(out byte flags);
+                    screensEnabled = (flags & 0x01) != 0;
+                    queueEnabled   = (flags & 0x02) != 0;
+                }
+                catch { }
+
+                // Apply server's config on the client side
+                _serverScreensEnabled = screensEnabled;
+                _serverQueueEnabled = queueEnabled;
+
                 string url = Encoding.UTF8.GetString(urlBytes);
-                Log("Received MOTD URL from server: " + url);
+                Log("Received MOTD URL: " + url + " (screens=" + screensEnabled + ", queue=" + queueEnabled + ")");
 
                 if (!IsDedicatedServer())
                 {
                     MOTDUI.Show(url);
-                    MOTDWorldScreen.SpawnScreens();
-                    // Show the MOTD on level screens until something is queued.
-                    // LoadCurrentOnWorldScreens() uses _current if set, else MOTD_URL.
-                    LoadCurrentOnWorldScreens();
+                    if (screensEnabled)
+                    {
+                        MOTDWorldScreen.SpawnScreens();
+                        LoadCurrentOnWorldScreens();
+                    }
                 }
             }
             catch (Exception ex)
@@ -290,6 +332,7 @@ namespace WebsiteMOTD
         /// <summary>Add a URL to the shared queue on behalf of the local player.</summary>
         public static void AddToQueue(string url)
         {
+            if (!_serverQueueEnabled) return;
             if (string.IsNullOrWhiteSpace(url)) return;
             url = url.Trim();
             if (!url.StartsWith("http://") && !url.StartsWith("https://"))
@@ -465,6 +508,12 @@ namespace WebsiteMOTD
                         LoadCurrentOnWorldScreens();
                         OnQueueChanged?.Invoke();
                     }
+                    else if (msg.StartsWith("err:"))
+                    {
+                        string err = msg.Substring(4);
+                        LocalChat(err);
+                        MOTDUI.ShowQueueError(err);
+                    }
                 }
             }
             catch (Exception ex)
@@ -477,10 +526,33 @@ namespace WebsiteMOTD
 
         private static void ServerAddItem(ulong clientId, string username, string url)
         {
+            if (!ServerConfig.QueueEnabled) return;
             if (string.IsNullOrWhiteSpace(url)) return;
             url = url.Trim();
             if (!url.StartsWith("http://") && !url.StartsWith("https://"))
                 url = "https://" + url;
+
+            if (!ServerConfig.IsQueueUrlAllowed(url))
+            {
+                string allowed = string.Join(", ", ServerConfig.QueueAllowedSites);
+                string msg = "Queue only accepts URLs from: " + allowed;
+                Log("Rejected queue URL from client " + clientId + " (" + url + ") — not in allowlist.");
+
+                // On a listen server the rejected client IS the host, so
+                // routing through the network layer would bounce to the
+                // server-side message branch and drop the err. Short-circuit.
+                var nm = NetworkManager.Singleton;
+                if (nm != null && clientId == nm.LocalClientId)
+                {
+                    LocalChat(msg);
+                    if (!IsDedicatedServer()) MOTDUI.ShowQueueError(msg);
+                }
+                else
+                {
+                    SendScreenMsgTo(clientId, "err:" + msg);
+                }
+                return;
+            }
 
             var item = new QueueItem
             {
@@ -561,6 +633,9 @@ namespace WebsiteMOTD
         {
             // Dedicated servers have no renderer — skip entirely
             if (IsDedicatedServer()) return;
+
+            // Server disabled level screens for this lobby
+            if (!_serverScreensEnabled) return;
 
             MOTDWorldScreen.SpawnScreens();
             string url = _current != null ? _current.Url : MOTD_URL;
@@ -723,10 +798,7 @@ namespace WebsiteMOTD
                     cm.AddChatMessage(chatMsg);
                     return;
                 }
-                else
-                {
-                    Log("[LocalChat] ChatManager.Instance is null");
-                }
+                Log("[LocalChat] ChatManager.Instance is null");
             }
             catch (Exception ex)
             {
@@ -766,7 +838,8 @@ namespace WebsiteMOTD
 
     /// <summary>
     /// Client-side chat command interceptor.
-    /// Only /web and /queue are supported — everything else is controlled via the UI.
+    /// /web, /motd, /browser   → open the URL in the browser overlay.
+    /// /q, /queue               → add the URL to the shared screen queue.
     /// </summary>
     [HarmonyPatch(typeof(ChatManager), "Client_SendChatMessage")]
     public static class ChatCommandPatch
@@ -779,11 +852,25 @@ namespace WebsiteMOTD
 
             string[] parts = msg.Split(new[] { ' ' }, 2, StringSplitOptions.RemoveEmptyEntries);
             string cmd = parts[0].ToLowerInvariant();
+            string arg = parts.Length > 1 ? parts[1].Trim() : "";
 
-            if (cmd == "/web" || cmd == "/motd" || cmd == "/browser" || cmd == "/queue" || cmd == "/q")
+            if (cmd == "/web" || cmd == "/motd" || cmd == "/browser")
             {
-                string url = parts.Length > 1 ? parts[1].Trim() : Plugin.MOTD_URL;
-                MOTDUI.Show(url);
+                MOTDUI.Show(string.IsNullOrEmpty(arg) ? Plugin.MOTD_URL : arg);
+                return false;
+            }
+
+            if (cmd == "/q" || cmd == "/queue")
+            {
+                if (string.IsNullOrEmpty(arg))
+                {
+                    // No arg: just open the queue UI so they can see / manage it.
+                    MOTDUI.Show(Plugin.MOTD_URL);
+                }
+                else
+                {
+                    Plugin.AddToQueue(arg);
+                }
                 return false;
             }
 

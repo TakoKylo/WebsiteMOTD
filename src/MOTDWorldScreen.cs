@@ -14,8 +14,6 @@ namespace WebsiteMOTD
     {
         // ─── Native DLL imports (same DLL as MOTDWebView) ───────────
         [DllImport("WebView")]
-        private static extern void _CWebViewPlugin_InitStatic(bool inEditor, bool useDirect3D11);
-        [DllImport("WebView")]
         private static extern IntPtr _CWebViewPlugin_Init(string gameObject, bool transparent, bool zoom, int width, int height, string ua, bool separated);
         [DllImport("WebView")]
         private static extern int _CWebViewPlugin_Destroy(IntPtr instance);
@@ -47,12 +45,15 @@ namespace WebsiteMOTD
         private static Texture2D _sharedTexture;
         private static byte[] _sharedTextureBuffer;
         private static ulong _sharedLastGen;
-        private static bool _staticInitDone;
-        private static string _currentUrl;
-        private static bool _bitmapGenSupported = true; // false if DLL lacks _CWebViewPlugin_BitmapGeneration
+        private static bool _bitmapGenSupported = true;
+        private static float _lastLoadTime;  // Unity time of last page load (for adaptive refresh)
 
         private const int TEX_WIDTH = 1280;
         private const int TEX_HEIGHT = 720;
+
+        // Adaptive refresh tiers (seconds since last page load)
+        private const float LoadActiveSec = 3.0f;   // full-speed capture after page load
+        private const float LoadWindDownSec = 8.0f;  // half-speed for a few more seconds
 
         // ─── Per-instance ───────────────────────────────────────────
         private MeshRenderer _renderer;
@@ -91,7 +92,7 @@ namespace WebsiteMOTD
         {
             if (_sharedWebView == IntPtr.Zero) return;
             string embedUrl = MOTDUI.ConvertToEmbedUrl(url);
-            _currentUrl = embedUrl;
+            _lastLoadTime = Time.unscaledTime;
             Plugin.Log("WorldScreen loading: " + embedUrl);
             _CWebViewPlugin_LoadURL(_sharedWebView, embedUrl);
         }
@@ -234,12 +235,7 @@ namespace WebsiteMOTD
         {
             if (_sharedWebView != IntPtr.Zero) return;
 
-            if (!_staticInitDone)
-            {
-                bool isDX11 = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11;
-                _CWebViewPlugin_InitStatic(false, isDX11);
-                _staticInitDone = true;
-            }
+            MOTDWebView.EnsureStaticInit();
 
             _sharedWebView = _CWebViewPlugin_Init(
                 goName, true, false,
@@ -272,7 +268,6 @@ namespace WebsiteMOTD
 
             _sharedTextureBuffer = null;
             _sharedLastGen = 0;
-            _currentUrl = null;
         }
 
         // ─── Per-frame update ───────────────────────────────────────
@@ -282,29 +277,42 @@ namespace WebsiteMOTD
             // Only the primary screen drives the shared webview
             if (_isPrimary && _sharedWebView != IntPtr.Zero)
             {
-                bool refresh = (Time.frameCount % 6 == 0);
-                _CWebViewPlugin_Update(_sharedWebView, refresh, 1);
-
-                    // Process webview messages (detect page load for ad-block/volume injection)
-                    for (;;)
-                    {
-                        string msg = _CWebViewPlugin_GetMessage(_sharedWebView);
-                        if (msg == null) break;
-                        if (msg.StartsWith("CallOnLoaded:"))
-                        {
-                            InjectWorldAdBlockJS();
-                            InjectWorldVolumeJS();
-                            InjectWorldVideoEndedJS();
-                        }
-                        else if (msg.StartsWith("CallFromJS:"))
-                        {
-                            if (msg.Substring(11) == "videoEnded")
-                                Plugin.VideoEnded();
-                        }
-                    }
-
-                if (refresh)
+                // Pump message queue (always, even when not refreshing bitmap)
+                for (;;)
                 {
+                    string msg = _CWebViewPlugin_GetMessage(_sharedWebView);
+                    if (msg == null) break;
+                    if (msg.StartsWith("CallOnLoaded:"))
+                    {
+                        _lastLoadTime = Time.unscaledTime;
+                        InjectWorldAdBlockJS();
+                        InjectWorldVolumeJS();
+                        InjectWorldVideoEndedJS();
+                    }
+                    else if (msg.StartsWith("CallFromJS:"))
+                    {
+                        if (msg.Substring(11) == "videoEnded")
+                            Plugin.VideoEnded();
+                    }
+                }
+
+                // Adaptive refresh: fast after page load, then wind down to idle
+                float idleSec = Time.unscaledTime - _lastLoadTime;
+                bool shouldRefresh;
+                if (!_bitmapGenSupported)
+                    shouldRefresh = (Time.frameCount % 4 == 0);        // ~15fps without change-detection
+                else if (idleSec < LoadActiveSec)
+                    shouldRefresh = true;                               // full speed after load
+                else if (idleSec < LoadWindDownSec)
+                    shouldRefresh = (Time.frameCount % 2 == 0);        // ~30fps
+                else
+                    shouldRefresh = (Time.frameCount % 8 == 0);        // ~7.5fps idle
+
+                _CWebViewPlugin_Update(_sharedWebView, shouldRefresh, 1);
+
+                if (shouldRefresh)
+                {
+                    // Check if native bitmap actually changed since last upload
                     bool bitmapChanged = true;
                     if (_bitmapGenSupported)
                     {
@@ -317,9 +325,10 @@ namespace WebsiteMOTD
                         catch (System.EntryPointNotFoundException)
                         {
                             _bitmapGenSupported = false;
-                            Plugin.LogError("WorldScreen: _CWebViewPlugin_BitmapGeneration not found in DLL — falling back to unconditional refresh.");
+                            Plugin.LogError("WorldScreen: _CWebViewPlugin_BitmapGeneration not found — falling back to unconditional refresh.");
                         }
                     }
+
                     if (bitmapChanged)
                     {
                         int w = _CWebViewPlugin_BitmapWidth(_sharedWebView);
@@ -349,7 +358,6 @@ namespace WebsiteMOTD
                     }
                 }
             }
-
             // All screens apply the shared texture to their material
             if (_sharedTexture != null && _renderer != null && _renderer.material != null
                 && _renderer.material.mainTexture != _sharedTexture)

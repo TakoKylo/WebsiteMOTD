@@ -105,7 +105,19 @@ namespace WebsiteMOTD
 
         private static bool _nativeLoaded;
         private static bool _staticInitDone;
-        private static bool _bitmapGenSupported = true; // false if DLL lacks _CWebViewPlugin_BitmapGeneration
+        private static bool _bitmapGenSupported = true;
+
+        /// <summary>
+        /// Ensures the native WebView2 static init is called exactly once.
+        /// Shared between MOTDWebView and MOTDWorldScreen.
+        /// </summary>
+        public static void EnsureStaticInit()
+        {
+            if (_staticInitDone) return;
+            bool isDX11 = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11;
+            _CWebViewPlugin_InitStatic(false, isDX11);
+            _staticInitDone = true;
+        }
 
         public Texture2D Texture => _texture;
         public bool IsInitialized => _webView != IntPtr.Zero && _CWebViewPlugin_IsInitialized(_webView);
@@ -206,12 +218,7 @@ namespace WebsiteMOTD
 
         private void InitWebView()
         {
-            if (!_staticInitDone)
-            {
-                bool isDX11 = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11;
-                _CWebViewPlugin_InitStatic(false, isDX11);
-                _staticInitDone = true;
-            }
+            EnsureStaticInit();
 
             _webView = _CWebViewPlugin_Init(
                 gameObject.name,
@@ -393,9 +400,9 @@ namespace WebsiteMOTD
         // ─── Per-frame update ───────────────────────────────────────
 
         // Refresh rate tiers based on how recently the user interacted
-        private const float ActiveWindowSec  = 1.0f;  // full-speed capture for 1s after input
-        private const float WindDownSec      = 3.0f;  // half-speed capture for next 2s
-        // After WindDownSec: low-rate (4fps) to catch CSS animations / async content
+        private const float ActiveWindowSec  = 2.0f;  // full-speed capture for 2s after input
+        private const float WindDownSec      = 5.0f;  // half-speed capture for next 3s
+        // After WindDownSec: moderate idle rate to catch CSS animations / async content
 
         void Update()
         {
@@ -431,7 +438,7 @@ namespace WebsiteMOTD
             if (!_visible) return;
 
             // Decide whether to request a new bitmap capture this frame.
-            // Active interaction → every frame.  Winding down → every 2nd frame.  Idle → every 15th frame (~4fps).
+            // Active interaction → every frame.  Winding down → every 2nd frame.  Idle → every 8th frame (~7.5fps).
             // When bitmapGen is unavailable we cap to every 6 frames (~10fps) to avoid
             // uploading a full-resolution bitmap unconditionally at 60fps.
             float idleSec = Time.unscaledTime - _lastInteractTime;
@@ -445,7 +452,7 @@ namespace WebsiteMOTD
             else if (idleSec < WindDownSec)
                 shouldRefresh = (Time.frameCount % 2 == 0);       // ~30fps
             else
-                shouldRefresh = (Time.frameCount % 15 == 0);      // ~4fps idle
+                shouldRefresh = (Time.frameCount % 8 == 0);       // ~7.5fps idle
 
             _CWebViewPlugin_Update(_webView, shouldRefresh, 1);
 

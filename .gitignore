@@ -3,3 +3,8 @@ obj/
 *.user
 *.suo
 .vs/
+*.log
+*.cache
+*.pdb
+*.db
+*.bak

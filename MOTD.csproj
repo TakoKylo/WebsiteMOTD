@@ -19,4 +19,17 @@
     </Reference>
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Enumerate native\ folder contents for copying to output -->
+    <NativeContent Include="$(ProjectDir)native\**\*.*" />
+  </ItemGroup>
+
+  <Target Name="CopyNativeFiles" AfterTargets="Build">
+    <!-- Use MSBuild Copy task — no shell, no UAC prompt, creates output dirs automatically -->
+    <Copy SourceFiles="@(NativeContent)"
+          DestinationFiles="@(NativeContent->'$(OutputPath)native\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          ContinueOnError="true" />
+  </Target>
+
 </Project>

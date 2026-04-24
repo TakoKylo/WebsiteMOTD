@@ -13,15 +13,33 @@ namespace WebsiteMOTD
     internal static class ConfigPaths
     {
         /// <summary>
-        /// &lt;puck-root&gt;/config/ — two levels up from the mod DLL.
-        /// Servers:  /home/user/&lt;unit&gt;/config/
-        /// Clients:  C:\Program Files (x86)\Steam\steamapps\common\Puck\config\
-        /// Directory is created on demand.
+        /// &lt;puck-root&gt;/config/ — Unity's Application.dataPath points at
+        /// &lt;gameRoot&gt;/&lt;exe&gt;_Data, so its parent is the game root on both
+        /// clients (C:\...\Puck\) and dedicated servers (/home/user/&lt;unit&gt;/).
+        /// This is robust regardless of whether the mod DLL lives in
+        /// Plugins/&lt;mod&gt;/ (client) or steamapps/workshop/content/&lt;app&gt;/&lt;id&gt;/
+        /// (server via Steam Workshop).
         /// </summary>
         public static string ConfigDir()
         {
-            string dllDir = Path.GetDirectoryName(typeof(ConfigPaths).Assembly.Location) ?? "";
-            string configDir = Path.GetFullPath(Path.Combine(dllDir, "..", "..", "config"));
+            string gameRoot = null;
+            try
+            {
+                string dataPath = Application.dataPath;
+                if (!string.IsNullOrEmpty(dataPath))
+                    gameRoot = Path.GetDirectoryName(dataPath);
+            }
+            catch { }
+
+            if (string.IsNullOrEmpty(gameRoot))
+            {
+                // Last-ditch fallback: assume client layout. Shouldn't hit
+                // this in practice — Application.dataPath is always set.
+                string dllDir = DllDir();
+                gameRoot = Path.GetFullPath(Path.Combine(dllDir, "..", ".."));
+            }
+
+            string configDir = Path.Combine(gameRoot, "config");
             try
             {
                 if (!Directory.Exists(configDir)) Directory.CreateDirectory(configDir);
@@ -33,10 +51,24 @@ namespace WebsiteMOTD
             return configDir;
         }
 
-        /// <summary>Legacy location: next to the mod DLL. Used for one-shot migration.</summary>
+        /// <summary>Mod DLL directory — used as a legacy-migration source.</summary>
         public static string DllDir()
         {
             return Path.GetDirectoryName(typeof(ConfigPaths).Assembly.Location) ?? "";
+        }
+
+        /// <summary>
+        /// Candidate legacy locations to migrate from, in priority order.
+        /// Covers both the "next to DLL" layout and the short-lived
+        /// &lt;dll&gt;/../../config/ layout that resolved incorrectly on
+        /// dedicated servers (landed in steamapps/workshop/content/config/).
+        /// </summary>
+        public static IEnumerable<string> LegacyDirs()
+        {
+            string dllDir = DllDir();
+            yield return dllDir;
+            string upTwo = Path.GetFullPath(Path.Combine(dllDir, "..", "..", "config"));
+            yield return upTwo;
         }
     }
 
@@ -119,21 +151,28 @@ namespace WebsiteMOTD
             string configDir = ConfigPaths.ConfigDir();
             string dllDir    = ConfigPaths.DllDir();
             string jsonPath  = Path.Combine(configDir, "server_config.json");
-            string oldJson   = Path.Combine(dllDir,    "server_config.json");
             string iniPath   = Path.Combine(dllDir,    "server_config.ini");
 
-            // Migrate prior location: if an older install left the JSON
-            // next to the DLL, pick it up on the way to the new location.
-            if (!File.Exists(jsonPath) && File.Exists(oldJson))
+            // Migrate from any legacy location (next to DLL, or the
+            // buggy <dll>/../../config path that resolved to
+            // steamapps/workshop/content/config on servers).
+            if (!File.Exists(jsonPath))
             {
-                try
+                foreach (string dir in ConfigPaths.LegacyDirs())
                 {
-                    File.Copy(oldJson, jsonPath, false);
-                    Plugin.Log("Moved server_config.json from DLL dir into " + configDir + ".");
-                }
-                catch (Exception ex)
-                {
-                    Plugin.LogError("Failed to relocate server_config.json: " + ex.Message);
+                    string candidate = Path.Combine(dir, "server_config.json");
+                    if (candidate == jsonPath) continue;
+                    if (!File.Exists(candidate)) continue;
+                    try
+                    {
+                        File.Copy(candidate, jsonPath, false);
+                        Plugin.Log("Migrated server_config.json from " + candidate + " → " + jsonPath);
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Plugin.LogError("Failed to migrate " + candidate + ": " + ex.Message);
+                    }
                 }
             }
 
@@ -303,22 +342,29 @@ namespace WebsiteMOTD
             string configDir = ConfigPaths.ConfigDir();
             string dllDir    = ConfigPaths.DllDir();
             _path            = Path.Combine(configDir, "client_config.json");
-            string oldJson   = Path.Combine(dllDir,    "client_config.json");
             string iniPath   = Path.Combine(dllDir,    "motd_settings.ini");
             string trustPath = Path.Combine(dllDir,    "trusted_sites.txt");
 
-            // Migrate prior location: an older install may have written
-            // client_config.json next to the DLL; pick it up once.
-            if (!File.Exists(_path) && File.Exists(oldJson))
+            // Migrate from any legacy location (next to DLL, or the
+            // buggy <dll>/../../config path used briefly after the
+            // first relocation attempt).
+            if (!File.Exists(_path))
             {
-                try
+                foreach (string dir in ConfigPaths.LegacyDirs())
                 {
-                    File.Copy(oldJson, _path, false);
-                    Plugin.Log("Moved client_config.json from DLL dir into " + configDir + ".");
-                }
-                catch (Exception ex)
-                {
-                    Plugin.LogError("Failed to relocate client_config.json: " + ex.Message);
+                    string candidate = Path.Combine(dir, "client_config.json");
+                    if (candidate == _path) continue;
+                    if (!File.Exists(candidate)) continue;
+                    try
+                    {
+                        File.Copy(candidate, _path, false);
+                        Plugin.Log("Migrated client_config.json from " + candidate + " → " + _path);
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Plugin.LogError("Failed to migrate " + candidate + ": " + ex.Message);
+                    }
                 }
             }
 

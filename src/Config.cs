@@ -7,6 +7,40 @@ using UnityEngine;
 namespace WebsiteMOTD
 {
     // ────────────────────────────────────────────────────────────────
+    //  Shared path helpers
+    // ────────────────────────────────────────────────────────────────
+
+    internal static class ConfigPaths
+    {
+        /// <summary>
+        /// &lt;puck-root&gt;/config/ — two levels up from the mod DLL.
+        /// Servers:  /home/user/&lt;unit&gt;/config/
+        /// Clients:  C:\Program Files (x86)\Steam\steamapps\common\Puck\config\
+        /// Directory is created on demand.
+        /// </summary>
+        public static string ConfigDir()
+        {
+            string dllDir = Path.GetDirectoryName(typeof(ConfigPaths).Assembly.Location) ?? "";
+            string configDir = Path.GetFullPath(Path.Combine(dllDir, "..", "..", "config"));
+            try
+            {
+                if (!Directory.Exists(configDir)) Directory.CreateDirectory(configDir);
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("Failed to create config dir '" + configDir + "': " + ex.Message);
+            }
+            return configDir;
+        }
+
+        /// <summary>Legacy location: next to the mod DLL. Used for one-shot migration.</summary>
+        public static string DllDir()
+        {
+            return Path.GetDirectoryName(typeof(ConfigPaths).Assembly.Location) ?? "";
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
     //  Server-only config
     // ────────────────────────────────────────────────────────────────
 
@@ -82,9 +116,26 @@ namespace WebsiteMOTD
 
             if (!Plugin.IsDedicatedServer()) return;
 
-            string modDir  = Path.GetDirectoryName(typeof(ServerConfig).Assembly.Location) ?? "";
-            string jsonPath = Path.Combine(modDir, "server_config.json");
-            string iniPath  = Path.Combine(modDir, "server_config.ini");
+            string configDir = ConfigPaths.ConfigDir();
+            string dllDir    = ConfigPaths.DllDir();
+            string jsonPath  = Path.Combine(configDir, "server_config.json");
+            string oldJson   = Path.Combine(dllDir,    "server_config.json");
+            string iniPath   = Path.Combine(dllDir,    "server_config.ini");
+
+            // Migrate prior location: if an older install left the JSON
+            // next to the DLL, pick it up on the way to the new location.
+            if (!File.Exists(jsonPath) && File.Exists(oldJson))
+            {
+                try
+                {
+                    File.Copy(oldJson, jsonPath, false);
+                    Plugin.Log("Moved server_config.json from DLL dir into " + configDir + ".");
+                }
+                catch (Exception ex)
+                {
+                    Plugin.LogError("Failed to relocate server_config.json: " + ex.Message);
+                }
+            }
 
             if (File.Exists(jsonPath))
             {
@@ -95,7 +146,8 @@ namespace WebsiteMOTD
                     if (parsed != null) _data = parsed;
                     if (string.IsNullOrWhiteSpace(_data.motd_url))
                         _data.motd_url = "https://poncepuck.net/motd/";
-                    Plugin.Log("Server config loaded (screens=" + _data.screens_enabled
+                    Plugin.Log("Server config loaded from " + jsonPath
+                               + " (screens=" + _data.screens_enabled
                                + ", queue=" + _data.queue_enabled
                                + ", motd_url=" + _data.motd_url + ").");
                 }
@@ -106,10 +158,7 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // First run on this server: migrate from the legacy INI if one
-            // exists so admins don't lose their screens_enabled / queue_enabled
-            // toggles when upgrading. The old .ini file is left in place as
-            // a breadcrumb; mod can be downgraded without data loss.
+            // First run: migrate from legacy .ini if present, else defaults.
             if (File.Exists(iniPath))
             {
                 try
@@ -131,7 +180,7 @@ namespace WebsiteMOTD
                                 break;
                         }
                     }
-                    Plugin.Log("Migrated legacy server_config.ini → server_config.json.");
+                    Plugin.Log("Migrated legacy server_config.ini → " + jsonPath + ".");
                 }
                 catch (Exception ex)
                 {
@@ -251,10 +300,27 @@ namespace WebsiteMOTD
             // No client config on dedicated servers.
             if (Plugin.IsDedicatedServer()) return;
 
-            string modDir = Path.GetDirectoryName(typeof(ClientConfig).Assembly.Location) ?? "";
-            _path            = Path.Combine(modDir, "client_config.json");
-            string iniPath   = Path.Combine(modDir, "motd_settings.ini");
-            string trustPath = Path.Combine(modDir, "trusted_sites.txt");
+            string configDir = ConfigPaths.ConfigDir();
+            string dllDir    = ConfigPaths.DllDir();
+            _path            = Path.Combine(configDir, "client_config.json");
+            string oldJson   = Path.Combine(dllDir,    "client_config.json");
+            string iniPath   = Path.Combine(dllDir,    "motd_settings.ini");
+            string trustPath = Path.Combine(dllDir,    "trusted_sites.txt");
+
+            // Migrate prior location: an older install may have written
+            // client_config.json next to the DLL; pick it up once.
+            if (!File.Exists(_path) && File.Exists(oldJson))
+            {
+                try
+                {
+                    File.Copy(oldJson, _path, false);
+                    Plugin.Log("Moved client_config.json from DLL dir into " + configDir + ".");
+                }
+                catch (Exception ex)
+                {
+                    Plugin.LogError("Failed to relocate client_config.json: " + ex.Message);
+                }
+            }
 
             if (File.Exists(_path))
             {
@@ -347,10 +413,7 @@ namespace WebsiteMOTD
         {
             if (Plugin.IsDedicatedServer()) return;
             if (_path == null)
-            {
-                string modDir = Path.GetDirectoryName(typeof(ClientConfig).Assembly.Location) ?? "";
-                _path = Path.Combine(modDir, "client_config.json");
-            }
+                _path = Path.Combine(ConfigPaths.ConfigDir(), "client_config.json");
             try
             {
                 File.WriteAllText(_path, JsonUtility.ToJson(_data, true));

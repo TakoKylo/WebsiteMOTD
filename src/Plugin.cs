@@ -311,6 +311,10 @@ namespace WebsiteMOTD
                 string url = Encoding.UTF8.GetString(urlBytes);
                 Log("Received MOTD URL: " + url + " (screens=" + screensEnabled + ", queue=" + queueEnabled + ")");
 
+                // Cache the server's URL so /web (no arg) opens the right page.
+                if (!string.IsNullOrWhiteSpace(url))
+                    MOTD_URL = url;
+
                 if (!IsDedicatedServer())
                 {
                     MOTDUI.Show(url);

@@ -34,9 +34,15 @@ Required files alongside the DLL after a clean install:
 
 ## Configuration
 
-Two JSON files live next to `WebsiteMOTD.dll`. Each is only created on the
-side that needs it, so a server install never gets a client file and vice
-versa.
+Two JSON files live in `<puck-root>/config/` (two directories up from the mod
+DLL). Each is only created on the side that needs it, so a server install
+never gets a client file and vice versa.
+
+- Windows client: `C:\Program Files (x86)\Steam\steamapps\common\Puck\config\`
+- Linux server:   `/home/<user>/<unit>/config/`
+
+The directory is created on demand. If you had configs sitting next to the DLL
+from a pre-relocation build, they're moved into the new location on first run.
 
 ### Server — `server_config.json`
 

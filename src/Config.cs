@@ -58,8 +58,8 @@ namespace WebsiteMOTD
     [Serializable]
     public class ServerConfigData
     {
-        public bool screens_enabled = true;
-        public bool queue_enabled = true;
+        public bool screens_enabled = false;
+        public bool queue_enabled = false;
         public string motd_url = "https://poncepuck.net/motd/";
 
         // Host allowlist for the shared queue. Domain is matched against

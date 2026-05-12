@@ -19,7 +19,7 @@ namespace WebsiteMOTD
         public List<ulong> VoteSkippers = new List<ulong>();
     }
 
-    public class Plugin : IPuckMod
+    public class Plugin : IPuckPlugin
     {
         public static string MOD_NAME = "WebsiteMOTD";
         public static string MOD_VERSION = "1.0.0";

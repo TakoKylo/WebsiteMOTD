@@ -19,7 +19,7 @@ namespace WebsiteMOTD
         public List<ulong> VoteSkippers = new List<ulong>();
     }
 
-    public class Plugin : IPuckMod
+    public class Plugin : IPuckPlugin
     {
         public static string MOD_NAME = "WebsiteMOTD";
         public static string MOD_VERSION = "1.0.0";
@@ -310,6 +310,10 @@ namespace WebsiteMOTD
 
                 string url = Encoding.UTF8.GetString(urlBytes);
                 Log("Received MOTD URL: " + url + " (screens=" + screensEnabled + ", queue=" + queueEnabled + ")");
+
+                // Cache the server's URL so /web (no arg) opens the right page.
+                if (!string.IsNullOrWhiteSpace(url))
+                    MOTD_URL = url;
 
                 if (!IsDedicatedServer())
                 {

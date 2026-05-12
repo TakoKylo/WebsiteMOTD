@@ -7,14 +7,59 @@ using UnityEngine;
 namespace WebsiteMOTD
 {
     // ────────────────────────────────────────────────────────────────
+    //  Shared path helpers
+    // ────────────────────────────────────────────────────────────────
+
+    internal static class ConfigPaths
+    {
+        /// <summary>
+        /// &lt;puck-root&gt;/config/ — derived from Application.dataPath, which
+        /// always points at &lt;gameRoot&gt;/Puck_Data on both clients and
+        /// dedicated servers (regardless of whether the mod DLL lives in
+        /// Plugins/&lt;mod&gt;/ or steamapps/workshop/content/&lt;app&gt;/&lt;id&gt;/).
+        /// Mirrors the pattern CompetitiveAdjustments uses, which is known
+        /// to land in the right place on Workshop-installed servers.
+        /// </summary>
+        public static string ConfigDir()
+        {
+            string gameRoot = Application.dataPath;
+            if (gameRoot.EndsWith("Puck_Data"))
+                gameRoot = Directory.GetParent(gameRoot).FullName;
+
+            string configDir = Path.Combine(gameRoot, "config");
+            if (!Directory.Exists(configDir))
+                Directory.CreateDirectory(configDir);
+            return configDir;
+        }
+
+        /// <summary>Mod DLL directory — used as a legacy-migration source.</summary>
+        public static string DllDir()
+        {
+            return Path.GetDirectoryName(typeof(ConfigPaths).Assembly.Location) ?? "";
+        }
+
+        /// <summary>
+        /// Candidate legacy locations to migrate from, in priority order.
+        /// Only includes &quot;next to DLL&quot; — the old &lt;dll&gt;/../../config/
+        /// path is intentionally excluded because on Workshop-installed
+        /// servers it resolved to steamapps/workshop/content/config/, and
+        /// migrating from a wrong path would just propagate stale data.
+        /// </summary>
+        public static IEnumerable<string> LegacyDirs()
+        {
+            yield return DllDir();
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────
     //  Server-only config
     // ────────────────────────────────────────────────────────────────
 
     [Serializable]
     public class ServerConfigData
     {
-        public bool screens_enabled = true;
-        public bool queue_enabled = true;
+        public bool screens_enabled = false;
+        public bool queue_enabled = false;
         public string motd_url = "https://poncepuck.net/motd/";
 
         // Host allowlist for the shared queue. Domain is matched against
@@ -32,7 +77,7 @@ namespace WebsiteMOTD
 
     /// <summary>
     /// Hard settings for dedicated servers. Persisted to
-    ///   &lt;modDir&gt;/server_config.json
+    ///   &lt;puck-root&gt;/config/ServerMOTD.json
     /// and only ever created/read on dedicated servers — clients never
     /// touch this file. Admins can change the MOTD URL here without
     /// recompiling the mod.
@@ -82,9 +127,38 @@ namespace WebsiteMOTD
 
             if (!Plugin.IsDedicatedServer()) return;
 
-            string modDir  = Path.GetDirectoryName(typeof(ServerConfig).Assembly.Location) ?? "";
-            string jsonPath = Path.Combine(modDir, "server_config.json");
-            string iniPath  = Path.Combine(modDir, "server_config.ini");
+            string configDir = ConfigPaths.ConfigDir();
+            string dllDir    = ConfigPaths.DllDir();
+            string jsonPath  = Path.Combine(configDir, "ServerMOTD.json");
+            string iniPath   = Path.Combine(dllDir,    "server_config.ini");
+
+            // Migrate from older filenames (server_config.json) and older
+            // locations (next to the mod DLL). New canonical name is
+            // ServerMOTD.json under <puck-root>/config/.
+            if (!File.Exists(jsonPath))
+            {
+                string[] candidates = new[]
+                {
+                    Path.Combine(configDir, "server_config.json"),
+                    Path.Combine(dllDir,    "ServerMOTD.json"),
+                    Path.Combine(dllDir,    "server_config.json"),
+                };
+                foreach (string candidate in candidates)
+                {
+                    if (candidate == jsonPath) continue;
+                    if (!File.Exists(candidate)) continue;
+                    try
+                    {
+                        File.Copy(candidate, jsonPath, false);
+                        Plugin.Log("Migrated " + Path.GetFileName(candidate) + " → " + jsonPath);
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Plugin.LogError("Failed to migrate " + candidate + ": " + ex.Message);
+                    }
+                }
+            }
 
             if (File.Exists(jsonPath))
             {
@@ -95,21 +169,19 @@ namespace WebsiteMOTD
                     if (parsed != null) _data = parsed;
                     if (string.IsNullOrWhiteSpace(_data.motd_url))
                         _data.motd_url = "https://poncepuck.net/motd/";
-                    Plugin.Log("Server config loaded (screens=" + _data.screens_enabled
+                    Plugin.Log("Server config loaded from " + jsonPath
+                               + " (screens=" + _data.screens_enabled
                                + ", queue=" + _data.queue_enabled
                                + ", motd_url=" + _data.motd_url + ").");
                 }
                 catch (Exception ex)
                 {
-                    Plugin.LogError("Failed to parse server_config.json: " + ex.Message);
+                    Plugin.LogError("Failed to parse ServerMOTD.json: " + ex.Message);
                 }
                 return;
             }
 
-            // First run on this server: migrate from the legacy INI if one
-            // exists so admins don't lose their screens_enabled / queue_enabled
-            // toggles when upgrading. The old .ini file is left in place as
-            // a breadcrumb; mod can be downgraded without data loss.
+            // First run: migrate from legacy .ini if present, else defaults.
             if (File.Exists(iniPath))
             {
                 try
@@ -131,7 +203,7 @@ namespace WebsiteMOTD
                                 break;
                         }
                     }
-                    Plugin.Log("Migrated legacy server_config.ini → server_config.json.");
+                    Plugin.Log("Migrated legacy server_config.ini → " + jsonPath + ".");
                 }
                 catch (Exception ex)
                 {
@@ -151,7 +223,7 @@ namespace WebsiteMOTD
             }
             catch (Exception ex)
             {
-                Plugin.LogError("Failed to write server_config.json: " + ex.Message);
+                Plugin.LogError("Failed to write ServerMOTD.json: " + ex.Message);
             }
         }
     }
@@ -166,14 +238,14 @@ namespace WebsiteMOTD
         public float volume = 0.5f;
         public bool muted = false;
         public bool screens_disabled = false;
-        public float zoom = 1.25f;
+        public float zoom = 1.0f;
         public List<string> trusted_sites = new List<string>();
     }
 
     /// <summary>
     /// Per-user UI settings plus the trusted-sites allowlist, stored in a
-    /// single file at &lt;modDir&gt;/client_config.json. Never created on
-    /// dedicated servers. Replaces the old motd_settings.ini +
+    /// single file at &lt;puck-root&gt;/config/ClientMOTD.json. Never created
+    /// on dedicated servers. Replaces the old motd_settings.ini +
     /// trusted_sites.txt pair; legacy files are migrated on first run.
     /// </summary>
     public static class ClientConfig
@@ -251,10 +323,39 @@ namespace WebsiteMOTD
             // No client config on dedicated servers.
             if (Plugin.IsDedicatedServer()) return;
 
-            string modDir = Path.GetDirectoryName(typeof(ClientConfig).Assembly.Location) ?? "";
-            _path            = Path.Combine(modDir, "client_config.json");
-            string iniPath   = Path.Combine(modDir, "motd_settings.ini");
-            string trustPath = Path.Combine(modDir, "trusted_sites.txt");
+            string configDir = ConfigPaths.ConfigDir();
+            string dllDir    = ConfigPaths.DllDir();
+            _path            = Path.Combine(configDir, "ClientMOTD.json");
+            string iniPath   = Path.Combine(dllDir,    "motd_settings.ini");
+            string trustPath = Path.Combine(dllDir,    "trusted_sites.txt");
+
+            // Migrate from older filenames (client_config.json) and older
+            // locations (next to the mod DLL). New canonical name is
+            // ClientMOTD.json under <puck-root>/config/.
+            if (!File.Exists(_path))
+            {
+                string[] candidates = new[]
+                {
+                    Path.Combine(configDir, "client_config.json"),
+                    Path.Combine(dllDir,    "ClientMOTD.json"),
+                    Path.Combine(dllDir,    "client_config.json"),
+                };
+                foreach (string candidate in candidates)
+                {
+                    if (candidate == _path) continue;
+                    if (!File.Exists(candidate)) continue;
+                    try
+                    {
+                        File.Copy(candidate, _path, false);
+                        Plugin.Log("Migrated " + Path.GetFileName(candidate) + " → " + _path);
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Plugin.LogError("Failed to migrate " + candidate + ": " + ex.Message);
+                    }
+                }
+            }
 
             if (File.Exists(_path))
             {
@@ -271,7 +372,7 @@ namespace WebsiteMOTD
                 }
                 catch (Exception ex)
                 {
-                    Plugin.LogError("Failed to parse client_config.json: " + ex.Message);
+                    Plugin.LogError("Failed to parse ClientMOTD.json: " + ex.Message);
                 }
             }
             else
@@ -315,7 +416,7 @@ namespace WebsiteMOTD
                             break;
                     }
                 }
-                Plugin.Log("Migrated legacy motd_settings.ini → client_config.json.");
+                Plugin.Log("Migrated legacy motd_settings.ini → ClientMOTD.json.");
             }
             catch (Exception ex)
             {
@@ -335,7 +436,7 @@ namespace WebsiteMOTD
                     if (!_data.trusted_sites.Contains(d))
                         _data.trusted_sites.Add(d);
                 }
-                Plugin.Log("Migrated " + _data.trusted_sites.Count + " trusted sites → client_config.json.");
+                Plugin.Log("Migrated " + _data.trusted_sites.Count + " trusted sites → ClientMOTD.json.");
             }
             catch (Exception ex)
             {
@@ -347,17 +448,14 @@ namespace WebsiteMOTD
         {
             if (Plugin.IsDedicatedServer()) return;
             if (_path == null)
-            {
-                string modDir = Path.GetDirectoryName(typeof(ClientConfig).Assembly.Location) ?? "";
-                _path = Path.Combine(modDir, "client_config.json");
-            }
+                _path = Path.Combine(ConfigPaths.ConfigDir(), "ClientMOTD.json");
             try
             {
                 File.WriteAllText(_path, JsonUtility.ToJson(_data, true));
             }
             catch (Exception ex)
             {
-                Plugin.LogError("Failed to write client_config.json: " + ex.Message);
+                Plugin.LogError("Failed to write ClientMOTD.json: " + ex.Message);
             }
         }
     }

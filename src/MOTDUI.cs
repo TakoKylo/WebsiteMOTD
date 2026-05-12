@@ -35,6 +35,8 @@ namespace WebsiteMOTD
         private static VisualElement _webViewElement;
         private static bool _useWebView;
         private static Button _webViewToggleBtn;
+        private static int _lastWebViewWidth;
+        private static int _lastWebViewHeight;
 
         // ── Queue panel ──
         private static VisualElement _queuePanel;          // outer container (tab + content)
@@ -63,7 +65,7 @@ namespace WebsiteMOTD
         private static Button _settingsBtn;
         private static Button _minimizeBtn;
         private static bool _settingsOpen;
-        private static float _zoomLevel = 1.25f;
+        private static float _zoomLevel = 1.0f;
         private static bool _isMinimized;
         private static VisualElement _card;
         private static VisualElement _cardBody;
@@ -619,7 +621,8 @@ namespace WebsiteMOTD
             _webViewElement.name = "WebViewDisplay";
             _webViewElement.style.flexGrow = 1f;
             _webViewElement.style.display = DisplayStyle.None;
-            // Stretch to fill — webview aspect ratio is set to match the card
+            // Texture is sized to match the element's aspect ratio (see GeometryChangedEvent
+            // below), so a plain 100%/100% fill leaves no dead space and no stretch/squish.
             _webViewElement.style.backgroundSize = new BackgroundSize(new Length(100f, LengthUnit.Percent), new Length(100f, LengthUnit.Percent));
             // Flip Y: WebView2 bitmap is top-down, Unity texture row 0 is bottom
             _webViewElement.style.scale = new StyleScale(new Scale(new Vector3(1f, -1f, 1f)));
@@ -628,10 +631,33 @@ namespace WebsiteMOTD
             if (_scrollView != null && _scrollView.parent != null)
                 _scrollView.parent.Insert(_scrollView.parent.IndexOf(_scrollView) + 1, _webViewElement);
 
-            // Match WebView resolution to player's display resolution
-            int wvWidth = Screen.width;
-            int wvHeight = Screen.height;
-            Plugin.Log("WebView resolution: " + wvWidth + "x" + wvHeight);
+            // Initial viewport — replaced by the GeometryChangedEvent below as soon as
+            // the element is laid out, so the texture aspect matches the card.
+            int wvWidth = 1920;
+            int wvHeight = 1080;
+            _lastWebViewWidth = wvWidth;
+            _lastWebViewHeight = wvHeight;
+            Plugin.Log("WebView initial viewport: " + wvWidth + "x" + wvHeight);
+
+            // Resize the WebView texture whenever the display element's layout changes,
+            // so the browser viewport always matches the card aspect ratio. Reference
+            // height is fixed for consistent text/element scaling regardless of physical
+            // resolution; width follows the card aspect (capped to a sane range).
+            _webViewElement.RegisterCallback<GeometryChangedEvent>(evt =>
+            {
+                if (_webView == null) return;
+                float w = evt.newRect.width;
+                float h = evt.newRect.height;
+                if (w <= 1f || h <= 1f) return;
+                const int refHeight = 1080;
+                int targetH = refHeight;
+                int targetW = Mathf.Clamp(Mathf.RoundToInt(refHeight * (w / h)), 640, 3840);
+                if (Mathf.Abs(targetW - _lastWebViewWidth) < 16 && Mathf.Abs(targetH - _lastWebViewHeight) < 16)
+                    return;
+                _lastWebViewWidth = targetW;
+                _lastWebViewHeight = targetH;
+                _webView.SetSize(targetW, targetH);
+            });
 
             _webView = MOTDWebView.Create(
                 _webViewElement,
@@ -639,16 +665,22 @@ namespace WebsiteMOTD
                 onLoaded: url =>
                 {
                     Plugin.Log("WebView loaded: " + url);
+                    _url = url;
                     if (_urlField != null && _useWebView)
                         _urlField.value = url;
                     InjectAdBlockJS();
                     ApplyWebViewVolume();
                     InjectMediaHelperJS();
                     ApplyWebViewZoom();
+                    UpdateBackForwardButtons();
                 },
                 onStarted: url =>
                 {
                     Plugin.Log("WebView started: " + url);
+                    _url = url;
+                    if (_urlField != null && _useWebView)
+                        _urlField.value = url;
+                    UpdateBackForwardButtons();
                 },
                 onError: err =>
                 {
@@ -1388,7 +1420,7 @@ namespace WebsiteMOTD
         }
 
         // Settings + trusted-sites are persisted through ClientConfig
-        // (single client_config.json). These wrappers hydrate the UI's
+        // (single ClientMOTD.json). These wrappers hydrate the UI's
         // in-memory cache fields from disk and push changes back.
 
         private static void LoadTrustedDomains()
@@ -1422,7 +1454,7 @@ namespace WebsiteMOTD
             _screensDisabled = ClientConfig.ScreensDisabled;
             _zoomLevel       = ClientConfig.Zoom;
             _settingsLoaded  = true;
-            Plugin.Log("MOTD settings loaded from client_config.json.");
+            Plugin.Log("MOTD settings loaded from ClientMOTD.json.");
         }
 
         private static void SaveSettings()

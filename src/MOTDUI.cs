@@ -641,8 +641,9 @@ namespace WebsiteMOTD
 
             // Resize the WebView texture whenever the display element's layout changes,
             // so the browser viewport always matches the card aspect ratio. Reference
-            // height is fixed for consistent text/element scaling regardless of physical
-            // resolution; width follows the card aspect (capped to a sane range).
+            // height is fixed at 1080 so pages always see a standard 1080p-tall browser
+            // viewport regardless of the player's physical resolution — content stays
+            // the same physical size, and the zoom slider lets users adjust from there.
             _webViewElement.RegisterCallback<GeometryChangedEvent>(evt =>
             {
                 if (_webView == null) return;
@@ -962,10 +963,10 @@ namespace WebsiteMOTD
         {
             if (_muteBtn != null)
             {
-                _muteBtn.text = _isMuted ? "🔇" : "🔊";
+                _muteBtn.text = _isMuted ? "Muted" : "Mute";
                 _muteBtn.tooltip = _isMuted ? "Unmute" : "Mute";
-                _muteBtn.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
-                _muteBtn.style.color = _isMuted ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f);
+                _muteBtn.style.backgroundColor = _isMuted ? new Color(0.4f, 0.12f, 0.12f) : new Color(0.25f, 0.25f, 0.3f);
+                _muteBtn.style.color = _isMuted ? new Color(1f, 0.7f, 0.7f) : Color.white;
             }
             if (_muteSettingsBtn != null)
             {
@@ -975,9 +976,10 @@ namespace WebsiteMOTD
             }
             if (_miniMuteBtn != null)
             {
-                _miniMuteBtn.text    = _isMuted ? "\ud83d\udd07" : "\ud83d\udd0a";
+                _miniMuteBtn.text    = _isMuted ? "Muted" : "Mute";
                 _miniMuteBtn.tooltip = _isMuted ? "Unmute" : "Mute";
-                _miniMuteBtn.style.color = _isMuted ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f);
+                _miniMuteBtn.style.color = _isMuted ? new Color(1f, 0.7f, 0.7f) : Color.white;
+                _miniMuteBtn.style.backgroundColor = _isMuted ? new Color(0.4f, 0.12f, 0.12f) : new Color(0.25f, 0.25f, 0.3f);
             }
         }
 
@@ -1055,7 +1057,7 @@ namespace WebsiteMOTD
                 // Restore main overlay
                 if (_overlay != null) _overlay.style.display = DisplayStyle.Flex;
                 DestroyMiniBar();
-                if (_minimizeBtn != null) _minimizeBtn.text = "\u2212";
+                if (_minimizeBtn != null) _minimizeBtn.text = "Min";
             }
         }
 
@@ -1090,21 +1092,23 @@ namespace WebsiteMOTD
             _miniBar.style.borderLeftColor   = new Color(0.25f, 0.25f, 0.3f);
             _miniBar.style.borderRightColor  = new Color(0.25f, 0.25f, 0.3f);
 
-            // Mute button
+            // Mute button \u2014 text label so it renders regardless of font glyph coverage
             _miniMuteBtn = new Button(ToggleMute);
-            _miniMuteBtn.text    = _isMuted ? "\ud83d\udd07" : "\ud83d\udd0a";
+            _miniMuteBtn.text    = _isMuted ? "Muted" : "Mute";
             _miniMuteBtn.tooltip = _isMuted ? "Unmute" : "Mute";
-            _miniMuteBtn.style.fontSize = 15f;
-            _miniMuteBtn.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
-            _miniMuteBtn.style.color = _isMuted ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f);
+            _miniMuteBtn.style.fontSize = 12f;
+            _miniMuteBtn.style.unityFontStyleAndWeight = FontStyle.Bold;
+            _miniMuteBtn.style.unityTextAlign = TextAnchor.MiddleCenter;
+            _miniMuteBtn.style.backgroundColor = _isMuted ? new Color(0.4f, 0.12f, 0.12f) : new Color(0.25f, 0.25f, 0.3f);
+            _miniMuteBtn.style.color = _isMuted ? new Color(1f, 0.7f, 0.7f) : Color.white;
             _miniMuteBtn.style.borderTopWidth = _miniMuteBtn.style.borderBottomWidth =
                 _miniMuteBtn.style.borderLeftWidth = _miniMuteBtn.style.borderRightWidth = 0f;
-            _miniMuteBtn.style.paddingLeft = _miniMuteBtn.style.paddingRight = 4f;
+            _miniMuteBtn.style.borderTopLeftRadius = _miniMuteBtn.style.borderTopRightRadius =
+                _miniMuteBtn.style.borderBottomLeftRadius = _miniMuteBtn.style.borderBottomRightRadius = 4f;
+            _miniMuteBtn.style.paddingLeft = _miniMuteBtn.style.paddingRight = 8f;
             _miniMuteBtn.style.paddingTop  = _miniMuteBtn.style.paddingBottom = 2f;
             _miniMuteBtn.style.height = 26f;
-            _miniMuteBtn.RegisterCallback<MouseEnterEvent>(e => _miniMuteBtn.style.color = Color.white);
-            _miniMuteBtn.RegisterCallback<MouseLeaveEvent>(e => _miniMuteBtn.style.color = _isMuted
-                ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f));
+            _miniMuteBtn.style.marginRight = 6f;
             // Keep in sync with global mute state — mutate on toggle
             Action<float> _;  // unused setter
             AddCustomSlider(_miniBar, 80f, _isMuted ? 0f : _globalVolume,
@@ -1119,39 +1123,42 @@ namespace WebsiteMOTD
                 setter: out _);
             _miniBar.Insert(0, _miniMuteBtn); // mute goes before the slider
 
-            // Maximize button
+            // Maximize button \u2014 text label so it renders regardless of font glyph coverage
             var maxBtn = new Button(ToggleMinimize);
-            maxBtn.text    = "\u26F6";
+            maxBtn.text    = "Max";
             maxBtn.tooltip = "Maximize";
-            maxBtn.style.fontSize   = 20f;
-            maxBtn.style.color      = new Color(0.7f, 0.7f, 0.7f);
-            maxBtn.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
+            maxBtn.style.fontSize   = 12f;
+            maxBtn.style.unityFontStyleAndWeight = FontStyle.Bold;
+            maxBtn.style.unityTextAlign = TextAnchor.MiddleCenter;
+            maxBtn.style.color      = Color.white;
+            maxBtn.style.backgroundColor = new Color(0.25f, 0.25f, 0.3f);
             maxBtn.style.borderTopWidth = maxBtn.style.borderBottomWidth =
                 maxBtn.style.borderLeftWidth = maxBtn.style.borderRightWidth = 0f;
-            maxBtn.style.paddingLeft  = maxBtn.style.paddingRight  = 6f;
-            maxBtn.style.paddingBottom = 6f;
+            maxBtn.style.borderTopLeftRadius = maxBtn.style.borderTopRightRadius =
+                maxBtn.style.borderBottomLeftRadius = maxBtn.style.borderBottomRightRadius = 4f;
+            maxBtn.style.paddingLeft = maxBtn.style.paddingRight = 8f;
+            maxBtn.style.paddingTop  = maxBtn.style.paddingBottom = 2f;
             maxBtn.style.height    = 26f;
             maxBtn.style.marginLeft = 6f;
-            maxBtn.RegisterCallback<MouseEnterEvent>(e => maxBtn.style.color = Color.white);
-            maxBtn.RegisterCallback<MouseLeaveEvent>(e => maxBtn.style.color = new Color(0.7f, 0.7f, 0.7f));
             _miniBar.Add(maxBtn);
 
             // Close button
             var miniClose = new Button(Hide);
-            miniClose.text    = "\u2715";
+            miniClose.text    = "Close";
             miniClose.tooltip = "Close";
-            miniClose.style.fontSize = 15f;
-            miniClose.style.color    = new Color(0.7f, 0.7f, 0.7f);
-            miniClose.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
+            miniClose.style.fontSize = 12f;
+            miniClose.style.unityFontStyleAndWeight = FontStyle.Bold;
+            miniClose.style.unityTextAlign = TextAnchor.MiddleCenter;
+            miniClose.style.color    = Color.white;
+            miniClose.style.backgroundColor = new Color(0.5f, 0.2f, 0.2f);
             miniClose.style.borderTopWidth = miniClose.style.borderBottomWidth =
                 miniClose.style.borderLeftWidth = miniClose.style.borderRightWidth = 0f;
-            miniClose.style.paddingLeft  = miniClose.style.paddingRight  = 6f;
-            miniClose.style.paddingBottom = 2f;
-            miniClose.style.paddingTop   = 4f;
+            miniClose.style.borderTopLeftRadius = miniClose.style.borderTopRightRadius =
+                miniClose.style.borderBottomLeftRadius = miniClose.style.borderBottomRightRadius = 4f;
+            miniClose.style.paddingLeft = miniClose.style.paddingRight = 8f;
+            miniClose.style.paddingTop  = miniClose.style.paddingBottom = 2f;
             miniClose.style.height    = 26f;
             miniClose.style.marginLeft = 2f;
-            miniClose.RegisterCallback<MouseEnterEvent>(e => miniClose.style.color = new Color(1f, 0.4f, 0.4f));
-            miniClose.RegisterCallback<MouseLeaveEvent>(e => miniClose.style.color = new Color(0.7f, 0.7f, 0.7f));
             _miniBar.Add(miniClose);
 
             root.Add(_miniBar);
@@ -1337,7 +1344,7 @@ namespace WebsiteMOTD
                 {
                     Color muteAccent = _isMuted ? new Color(0.4f, 0.12f, 0.12f) : new Color(0.18f, 0.25f, 0.35f);
                     _muteSettingsBtn = CreateStyledButton(
-                        _isMuted ? "🔇  Muted" : "🔊  Unmuted",
+                        _isMuted ? "Muted" : "Unmuted",
                         muteAccent, ToggleMute);
                     _muteSettingsBtn.style.color = _isMuted ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f);
                     container.Add(_muteSettingsBtn);
@@ -1506,7 +1513,7 @@ namespace WebsiteMOTD
             _confirmOverlay.Add(dialog);
 
             // Shield icon + title
-            var title = new Label("Website Confirmation");
+            var title = new Label("In Game WebView Confirmation");
             title.style.fontSize = 20f;
             title.style.color = new Color(1f, 1f, 1f);
             title.style.unityFontStyleAndWeight = FontStyle.Bold;
@@ -1538,8 +1545,29 @@ namespace WebsiteMOTD
             urlLabel.style.paddingRight = 10f;
             urlLabel.style.paddingTop = 8f;
             urlLabel.style.paddingBottom = 8f;
-            urlLabel.style.marginBottom = 16f;
+            urlLabel.style.marginBottom = 12f;
             dialog.Add(urlLabel);
+
+            // Rules-agreement notice. Either button (Open Website or Deny) closes the
+            // MOTD and is treated as the player acknowledging the server rules — make
+            // that explicit so it can't be missed.
+            var rulesNotice = new Label("By clicking Open Website or Deny, you acknowledge that you have read and agree to the server rules.");
+            rulesNotice.style.fontSize = 12f;
+            rulesNotice.style.color = new Color(1f, 0.85f, 0.4f);
+            rulesNotice.style.unityFontStyleAndWeight = FontStyle.Bold;
+            rulesNotice.style.whiteSpace = WhiteSpace.Normal;
+            rulesNotice.style.unityTextAlign = TextAnchor.MiddleCenter;
+            rulesNotice.style.backgroundColor = new Color(0.18f, 0.14f, 0.06f);
+            rulesNotice.style.borderTopLeftRadius = 4f;
+            rulesNotice.style.borderTopRightRadius = 4f;
+            rulesNotice.style.borderBottomLeftRadius = 4f;
+            rulesNotice.style.borderBottomRightRadius = 4f;
+            rulesNotice.style.paddingLeft = 10f;
+            rulesNotice.style.paddingRight = 10f;
+            rulesNotice.style.paddingTop = 8f;
+            rulesNotice.style.paddingBottom = 8f;
+            rulesNotice.style.marginBottom = 16f;
+            dialog.Add(rulesNotice);
 
             // "Don't ask again" toggle. We draw the checkbox ourselves
             // because Unity's built-in Toggle renders an invisible box on
@@ -1855,12 +1883,13 @@ namespace WebsiteMOTD
             card.Add(titleBar);
 
             // Back button
-            _backBtn = CreateStyledButton("\u25C0", new Color(0.25f, 0.25f, 0.3f), GoBack);
-            _backBtn.style.paddingLeft  = 8f;
-            _backBtn.style.paddingRight = 8f;
+            _backBtn = CreateStyledButton("Back", new Color(0.25f, 0.25f, 0.3f), GoBack);
+            _backBtn.style.paddingLeft  = 10f;
+            _backBtn.style.paddingRight = 10f;
             _backBtn.style.paddingTop = 2f;
             _backBtn.style.paddingBottom = 2f;
             _backBtn.style.height = 28f;
+            _backBtn.style.flexShrink = 0f;
             _backBtn.style.unityTextAlign = TextAnchor.MiddleCenter;
             _backBtn.style.marginRight = 2f;
             _backBtn.SetEnabled(false);
@@ -1868,20 +1897,23 @@ namespace WebsiteMOTD
             titleBar.Add(_backBtn);
 
             // Forward button
-            _fwdBtn = CreateStyledButton("\u25B6", new Color(0.25f, 0.25f, 0.3f), GoForward);
-            _fwdBtn.style.paddingLeft  = 8f;
-            _fwdBtn.style.paddingRight = 8f;
+            _fwdBtn = CreateStyledButton("Fwd", new Color(0.25f, 0.25f, 0.3f), GoForward);
+            _fwdBtn.style.paddingLeft  = 10f;
+            _fwdBtn.style.paddingRight = 10f;
             _fwdBtn.style.paddingTop = 2f;
             _fwdBtn.style.paddingBottom = 2f;
             _fwdBtn.style.height = 28f;
+            _fwdBtn.style.flexShrink = 0f;
             _fwdBtn.style.unityTextAlign = TextAnchor.MiddleCenter;
             _fwdBtn.style.marginRight = 6f;
             _fwdBtn.SetEnabled(false);
             _fwdBtn.style.opacity = 0.35f;
             titleBar.Add(_fwdBtn);
 
-            // Refresh button
-            var refreshBtn = CreateStyledButton("🔄", new Color(0.25f, 0.25f, 0.3f), () =>
+            // All title-bar buttons use ASCII labels: Puck's UI font does not include
+            // most BMP symbols (arrows, gear, house, music notes, etc.) and emoji never
+            // render. Labels keep the buttons visible regardless of font coverage.
+            var refreshBtn = CreateStyledButton("Reload", new Color(0.25f, 0.25f, 0.3f), () =>
             {
                 if (_useWebView && _webView != null)
                     _webView.Reload();
@@ -1891,11 +1923,11 @@ namespace WebsiteMOTD
             refreshBtn.style.paddingLeft  = 10f;
             refreshBtn.style.paddingRight = 10f;
             refreshBtn.style.height = 28f;
+            refreshBtn.style.flexShrink = 0f;
             refreshBtn.style.marginRight = 2f;
             titleBar.Add(refreshBtn);
 
-            // Home button
-            var homeBtn = CreateStyledButton("🏠", new Color(0.25f, 0.25f, 0.3f), () =>
+            var homeBtn = CreateStyledButton("Home", new Color(0.25f, 0.25f, 0.3f), () =>
             {
                 if (!string.IsNullOrEmpty(_homeUrl))
                     NavigateTo(_homeUrl);
@@ -1903,15 +1935,20 @@ namespace WebsiteMOTD
             homeBtn.style.paddingLeft  = 10f;
             homeBtn.style.paddingRight = 10f;
             homeBtn.style.height = 28f;
+            homeBtn.style.flexShrink = 0f;
             homeBtn.style.marginRight = 6f;
             titleBar.Add(homeBtn);
 
-            // Editable URL bar
+            // Editable URL bar — flex-grow so it fills the remaining space between
+            // the nav buttons (left) and audio/settings/window controls (right).
+            // All sibling buttons set flexShrink=0 so they keep their natural width
+            // and the URL field absorbs leftover space without ever pushing them off.
             _urlField = new TextField();
             _urlField.value = _url ?? "";
-            _urlField.style.flexGrow = 0f;
+            _urlField.style.flexGrow = 1f;
+            _urlField.style.flexShrink = 1f;
+            _urlField.style.minWidth = 120f;
             _urlField.style.height = 28f;
-            _urlField.style.width = 1180f;
             _urlField.style.marginRight = 6f;
 
             var textInput = _urlField.Q<VisualElement>("unity-text-input");
@@ -1957,6 +1994,7 @@ namespace WebsiteMOTD
             goBtn.style.paddingLeft  = 12f;
             goBtn.style.paddingRight = 12f;
             goBtn.style.height = 28f;
+            goBtn.style.flexShrink = 0f;
             goBtn.style.marginRight = 6f;
             titleBar.Add(goBtn);
 
@@ -1969,17 +2007,21 @@ namespace WebsiteMOTD
             audioGroup.style.marginRight = 6f;
             titleBar.Add(audioGroup);
 
-            // mute toggle
+            // mute toggle — text label so it renders regardless of font glyph coverage
             _muteBtn = new Button(ToggleMute);
-            _muteBtn.text = _isMuted ? "🔇" : "🔊";
-            _muteBtn.style.fontSize = 15f;
-            _muteBtn.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
-            _muteBtn.style.color = _isMuted ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f);
-            _muteBtn.style.paddingLeft = 6f;
-            _muteBtn.style.paddingRight = 6f;
-            _muteBtn.style.paddingTop = 3f;
-            _muteBtn.style.paddingBottom = 3f;
+            _muteBtn.text = _isMuted ? "Muted" : "Mute";
+            _muteBtn.style.fontSize = 13f;
+            _muteBtn.style.unityFontStyleAndWeight = FontStyle.Bold;
+            _muteBtn.style.unityTextAlign = TextAnchor.MiddleCenter;
+            _muteBtn.style.backgroundColor = _isMuted ? new Color(0.4f, 0.12f, 0.12f) : new Color(0.25f, 0.25f, 0.3f);
+            _muteBtn.style.color = _isMuted ? new Color(1f, 0.7f, 0.7f) : Color.white;
+            _muteBtn.style.paddingLeft = 10f;
+            _muteBtn.style.paddingRight = 10f;
+            _muteBtn.style.paddingTop = 2f;
+            _muteBtn.style.paddingBottom = 2f;
             _muteBtn.style.height = 28f;
+            _muteBtn.style.flexShrink = 0f;
+            _muteBtn.style.marginRight = 6f;
             _muteBtn.style.borderTopWidth = 0f;
             _muteBtn.style.borderBottomWidth = 0f;
             _muteBtn.style.borderLeftWidth = 0f;
@@ -1989,9 +2031,6 @@ namespace WebsiteMOTD
             _muteBtn.style.borderBottomLeftRadius = 4f;
             _muteBtn.style.borderBottomRightRadius = 4f;
             _muteBtn.tooltip = _isMuted ? "Unmute" : "Mute";
-            _muteBtn.RegisterCallback<MouseEnterEvent>(e => _muteBtn.style.color = Color.white);
-            _muteBtn.RegisterCallback<MouseLeaveEvent>(e =>
-                _muteBtn.style.color = _isMuted ? new Color(1f, 0.4f, 0.4f) : new Color(0.75f, 0.75f, 0.8f));
             audioGroup.Add(_muteBtn);
 
             Action<float> volSetter;
@@ -2006,64 +2045,87 @@ namespace WebsiteMOTD
                 setter: out volSetter);
             _volumeSliderSetter = volSetter;
 
-            // Settings button
+            // Settings / Minimize / Close \u2014 text labels with a subtle background so they
+            // stay visible regardless of glyph coverage (Puck's UI font doesn't render
+            // most non-ASCII symbols, so the original gear/minus/cross would be invisible).
             _settingsBtn = new Button(ToggleSettings);
-            _settingsBtn.text = "\u2699";
+            _settingsBtn.text = "Settings";
             _settingsBtn.tooltip = "Settings";
-            _settingsBtn.style.fontSize = 17f;
-            _settingsBtn.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
-            _settingsBtn.style.color = new Color(0.7f, 0.7f, 0.7f);
-            _settingsBtn.style.paddingLeft = 8f;
-            _settingsBtn.style.paddingRight = 8f;
-            _settingsBtn.style.paddingTop = 8f;
+            _settingsBtn.style.fontSize = 13f;
+            _settingsBtn.style.unityFontStyleAndWeight = FontStyle.Bold;
+            _settingsBtn.style.unityTextAlign = TextAnchor.MiddleCenter;
+            _settingsBtn.style.backgroundColor = new Color(0.25f, 0.25f, 0.3f);
+            _settingsBtn.style.color = Color.white;
+            _settingsBtn.style.paddingLeft = 10f;
+            _settingsBtn.style.paddingRight = 10f;
+            _settingsBtn.style.paddingTop = 2f;
             _settingsBtn.style.paddingBottom = 2f;
             _settingsBtn.style.height = 28f;
             _settingsBtn.style.marginLeft = 4f;
+            _settingsBtn.style.flexShrink = 0f;
+            _settingsBtn.style.borderTopLeftRadius = 4f;
+            _settingsBtn.style.borderTopRightRadius = 4f;
+            _settingsBtn.style.borderBottomLeftRadius = 4f;
+            _settingsBtn.style.borderBottomRightRadius = 4f;
             _settingsBtn.style.borderTopWidth = 0f;
             _settingsBtn.style.borderBottomWidth = 0f;
             _settingsBtn.style.borderLeftWidth = 0f;
             _settingsBtn.style.borderRightWidth = 0f;
-            _settingsBtn.RegisterCallback<MouseEnterEvent>(e => _settingsBtn.style.color = Color.white);
-            _settingsBtn.RegisterCallback<MouseLeaveEvent>(e => _settingsBtn.style.color = _settingsOpen ? Color.white : new Color(0.7f, 0.7f, 0.7f));
+            _settingsBtn.RegisterCallback<MouseEnterEvent>(e => _settingsBtn.style.backgroundColor = new Color(0.35f, 0.35f, 0.4f));
+            _settingsBtn.RegisterCallback<MouseLeaveEvent>(e => _settingsBtn.style.backgroundColor = _settingsOpen ? new Color(0.4f, 0.4f, 0.45f) : new Color(0.25f, 0.25f, 0.3f));
             titleBar.Add(_settingsBtn);
 
-            // Minimize button
             _minimizeBtn = new Button(ToggleMinimize);
-            _minimizeBtn.text = "−";
+            _minimizeBtn.text = "Min";
             _minimizeBtn.tooltip = "Minimize";
-            _minimizeBtn.style.fontSize = 18f;
-            _minimizeBtn.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
-            _minimizeBtn.style.color = new Color(0.7f, 0.7f, 0.7f);
-            _minimizeBtn.style.paddingLeft = 8f;
-            _minimizeBtn.style.paddingRight = 8f;
-            _minimizeBtn.style.paddingTop = 4f;
+            _minimizeBtn.style.fontSize = 13f;
+            _minimizeBtn.style.unityFontStyleAndWeight = FontStyle.Bold;
+            _minimizeBtn.style.unityTextAlign = TextAnchor.MiddleCenter;
+            _minimizeBtn.style.backgroundColor = new Color(0.25f, 0.25f, 0.3f);
+            _minimizeBtn.style.color = Color.white;
+            _minimizeBtn.style.paddingLeft = 10f;
+            _minimizeBtn.style.paddingRight = 10f;
+            _minimizeBtn.style.paddingTop = 2f;
             _minimizeBtn.style.paddingBottom = 2f;
             _minimizeBtn.style.height = 28f;
             _minimizeBtn.style.marginLeft = 2f;
+            _minimizeBtn.style.flexShrink = 0f;
+            _minimizeBtn.style.borderTopLeftRadius = 4f;
+            _minimizeBtn.style.borderTopRightRadius = 4f;
+            _minimizeBtn.style.borderBottomLeftRadius = 4f;
+            _minimizeBtn.style.borderBottomRightRadius = 4f;
             _minimizeBtn.style.borderTopWidth = 0f;
             _minimizeBtn.style.borderBottomWidth = 0f;
             _minimizeBtn.style.borderLeftWidth = 0f;
             _minimizeBtn.style.borderRightWidth = 0f;
-            _minimizeBtn.RegisterCallback<MouseEnterEvent>(e => _minimizeBtn.style.color = Color.white);
-            _minimizeBtn.RegisterCallback<MouseLeaveEvent>(e => _minimizeBtn.style.color = new Color(0.7f, 0.7f, 0.7f));
+            _minimizeBtn.RegisterCallback<MouseEnterEvent>(e => _minimizeBtn.style.backgroundColor = new Color(0.35f, 0.35f, 0.4f));
+            _minimizeBtn.RegisterCallback<MouseLeaveEvent>(e => _minimizeBtn.style.backgroundColor = new Color(0.25f, 0.25f, 0.3f));
             titleBar.Add(_minimizeBtn);
 
-            // Close button
             var closeBtn = new Button(Hide);
-            closeBtn.text = "\u2715";
-            closeBtn.style.fontSize = 16f;
-            closeBtn.style.color = new Color(0.7f, 0.7f, 0.7f);
-            closeBtn.style.backgroundColor = new Color(0f, 0f, 0f, 0f);
+            closeBtn.text = "Close";
+            closeBtn.style.fontSize = 13f;
+            closeBtn.style.unityFontStyleAndWeight = FontStyle.Bold;
+            closeBtn.style.unityTextAlign = TextAnchor.MiddleCenter;
+            closeBtn.style.color = Color.white;
+            closeBtn.style.backgroundColor = new Color(0.5f, 0.2f, 0.2f);
+            closeBtn.style.borderTopLeftRadius = 4f;
+            closeBtn.style.borderTopRightRadius = 4f;
+            closeBtn.style.borderBottomLeftRadius = 4f;
+            closeBtn.style.borderBottomRightRadius = 4f;
             closeBtn.style.borderTopWidth    = 0f;
             closeBtn.style.borderBottomWidth = 0f;
             closeBtn.style.borderLeftWidth   = 0f;
             closeBtn.style.borderRightWidth  = 0f;
-            closeBtn.style.paddingLeft   = 8f;
-            closeBtn.style.paddingRight  = 8f;
+            closeBtn.style.paddingLeft   = 12f;
+            closeBtn.style.paddingRight  = 12f;
             closeBtn.style.paddingTop    = 2f;
             closeBtn.style.paddingBottom = 2f;
-            closeBtn.RegisterCallback<MouseEnterEvent>(e => closeBtn.style.color = new Color(1f, 0.4f, 0.4f));
-            closeBtn.RegisterCallback<MouseLeaveEvent>(e => closeBtn.style.color = new Color(0.7f, 0.7f, 0.7f));
+            closeBtn.style.height = 28f;
+            closeBtn.style.marginLeft = 2f;
+            closeBtn.style.flexShrink = 0f;
+            closeBtn.RegisterCallback<MouseEnterEvent>(e => closeBtn.style.backgroundColor = new Color(0.7f, 0.3f, 0.3f));
+            closeBtn.RegisterCallback<MouseLeaveEvent>(e => closeBtn.style.backgroundColor = new Color(0.5f, 0.2f, 0.2f));
             titleBar.Add(closeBtn);
         }
 
@@ -2339,15 +2401,26 @@ namespace WebsiteMOTD
                 urlLabel.style.marginBottom = 8f;
                 _queueNowPlayingBox.Add(urlLabel);
 
-                // Vote skip button
-                int votes = current.VoteSkippers.Count;
-                int needed = Plugin.GetVoteSkipThreshold();
-                bool voted = Plugin.HasLocalVotedSkip();
+                // Skip button — owners can drop their own video without needing votes;
+                // everyone else gets the regular vote-skip with the running tally.
+                if (Plugin.IsLocalOwnerOfCurrent())
+                {
+                    _voteSkipBtn = CreateStyledButton(
+                        "Skip (your video)",
+                        new Color(0.6f, 0.35f, 0.2f),
+                        Plugin.OwnerVetoCurrent);
+                }
+                else
+                {
+                    int votes = current.VoteSkippers.Count;
+                    int needed = Plugin.GetVoteSkipThreshold();
+                    bool voted = Plugin.HasLocalVotedSkip();
 
-                _voteSkipBtn = CreateStyledButton(
-                    (voted ? "✔ Voted Skip " : "Vote Skip ") + "(" + votes + "/" + needed + ")",
-                    voted ? new Color(0.55f, 0.4f, 0.25f) : new Color(0.6f, 0.25f, 0.25f),
-                    Plugin.ToggleVoteSkip);
+                    _voteSkipBtn = CreateStyledButton(
+                        (voted ? "Voted Skip " : "Vote Skip ") + "(" + votes + "/" + needed + ")",
+                        voted ? new Color(0.55f, 0.4f, 0.25f) : new Color(0.6f, 0.25f, 0.25f),
+                        Plugin.ToggleVoteSkip);
+                }
                 _voteSkipBtn.style.height = 28f;
                 _voteSkipBtn.style.flexGrow = 1f;
                 _queueNowPlayingBox.Add(_voteSkipBtn);
@@ -2467,6 +2540,20 @@ namespace WebsiteMOTD
                 OpenExternal(url);
             });
             leftButtons.Add(extBtn);
+
+            // Rules-acknowledgement notice — any way of dismissing/leaving this MOTD
+            // (Got it!, X, opening an external browser) is treated as the player
+            // acknowledging the server rules, so state it where they can't miss it.
+            var rulesNotice = new Label("Closing this window means you agree to the server rules.");
+            rulesNotice.style.fontSize = 12f;
+            rulesNotice.style.color = new Color(0.3f, 0.55f, 1f);
+            rulesNotice.style.unityFontStyleAndWeight = FontStyle.Bold;
+            rulesNotice.style.unityTextAlign = TextAnchor.MiddleCenter;
+            rulesNotice.style.whiteSpace = WhiteSpace.Normal;
+            rulesNotice.style.flexShrink = 1f;
+            rulesNotice.style.marginLeft = 16f;
+            rulesNotice.style.marginRight = 6f;
+            footer.Add(rulesNotice);
 
             var gotItBtn = CreateStyledButton("Got it!", new Color(0.3f, 0.55f, 1f), Hide);
             gotItBtn.style.unityFontStyleAndWeight = FontStyle.Bold;
@@ -3184,6 +3271,9 @@ namespace WebsiteMOTD
             btn.style.paddingRight    = 16f;
             btn.style.paddingTop      = 7f;
             btn.style.paddingBottom   = 7f;
+            // Center label both axes — Unity Button's default is upper-left, which
+            // leaves the text hugging a corner inside our taller/wider buttons.
+            btn.style.unityTextAlign  = TextAnchor.MiddleCenter;
             btn.style.borderTopLeftRadius     = 4f;
             btn.style.borderTopRightRadius    = 4f;
             btn.style.borderBottomLeftRadius   = 4f;

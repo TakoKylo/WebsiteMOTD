@@ -367,6 +367,31 @@ namespace WebsiteMOTD
                 SendScreenMsg("vote");
         }
 
+        /// <summary>True if the local client queued the currently playing item.</summary>
+        public static bool IsLocalOwnerOfCurrent()
+        {
+            if (_current == null) return false;
+            var nm = NetworkManager.Singleton;
+            if (nm == null) return false;
+            return _current.ClientId == nm.LocalClientId;
+        }
+
+        /// <summary>
+        /// Owner-only skip: the player who queued the current item can drop it
+        /// without waiting on votes. No-op for non-owners.
+        /// </summary>
+        public static void OwnerVetoCurrent()
+        {
+            var nm = NetworkManager.Singleton;
+            if (nm?.CustomMessagingManager == null) return;
+            if (!IsLocalOwnerOfCurrent()) return;
+
+            if (nm.IsServer)
+                ServerOwnerVeto(nm.LocalClientId);
+            else
+                SendScreenMsg("veto");
+        }
+
         /// <summary>Remove one of your queued items.</summary>
         public static void RemoveFromQueue(int index)
         {
@@ -486,6 +511,10 @@ namespace WebsiteMOTD
                     {
                         ServerHandleVote(senderClientId);
                     }
+                    else if (msg == "veto")
+                    {
+                        ServerOwnerVeto(senderClientId);
+                    }
                     else if (msg == "ended")
                     {
                         // Deduplicate: all clients may fire this; only advance once per item
@@ -591,6 +620,18 @@ namespace WebsiteMOTD
 
             ServerBroadcastQueueState();
             ServerCheckVoteSkip();
+        }
+
+        /// <summary>
+        /// Owner-only skip on the server side. The sender must be the player who
+        /// queued the current item — otherwise the request is ignored.
+        /// </summary>
+        private static void ServerOwnerVeto(ulong clientId)
+        {
+            if (_current == null) return;
+            if (_current.ClientId != clientId) return;
+            Log("Owner " + clientId + " vetoed their own queued item — advancing.");
+            ServerPlayNext();
         }
 
         private static void ServerCheckVoteSkip()

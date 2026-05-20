@@ -17,6 +17,13 @@ namespace WebsiteMOTD
         public string Username;
         public string Url;
         public List<ulong> VoteSkippers = new List<ulong>();
+
+        // Monotonically increasing per-item ID assigned on the server when an item
+        // becomes _current. Used to dedupe video-ended signals (a single video can be
+        // reported "ended" by multiple sources — overlay WebView, world screen, every
+        // client — and we must advance exactly once per item). URL alone can't dedupe
+        // because two players can legitimately queue the same URL back-to-back.
+        public long Seq;
     }
 
     public class Plugin : IPuckPlugin
@@ -43,7 +50,8 @@ namespace WebsiteMOTD
         private static readonly List<QueueItem> _queue = new List<QueueItem>();
         private static QueueItem _current;
         private static string _lastLoadedWorldUrl; // prevents reloading on every state broadcast
-        private static string _endedForUrl;        // deduplicates video-ended signals from multiple clients
+        private static long _itemSeqCounter;       // server-side monotonic source for QueueItem.Seq
+        private static long _endedForSeq;          // deduplicates video-ended signals (per-item, not per-URL)
 
         // Server config flags received by clients (default: all enabled)
         private static bool _serverScreensEnabled = true;
@@ -135,7 +143,8 @@ namespace WebsiteMOTD
             _queue.Clear();
             _current = null;
             _lastLoadedWorldUrl = null;
-            _endedForUrl = null;
+            _endedForSeq = 0;
+            _itemSeqCounter = 0;
             _serverScreensEnabled = true;
             _serverQueueEnabled = true;
 
@@ -261,11 +270,16 @@ namespace WebsiteMOTD
             var nm = NetworkManager.Singleton;
             if (nm?.CustomMessagingManager == null) return;
 
-            // Payload: ushort urlLen + url bytes + byte flags
-            // flags bit 0 = screens_enabled, bit 1 = queue_enabled
+            // Read from the cached statics rather than ServerConfig directly.
+            // ServerConfig.Load() only runs on dedicated servers — on a listen-server
+            // host its _data is the class default (screens_enabled=false, queue_enabled=false)
+            // so reading from it would tell the host's own client "queue disabled" and
+            // disable the queue feature on listen lobbies entirely.
+            // Setup() seeds the statics from ServerConfig on dedicated; on listen
+            // servers they keep the class-level true defaults.
             byte flags = 0;
-            if (ServerConfig.ScreensEnabled) flags |= 0x01;
-            if (ServerConfig.QueueEnabled)   flags |= 0x02;
+            if (_serverScreensEnabled) flags |= 0x01;
+            if (_serverQueueEnabled)   flags |= 0x02;
 
             byte[] urlBytes = Encoding.UTF8.GetBytes(MOTD_URL);
             int size = sizeof(ushort) + urlBytes.Length + 1;
@@ -281,7 +295,7 @@ namespace WebsiteMOTD
                     NetworkDelivery.ReliableFragmentedSequenced);
             }
 
-            Log("Sent MOTD URL to client " + clientId + " (screens=" + ServerConfig.ScreensEnabled + ", queue=" + ServerConfig.QueueEnabled + ").");
+            Log("Sent MOTD URL to client " + clientId + " (screens=" + _serverScreensEnabled + ", queue=" + _serverQueueEnabled + ").");
         }
 
         /// <summary>CLIENT: received the MOTD URL + server config from the server.</summary>
@@ -424,16 +438,33 @@ namespace WebsiteMOTD
         /// <summary>
         /// Called when the local client's WebView detects that the current video ended.
         /// Server advances the queue immediately; clients send a signal to the server.
+        /// On a listen server the overlay WebView and the world-screen WebView can both
+        /// fire this for the same video — and remote clients may pile on with their own
+        /// "ended" messages. Dedupe by the current item's Seq.
         /// </summary>
         public static void VideoEnded()
         {
             var nm = NetworkManager.Singleton;
             if (nm?.CustomMessagingManager == null) return;
-            Log("VideoEnded: auto-advancing queue.");
             if (nm.IsServer)
-                ServerPlayNext();
+            {
+                ServerTryAdvanceForEnded();
+            }
             else
+            {
                 SendScreenMsg("ended");
+            }
+        }
+
+        /// <summary>Server-side dedupe gate for ended-driven advances. Returns whether the queue advanced.</summary>
+        private static bool ServerTryAdvanceForEnded()
+        {
+            long seq = _current != null ? _current.Seq : 0;
+            if (seq == 0 || seq == _endedForSeq) return false;
+            _endedForSeq = seq;
+            Log("Video ended (seq=" + seq + ") — advancing queue.");
+            ServerPlayNext();
+            return true;
         }
 
         // ─── Screen message transport ───────────────────────────────
@@ -498,6 +529,7 @@ namespace WebsiteMOTD
                 string msg = Encoding.UTF8.GetString(msgBytes);
 
                 var nm = NetworkManager.Singleton;
+                if (nm == null) return;
                 if (nm.IsServer)
                 {
                     // Client → Server requests
@@ -517,14 +549,12 @@ namespace WebsiteMOTD
                     }
                     else if (msg == "ended")
                     {
-                        // Deduplicate: all clients may fire this; only advance once per item
-                        string playingUrl = _current != null ? _current.Url : null;
-                        if (playingUrl != null && playingUrl != _endedForUrl)
-                        {
-                            _endedForUrl = playingUrl;
-                            Log("Client " + senderClientId + " reported video ended — advancing queue.");
-                            ServerPlayNext();
-                        }
+                        // Dedupe routes through ServerTryAdvanceForEnded — same gate the
+                        // server-local VideoEnded path uses, so listen-server hosts don't
+                        // double-advance when both their own webview and a remote client
+                        // report the same video ending.
+                        if (ServerTryAdvanceForEnded())
+                            Log("Client " + senderClientId + " reported video ended.");
                     }
                     else if (msg.StartsWith("remove:"))
                     {
@@ -559,12 +589,17 @@ namespace WebsiteMOTD
 
         private static void ServerAddItem(ulong clientId, string username, string url)
         {
-            if (!ServerConfig.QueueEnabled) return;
+            // Source-of-truth for whether the queue is enabled is _serverQueueEnabled;
+            // see SendMOTDToClient for why we don't read ServerConfig directly here.
+            if (!_serverQueueEnabled) return;
             if (string.IsNullOrWhiteSpace(url)) return;
             url = url.Trim();
             if (!url.StartsWith("http://") && !url.StartsWith("https://"))
                 url = "https://" + url;
 
+            // The allowlist still flows through ServerConfig — its class default already
+            // contains youtube/twitch/etc., so listen servers get a sensible allowlist
+            // without needing the file. Dedicated admins can override via JSON.
             if (!ServerConfig.IsQueueUrlAllowed(url))
             {
                 string allowed = string.Join(", ", ServerConfig.QueueAllowedSites);
@@ -596,8 +631,9 @@ namespace WebsiteMOTD
 
             if (_current == null)
             {
+                item.Seq = ++_itemSeqCounter;
                 _current = item;
-                Log("Now playing: " + username + " → " + url);
+                Log("Now playing (seq=" + item.Seq + "): " + username + " → " + url);
                 LoadCurrentOnWorldScreens();
             }
             else
@@ -667,9 +703,12 @@ namespace WebsiteMOTD
             {
                 _current = _queue[0];
                 _queue.RemoveAt(0);
-                Log("Now playing: " + _current.Username + " → " + _current.Url);
+                _current.Seq = ++_itemSeqCounter;
+                Log("Now playing (seq=" + _current.Seq + "): " + _current.Username + " → " + _current.Url);
             }
-            _endedForUrl = null; // allow next video's ended to trigger advance
+            // NOTE: _endedForSeq is intentionally NOT cleared here. It tracks the last
+            // item we advanced past, so late "ended" signals for the previous item are
+            // ignored and don't double-advance through the new _current.
             LoadCurrentOnWorldScreens();
             ServerBroadcastQueueState();
         }
@@ -688,11 +727,15 @@ namespace WebsiteMOTD
             // Only reload if the URL actually changed — otherwise every queue
             // broadcast (e.g. vote toggles) would restart the current video.
             if (url == _lastLoadedWorldUrl) return;
+            string prevWorldUrl = _lastLoadedWorldUrl;
             _lastLoadedWorldUrl = url;
             MOTDWorldScreen.LoadOnAllScreens(url);
 
-            // Also navigate the overlay WebView when it is open
-            if (MOTDUI.IsVisible)
+            // Also navigate the overlay WebView, but ONLY if the user is currently
+            // viewing the page that the world screens were just showing (or has
+            // nothing loaded yet). Otherwise an active browse gets yanked back to
+            // the queue URL every time someone votes or a video advances.
+            if (MOTDUI.IsVisible && MOTDUI.ShouldFollowWorldScreen(prevWorldUrl))
                 MOTDUI.NavigateTo(url, addToHistory: false);
         }
 
@@ -715,12 +758,14 @@ namespace WebsiteMOTD
         // ─── Queue state serialization ──────────────────────────────
         //
         // Format (line-delimited):
-        //   cur|clientId|username|url|voter1,voter2,...
+        //   cur|clientId|username|url|voter1,voter2,...|seq
         //   qu|clientId|username|url
         //   qu|clientId|username|url
         //
         // "cur" line omitted when nothing is playing.
         // URLs and usernames are base64-encoded to avoid delimiter collisions.
+        // The trailing seq field is server-internal but ships in the broadcast so
+        // the server can re-parse its own state without losing the dedupe key.
 
         private static string SerializeQueueState()
         {
@@ -735,7 +780,7 @@ namespace WebsiteMOTD
                     if (i > 0) sb.Append(',');
                     sb.Append(_current.VoteSkippers[i]);
                 }
-                sb.Append('\n');
+                sb.Append('|').Append(_current.Seq).Append('\n');
             }
             foreach (var item in _queue)
             {
@@ -777,6 +822,8 @@ namespace WebsiteMOTD
                             if (ulong.TryParse(v, out ulong voter))
                                 item.VoteSkippers.Add(voter);
                     }
+                    if (parts.Length >= 6 && long.TryParse(parts[5], out long seq))
+                        item.Seq = seq;
                     _current = item;
                 }
                 else if (kind == "qu")
@@ -879,6 +926,71 @@ namespace WebsiteMOTD
             catch { }
             return "Player " + clientId;
         }
+    }
+
+    /// <summary>
+    /// Forces <see cref="UIState.IsMouseRequired"/> to true while the MOTD overlay is open.
+    /// UIManager.CheckMouseRequirement recomputes the flag from its own UIView list whenever
+    /// any game UI's visibility/focus changes, so without this postfix opening or closing
+    /// a stock view (chat, scoreboard, etc.) while MOTD is up would re-enable movement
+    /// input — the player's stick/keys would feed through the page underneath.
+    /// </summary>
+    [HarmonyPatch(typeof(UIManager), "CheckMouseRequirement")]
+    public static class CheckMouseRequirementPatch
+    {
+        public static void Postfix()
+        {
+            if (!MOTDUI.IsAnyOverlayVisible) return;
+            if (GlobalStateManager.UIState.IsMouseRequired) return;
+            GlobalStateManager.SetUIState(new System.Collections.Generic.Dictionary<string, object>
+            {
+                { "isMouseRequired", true }
+            });
+        }
+    }
+
+    // ─── Input gating while overlay is open ─────────────────────────
+    //
+    // IsMouseRequired covers PlayerInput (movement, blade, dash, jump). It does NOT
+    // gate the UI-level inputs that fire chat, scoreboard, or pause — those are
+    // bound to their own actions and only check IsInteracting or game phase. The
+    // MOTD overlay isn't a UIView, so it doesn't contribute to IsInteracting, and
+    // those actions fire right through.
+    //
+    // We can't easily fake a UIView entry, so instead we patch each handler with a
+    // prefix that no-ops while the overlay is up. Pause is included so ESC closes
+    // the overlay without also toggling the pause menu underneath.
+
+    [HarmonyPatch(typeof(UIManager), "OnAllChatActionPerformed")]
+    public static class BlockAllChatPatch
+    {
+        public static bool Prefix() => !MOTDUI.IsAnyOverlayVisible;
+    }
+
+    [HarmonyPatch(typeof(UIManager), "OnTeamChatActionPerformed")]
+    public static class BlockTeamChatPatch
+    {
+        public static bool Prefix() => !MOTDUI.IsAnyOverlayVisible;
+    }
+
+    [HarmonyPatch(typeof(UIManager), "OnScoreboardActionStarted")]
+    public static class BlockScoreboardStartedPatch
+    {
+        public static bool Prefix() => !MOTDUI.IsAnyOverlayVisible;
+    }
+
+    [HarmonyPatch(typeof(UIManager), "OnScoreboardActionCanceled")]
+    public static class BlockScoreboardCanceledPatch
+    {
+        // Cancellation also needs gating: if the scoreboard never opened (we blocked
+        // Started), it shouldn't try to close either. Otherwise harmless, but cleaner.
+        public static bool Prefix() => !MOTDUI.IsAnyOverlayVisible;
+    }
+
+    [HarmonyPatch(typeof(UIManager), "OnPauseActionPerformed")]
+    public static class BlockPausePatch
+    {
+        public static bool Prefix() => !MOTDUI.IsAnyOverlayVisible;
     }
 
     /// <summary>

@@ -2,8 +2,10 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using Steamworks;
 using UnityEngine;
+using UnityEngine.InputSystem;
 using UnityEngine.UIElements;
 
 namespace WebsiteMOTD
@@ -26,8 +28,12 @@ namespace WebsiteMOTD
         private static string _url;
         private static readonly Stack<string> _history = new Stack<string>();
         private static readonly Stack<string> _forwardHistory = new Stack<string>();
-        private static readonly List<MOTDVideoHost> _videoHosts    = new List<MOTDVideoHost>();
-        private static readonly List<Coroutine>     _gifCoroutines = new List<Coroutine>();
+        private static readonly List<MOTDVideoHost> _videoHosts     = new List<MOTDVideoHost>();
+        private static readonly List<Coroutine>     _gifCoroutines  = new List<Coroutine>();
+        // Decoded textures (GIF frames + downloaded images) need explicit Destroy to
+        // free GPU memory — Unity's GC handles the C# wrapper, not the underlying
+        // texture. Without tracking, every page nav with images leaks them.
+        private static readonly List<Texture2D>     _managedTextures = new List<Texture2D>();
         private static string _homeUrl;
 
         // ── WebView mode ──
@@ -45,7 +51,10 @@ namespace WebsiteMOTD
         private static VisualElement _queueContent;        // expanded content (300px)
         private static VisualElement _queueNowPlayingBox;
         private static VisualElement _queueListBox;
-        private static Button _voteSkipBtn;
+        // Either a Button (owner veto) or a custom progress-track VisualElement
+        // (vote-skip showing fill = votes/threshold). Typed as the common base so
+        // both cleanup paths in Hide() work uniformly.
+        private static VisualElement _voteSkipBtn;
         private static TextField _queueUrlField;
         private static Label _queueErrorLabel;
         private static IVisualElementScheduledItem _queueErrorHide;
@@ -81,7 +90,37 @@ namespace WebsiteMOTD
         private static HashSet<string> _trustedDomains;
         private static VisualElement _confirmOverlay; // the confirmation dialog
 
+        // ── Async-navigation token ──
+        // Bumped on every NavigateTo / GoBack / GoForward / Hide. Fetch callbacks
+        // capture the value at request time and bail if it doesn't match anymore —
+        // otherwise a slow fetch from a previous navigation could render its result
+        // on top of the new page, or worse, into a different overlay after re-Show.
+        private static int _navToken;
+
+        // The last URL we wrote into the URL field (any path). Used to detect whether
+        // the user has been editing — if _urlField.value still equals this, they
+        // haven't touched it and it's safe to overwrite with new navigation events.
+        // (Focus-controller checks were unreliable: UI Toolkit panel focus can stick
+        // to the URL field's inner text-input even after the user clicked back into
+        // the WebView, which caused legitimate onLoaded/onStarted updates to be
+        // silently swallowed.)
+        private static string _lastUrlFieldValue;
+
+        // ── ESC-to-close poller ──
+        // UI Toolkit KeyDownEvents only fire when an inner element has focus, and the
+        // WebView consumes its own key input. A small polling MonoBehaviour catches ESC
+        // regardless of focus state.
+        private static MOTDEscPoller _escPoller;
+
         public static bool IsVisible => _isVisible;
+
+        /// <summary>
+        /// True whenever any MOTD layer is on screen — the main overlay OR just the
+        /// confirm dialog. Used by the input-gating patches so chat / scoreboard /
+        /// pause stay blocked during the confirm dialog too (otherwise ESC there
+        /// dismisses the dialog AND opens the pause menu underneath).
+        /// </summary>
+        public static bool IsAnyOverlayVisible => _isVisible || _confirmOverlay != null;
 
         // ─── Public API ─────────────────────────────────────────────
 
@@ -90,6 +129,11 @@ namespace WebsiteMOTD
             if (Application.isBatchMode) return;
 
             url = (url ?? "").Trim();
+            if (string.IsNullOrEmpty(url))
+            {
+                Plugin.LogError("MOTDUI.Show called with empty URL — ignoring.");
+                return;
+            }
             if (!url.StartsWith("http://") && !url.StartsWith("https://"))
                 url = "https://" + url;
 
@@ -109,9 +153,23 @@ namespace WebsiteMOTD
 
         /// <summary>
         /// Actually show the MOTD overlay after the user has approved (or the domain was trusted).
+        /// On platforms where the native WebView isn't available (Linux/macOS), pop the
+        /// page in the Steam overlay browser instead of trying to render it inline — the
+        /// HTML fallback can't handle JS-heavy MOTD pages, and Steam's overlay works on
+        /// every platform the game runs on.
         /// </summary>
         private static void ShowConfirmed(string url)
         {
+            if (!MOTDWebView.IsSupportedPlatform())
+            {
+                Plugin.Log("Opening MOTD in Steam overlay (native WebView unavailable on this platform): " + url);
+                TryOpenSteamBrowser(url);
+                // Nothing is shown in-game, so make sure the ESC poller doesn't linger
+                // (the confirm-dialog "Open Website" path leaves it running until Hide).
+                DestroyEscPoller();
+                return;
+            }
+
             _url = url;
             _homeUrl = url;
             _history.Clear();
@@ -144,6 +202,9 @@ namespace WebsiteMOTD
             UnityEngine.Cursor.visible = true;
             UnityEngine.Cursor.lockState = CursorLockMode.None;
             _isVisible = true;
+            EnsureEscPoller();
+            BlockGameplayInput();
+            DismissOpenChatInput();
 
             Plugin.Log("MOTD overlay shown for URL: " + url);
 
@@ -160,6 +221,10 @@ namespace WebsiteMOTD
 
         public static void Hide()
         {
+            // Invalidate in-flight HTML fetches so their callbacks don't write into a
+            // freshly-rebuilt overlay if the user calls Show again before they resolve.
+            _navToken++;
+
             DestroyMiniBar();
             if (_confirmOverlay != null)
             {
@@ -174,6 +239,7 @@ namespace WebsiteMOTD
                 _scrollView = null;
                 _statusLabel = null;
                 _urlField = null;
+                _lastUrlFieldValue = null;
                 _backBtn = null;
                 _fwdBtn = null;
                 _queuePanel = null;
@@ -213,6 +279,144 @@ namespace WebsiteMOTD
                 Plugin.OnQueueChanged -= RefreshQueuePanel;
                 _queueEventSubscribed = false;
             }
+
+            DestroyEscPoller();
+            UnblockGameplayInput();
+        }
+
+        /// <summary>
+        /// If the game's chat input was already in-progress when the overlay opens,
+        /// dismiss it. Without this, the chat field keeps focus underneath the overlay
+        /// and every keystroke the user types in the URL bar also goes into chat.
+        /// </summary>
+        private static void DismissOpenChatInput()
+        {
+            try
+            {
+                var ui = MonoBehaviourSingleton<UIManager>.Instance;
+                ui?.Chat?.StopInput();
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("DismissOpenChatInput failed: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Sets the game's <c>IsMouseRequired</c> flag so PlayerInput.UpdateInputs
+        /// (and the per-action handlers like Jump/Dash/BladeAngle) all short-circuit.
+        /// The Harmony patch on <c>UIManager.CheckMouseRequirement</c> keeps the flag
+        /// true even if a stock UIView toggles in/out while MOTD is open.
+        /// </summary>
+        private static void BlockGameplayInput()
+        {
+            try
+            {
+                if (!GlobalStateManager.UIState.IsMouseRequired)
+                {
+                    GlobalStateManager.SetUIState(new Dictionary<string, object>
+                    {
+                        { "isMouseRequired", true }
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("BlockGameplayInput failed: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Re-runs the game's own <c>CheckMouseRequirement</c> so the flag reflects
+        /// whatever stock views are still open (pause menu, scoreboard, etc.). We
+        /// reflect into the private method rather than clearing the flag outright,
+        /// because clearing it would re-enable movement while the player still has
+        /// the pause menu up.
+        /// </summary>
+        private static void UnblockGameplayInput()
+        {
+            try
+            {
+                var uiManager = MonoBehaviourSingleton<UIManager>.Instance;
+                if (uiManager == null)
+                {
+                    // The UIManager is torn down (scene change, app shutdown). Don't
+                    // touch the flag — clearing it here could re-enable movement if
+                    // some other view still needs the mouse. Whatever loads next will
+                    // recompute state from its own UIView list.
+                    return;
+                }
+
+                var method = typeof(UIManager).GetMethod(
+                    "CheckMouseRequirement",
+                    BindingFlags.NonPublic | BindingFlags.Instance);
+                if (method != null)
+                {
+                    method.Invoke(uiManager, null);
+                    return;
+                }
+
+                // Reflection failed (game rename / decompile drift). Best effort: only
+                // clear the flag if no other view has registered as mouse-required.
+                if (!GlobalStateManager.UIState.IsInteracting)
+                {
+                    GlobalStateManager.SetUIState(new Dictionary<string, object>
+                    {
+                        { "isMouseRequired", false }
+                    });
+                }
+                else
+                {
+                    Plugin.Log("UnblockGameplayInput: CheckMouseRequirement reflection missing and other views are interactive; leaving flag alone.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("UnblockGameplayInput failed: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// ESC handler: closes whichever MOTD layer is open. The confirm dialog
+        /// takes priority (treated as Deny) so users can dismiss it without
+        /// clobbering an already-open browser overlay underneath.
+        /// </summary>
+        internal static void OnEscapePressedFromPoller()
+        {
+            if (_confirmOverlay != null)
+            {
+                Plugin.Log("ESC pressed — denying MOTD confirmation dialog.");
+                _confirmOverlay.RemoveFromHierarchy();
+                _confirmOverlay = null;
+                if (!_isVisible)
+                {
+                    DestroyEscPoller();
+                    UnblockGameplayInput();
+                }
+                return;
+            }
+            if (_isVisible)
+            {
+                Plugin.Log("ESC pressed — closing MOTD overlay.");
+                Hide();
+            }
+        }
+
+        private static void EnsureEscPoller()
+        {
+            if (_escPoller != null) return;
+            var go = new GameObject("MOTD_EscPoller");
+            go.hideFlags = HideFlags.HideAndDontSave;
+            UnityEngine.Object.DontDestroyOnLoad(go);
+            _escPoller = go.AddComponent<MOTDEscPoller>();
+        }
+
+        private static void DestroyEscPoller()
+        {
+            if (_confirmOverlay != null || _isVisible) return;
+            if (_escPoller == null) return;
+            UnityEngine.Object.Destroy(_escPoller.gameObject);
+            _escPoller = null;
         }
 
         // ─── Navigation ─────────────────────────────────────────────
@@ -241,7 +445,10 @@ namespace WebsiteMOTD
 
             _url = url;
             if (_urlField != null)
+            {
                 _urlField.value = url;
+                _lastUrlFieldValue = url;
+            }
 
             UpdateBackButton();
             UpdateForwardButton();
@@ -290,9 +497,11 @@ namespace WebsiteMOTD
 
             Plugin.Log("Navigating to: " + url);
 
+            int navToken = ++_navToken;
             MOTDWebContent.Fetch(url,
                 onSuccess: elements =>
                 {
+                    if (navToken != _navToken) return; // superseded by a later nav
                     if (_contentArea == null || _overlay == null) return;
                     RemoveStatusLabel();
 
@@ -308,6 +517,7 @@ namespace WebsiteMOTD
                 },
                 onError: error =>
                 {
+                    if (navToken != _navToken) return;
                     if (_contentArea == null || _overlay == null) return;
                     Plugin.LogError("Fetch failed: " + error);
                     RemoveStatusLabel();
@@ -450,7 +660,7 @@ namespace WebsiteMOTD
                 _forwardHistory.Push(_url);
             string prev = _history.Pop();
             _url = prev;
-            if (_urlField != null) _urlField.value = prev;
+            if (_urlField != null) { _urlField.value = prev; _lastUrlFieldValue = prev; }
             UpdateBackButton();
             UpdateForwardButton();
             ClearContent();
@@ -463,9 +673,11 @@ namespace WebsiteMOTD
             _statusLabel.style.marginTop = 40f;
             _contentArea.Add(_statusLabel);
 
+            int navToken = ++_navToken;
             MOTDWebContent.Fetch(prev,
                 onSuccess: elements =>
                 {
+                    if (navToken != _navToken) return;
                     if (_contentArea == null || _overlay == null) return;
                     RemoveStatusLabel();
                     if (elements.Count == 0) { ShowSpaFallback(); TryOpenSteamBrowser(prev); }
@@ -473,6 +685,7 @@ namespace WebsiteMOTD
                 },
                 onError: error =>
                 {
+                    if (navToken != _navToken) return;
                     if (_contentArea == null || _overlay == null) return;
                     RemoveStatusLabel();
                     ShowErrorState(error);
@@ -493,7 +706,7 @@ namespace WebsiteMOTD
                 _history.Push(_url);
             string next = _forwardHistory.Pop();
             _url = next;
-            if (_urlField != null) _urlField.value = next;
+            if (_urlField != null) { _urlField.value = next; _lastUrlFieldValue = next; }
             UpdateBackButton();
             UpdateForwardButton();
             ClearContent();
@@ -506,9 +719,11 @@ namespace WebsiteMOTD
             _statusLabel.style.marginTop = 40f;
             _contentArea.Add(_statusLabel);
 
+            int navToken = ++_navToken;
             MOTDWebContent.Fetch(next,
                 onSuccess: elements =>
                 {
+                    if (navToken != _navToken) return;
                     if (_contentArea == null || _overlay == null) return;
                     RemoveStatusLabel();
                     if (elements.Count == 0) { ShowSpaFallback(); TryOpenSteamBrowser(next); }
@@ -516,11 +731,46 @@ namespace WebsiteMOTD
                 },
                 onError: error =>
                 {
+                    if (navToken != _navToken) return;
                     if (_contentArea == null || _overlay == null) return;
                     RemoveStatusLabel();
                     ShowErrorState(error);
                 }
             );
+        }
+
+        /// <summary>
+        /// Whether the overlay should auto-navigate when the world-screen URL changes.
+        /// True when the user hasn't browsed away from the queue's current page — i.e.
+        /// their overlay is showing the same URL the world screens were showing, the
+        /// home/MOTD URL, or nothing yet. Avoids hijacking active browsing every time
+        /// someone votes or the queue advances.
+        /// </summary>
+        public static bool ShouldFollowWorldScreen(string previousWorldUrl)
+        {
+            if (string.IsNullOrEmpty(_url)) return true;          // nothing loaded yet
+            if (_url == previousWorldUrl) return true;            // user is on the screen page
+            if (_url == _homeUrl) return true;                    // user is on home
+            if (_url == Plugin.MOTD_URL) return true;             // user is on MOTD
+            return false;
+        }
+
+        /// <summary>
+        /// Update the URL bar from a WebView event, but skip if the user has edited
+        /// the field since we last set it. Detection works by storing the last value
+        /// we wrote and comparing — if the current field value differs, the user is
+        /// mid-edit and we leave it alone.
+        /// </summary>
+        private static void SetUrlFieldIfNotEditing(string url)
+        {
+            if (_urlField == null || !_useWebView) return;
+            // If the user has typed something different from what we last set, they're
+            // editing — don't clobber. Otherwise (matches our last write, or first
+            // update), it's safe to overwrite.
+            if (_lastUrlFieldValue != null && _urlField.value != _lastUrlFieldValue)
+                return;
+            _urlField.value = url;
+            _lastUrlFieldValue = url;
         }
 
         private static void UpdateBackButton()
@@ -665,10 +915,13 @@ namespace WebsiteMOTD
                 wvWidth, wvHeight,
                 onLoaded: url =>
                 {
+                    // Hook is already installed via AddScriptOnLoad below — this is a
+                    // no-op fast path for clarity. EvaluateJS at OnLoaded still pushes
+                    // the up-to-date volume value into __motdVol after every navigation.
+
                     Plugin.Log("WebView loaded: " + url);
                     _url = url;
-                    if (_urlField != null && _useWebView)
-                        _urlField.value = url;
+                    SetUrlFieldIfNotEditing(url);
                     InjectAdBlockJS();
                     ApplyWebViewVolume();
                     InjectMediaHelperJS();
@@ -679,8 +932,7 @@ namespace WebsiteMOTD
                 {
                     Plugin.Log("WebView started: " + url);
                     _url = url;
-                    if (_urlField != null && _useWebView)
-                        _urlField.value = url;
+                    SetUrlFieldIfNotEditing(url);
                     UpdateBackForwardButtons();
                 },
                 onError: err =>
@@ -693,6 +945,11 @@ namespace WebsiteMOTD
                         Plugin.VideoEnded();
                 }
             );
+
+            // Install the volume hook BEFORE any page script can run. WebView2 honors
+            // this for every future navigation, so we no longer race against the page's
+            // own player setup — the engine default 1.0 never reaches the speakers.
+            _webView?.AddScriptOnLoad(PersistentVolumeHookJS);
 
             return _webView != null;
         }
@@ -870,6 +1127,76 @@ namespace WebsiteMOTD
 
         public static float EffectiveVolume => _isMuted ? 0f : _globalVolume;
 
+        /// <summary>
+        /// The persistent hook script installed once at WebView creation (via
+        /// AddScriptToExecuteOnDocumentCreated). It runs before any page JS on
+        /// every navigation, so the engine's default 1.0 volume never reaches
+        /// the audio output. <see cref="BuildVolumeJS"/> only pushes the value;
+        /// the actual clamping is enforced by this hook.
+        ///
+        /// What it installs:
+        ///   • A safe default for window.__motdVol (0) so videos can't play loud
+        ///     before the first BuildVolumeJS arrives via EvaluateJS.
+        ///   • A getter/setter override on HTMLMediaElement.prototype.volume that
+        ///     snaps every write to __motdVol.
+        ///   • A play() wrapper that sets the volume immediately before playback.
+        ///   • A capture-phase loadstart listener for lazy-loaded players.
+        ///   • A MutationObserver as a final safety net.
+        /// </summary>
+        internal const string PersistentVolumeHookJS =
+            "(function(){" +
+            "if(window.__motdVolHook)return;" +
+            "window.__motdVolHook=true;" +
+            // Default to silence until C# pushes a real value. Without this, the
+            // setter override would let through the engine default of 1.0 because
+            // __motdVol would be undefined.
+            "if(window.__motdVol==null)window.__motdVol=0;" +
+            "function apply(){try{document.querySelectorAll('video,audio').forEach(function(e){try{e.volume=window.__motdVol;}catch(_e){}});}catch(_e){}}" +
+            "try{var p=HTMLMediaElement.prototype;var d=Object.getOwnPropertyDescriptor(p,'volume');" +
+            "if(d&&d.set&&d.get){Object.defineProperty(p,'volume',{configurable:true," +
+            "get:function(){return d.get.call(this);}," +
+            "set:function(v){var o=window.__motdVol;d.set.call(this,(o!=null)?o:v);}});}}catch(_e){}" +
+            "try{var op=HTMLMediaElement.prototype.play;HTMLMediaElement.prototype.play=function(){try{this.volume=window.__motdVol;}catch(_e){}return op.apply(this,arguments);};}catch(_e){}" +
+            "try{document.addEventListener('loadstart',function(e){var t=e.target;if(t&&(t.tagName==='VIDEO'||t.tagName==='AUDIO')){try{t.volume=window.__motdVol;}catch(_e){}}},true);}catch(_e){}" +
+            "try{new MutationObserver(apply).observe(document.body||document.documentElement,{childList:true,subtree:true});}catch(_e){}" +
+            "})();";
+
+        /// <summary>
+        /// Push a volume value into the page AND install the clamping hooks if they
+        /// aren't already in place. The hook setup is normally done once at WebView
+        /// creation by <see cref="PersistentVolumeHookJS"/> — but if the native plugin
+        /// is older than the C# mod (missing _CWebViewPlugin_AddScriptOnLoad), the
+        /// persistent injection silently no-ops and this is the only thing keeping
+        /// videos from playing at the engine default 1.0.
+        ///
+        /// The hook block is guarded by <c>window.__motdVolHook</c>, so it's idempotent
+        /// — runs once per page, regardless of how many times BuildVolumeJS is invoked.
+        /// </summary>
+        internal static string BuildVolumeJS(float volume)
+        {
+            string volStr = volume.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+            return
+                "(function(){" +
+                "window.__motdVol=" + volStr + ";" +
+                "function apply(){try{document.querySelectorAll('video,audio').forEach(function(e){try{e.volume=window.__motdVol;}catch(_e){}});}catch(_e){}}" +
+                "apply();" +
+                "if(!window.__motdVolHook){" +
+                "window.__motdVolHook=true;" +
+                // Setter override: every volume write snaps to __motdVol. Without this,
+                // a re-render or DOM swap (e.g. chat-notification UI churn that causes
+                // YouTube to re-mount its player) lets a fresh element play at 1.0
+                // until the next observer tick.
+                "try{var p=HTMLMediaElement.prototype;var d=Object.getOwnPropertyDescriptor(p,'volume');" +
+                "if(d&&d.set&&d.get){Object.defineProperty(p,'volume',{configurable:true," +
+                "get:function(){return d.get.call(this);}," +
+                "set:function(v){var o=window.__motdVol;d.set.call(this,(o!=null)?o:v);}});}}catch(_e){}" +
+                "try{var op=HTMLMediaElement.prototype.play;HTMLMediaElement.prototype.play=function(){try{this.volume=window.__motdVol;}catch(_e){}return op.apply(this,arguments);};}catch(_e){}" +
+                "try{document.addEventListener('loadstart',function(e){var t=e.target;if(t&&(t.tagName==='VIDEO'||t.tagName==='AUDIO')){try{t.volume=window.__motdVol;}catch(_e){}}},true);}catch(_e){}" +
+                "try{new MutationObserver(apply).observe(document.body||document.documentElement,{childList:true,subtree:true});}catch(_e){}" +
+                "}" +
+                "})();";
+        }
+
         private static void InjectAdBlockJS()
         {
             if (_webView == null) return;
@@ -924,12 +1251,7 @@ namespace WebsiteMOTD
         {
             if (_webView == null) return;
             float vol = _isMuted ? 0f : _globalVolume;
-            string volStr = vol.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
-            _webView.EvaluateJS(
-                "window.__motdVol=" + volStr + ";" +
-                "document.querySelectorAll('video,audio').forEach(function(e){e.volume=window.__motdVol;});" +
-                "if(!window.__motdVolWatch){window.__motdVolWatch=true;" +
-                "new MutationObserver(function(){document.querySelectorAll('video,audio').forEach(function(e){e.volume=window.__motdVol;});}).observe(document.body||document.documentElement,{childList:true,subtree:true});}");
+            _webView.EvaluateJS(BuildVolumeJS(vol));
         }
 
         private static void ApplyWorldScreenVolume()
@@ -1521,8 +1843,13 @@ namespace WebsiteMOTD
             title.style.marginBottom = 16f;
             dialog.Add(title);
 
-            // Warning message
-            var msg = new Label("The server wants to open a webpage in the MOTD browser:");
+            // Warning message — note the destination differs by platform. The inline
+            // WebView only works on Windows, so other platforms fall back to the
+            // Steam overlay browser (handled in ShowConfirmed).
+            string destination = MOTDWebView.IsSupportedPlatform()
+                ? "in the MOTD browser"
+                : "in the Steam overlay browser";
+            var msg = new Label("The server wants to open a webpage " + destination + ":");
             msg.style.fontSize = 14f;
             msg.style.color = new Color(0.8f, 0.8f, 0.8f);
             msg.style.whiteSpace = WhiteSpace.Normal;
@@ -1657,6 +1984,11 @@ namespace WebsiteMOTD
                 Plugin.Log("User denied MOTD for: " + url);
                 _confirmOverlay?.RemoveFromHierarchy();
                 _confirmOverlay = null;
+                if (!_isVisible)
+                {
+                    DestroyEscPoller();
+                    UnblockGameplayInput();
+                }
             });
             denyBtn.style.paddingLeft = 24f;
             denyBtn.style.paddingRight = 24f;
@@ -1671,6 +2003,12 @@ namespace WebsiteMOTD
             UnityEngine.Cursor.visible = true;
             UnityEngine.Cursor.lockState = CursorLockMode.None;
             root.Add(_confirmOverlay);
+            EnsureEscPoller();
+            // Block gameplay input + dismiss any open chat right away — the dialog
+            // is modal, so we don't want stick input or chat keys leaking through
+            // while the player is deciding whether to open the page.
+            BlockGameplayInput();
+            DismissOpenChatInput();
         }
 
         private static void UpdateWebViewToggleButton()
@@ -1697,6 +2035,12 @@ namespace WebsiteMOTD
             foreach (var c in _gifCoroutines)
                 MOTDWebContent.StopManagedCoroutine(c);
             _gifCoroutines.Clear();
+
+            // Decoded textures (GIF frames + downloaded images) need explicit Destroy —
+            // GC won't free GPU memory on its own.
+            foreach (var tex in _managedTextures)
+                if (tex != null) UnityEngine.Object.Destroy(tex);
+            _managedTextures.Clear();
         }
 
         private static void RemoveStatusLabel()
@@ -1945,6 +2289,7 @@ namespace WebsiteMOTD
             // and the URL field absorbs leftover space without ever pushing them off.
             _urlField = new TextField();
             _urlField.value = _url ?? "";
+            _lastUrlFieldValue = _urlField.value;
             _urlField.style.flexGrow = 1f;
             _urlField.style.flexShrink = 1f;
             _urlField.style.minWidth = 120f;
@@ -2401,28 +2746,26 @@ namespace WebsiteMOTD
                 urlLabel.style.marginBottom = 8f;
                 _queueNowPlayingBox.Add(urlLabel);
 
-                // Skip button — owners can drop their own video without needing votes;
-                // everyone else gets the regular vote-skip with the running tally.
+                // Skip control. Owners can drop their own video without needing votes
+                // (single-click button). Everyone else gets a progress-bar vote-skip:
+                // a clickable track whose fill = current votes / threshold, so you can
+                // see the tally fill up as players vote without needing to read text.
                 if (Plugin.IsLocalOwnerOfCurrent())
                 {
                     _voteSkipBtn = CreateStyledButton(
                         "Skip (your video)",
                         new Color(0.6f, 0.35f, 0.2f),
                         Plugin.OwnerVetoCurrent);
+                    _voteSkipBtn.style.height = 28f;
+                    _voteSkipBtn.style.flexGrow = 1f;
                 }
                 else
                 {
-                    int votes = current.VoteSkippers.Count;
-                    int needed = Plugin.GetVoteSkipThreshold();
-                    bool voted = Plugin.HasLocalVotedSkip();
-
-                    _voteSkipBtn = CreateStyledButton(
-                        (voted ? "Voted Skip " : "Vote Skip ") + "(" + votes + "/" + needed + ")",
-                        voted ? new Color(0.55f, 0.4f, 0.25f) : new Color(0.6f, 0.25f, 0.25f),
-                        Plugin.ToggleVoteSkip);
+                    _voteSkipBtn = BuildVoteSkipProgressBar(
+                        current.VoteSkippers.Count,
+                        Plugin.GetVoteSkipThreshold(),
+                        Plugin.HasLocalVotedSkip());
                 }
-                _voteSkipBtn.style.height = 28f;
-                _voteSkipBtn.style.flexGrow = 1f;
                 _queueNowPlayingBox.Add(_voteSkipBtn);
             }
 
@@ -2500,6 +2843,63 @@ namespace WebsiteMOTD
             }
         }
 
+        /// <summary>
+        /// Build the vote-skip control as a clickable progress track. Fill width
+        /// represents votes/threshold so the tally is visible at a glance. Clicking
+        /// anywhere on the track toggles the local player's vote.
+        /// </summary>
+        private static VisualElement BuildVoteSkipProgressBar(int votes, int needed, bool voted)
+        {
+            // Clamp progress to [0, 1] — if for some reason votes exceeds needed (e.g.
+            // server already advanced), avoid a fill wider than the track.
+            float progress = needed > 0 ? Mathf.Clamp01((float)votes / needed) : 0f;
+
+            // Colors: bright red when not voted (urgent action), warmer amber when voted
+            // (acknowledged). Track is a dim version, fill is the saturated version.
+            Color trackColor = voted ? new Color(0.22f, 0.16f, 0.10f) : new Color(0.30f, 0.10f, 0.10f);
+            Color trackHover = voted ? new Color(0.30f, 0.22f, 0.14f) : new Color(0.42f, 0.16f, 0.16f);
+            Color fillColor  = voted ? new Color(0.85f, 0.62f, 0.30f) : new Color(0.85f, 0.30f, 0.30f);
+
+            var track = new VisualElement();
+            track.style.height = 28f;
+            track.style.flexGrow = 1f;
+            track.style.position = Position.Relative;
+            track.style.overflow = Overflow.Hidden;
+            track.style.backgroundColor = trackColor;
+            track.style.borderTopLeftRadius     = 4f;
+            track.style.borderTopRightRadius    = 4f;
+            track.style.borderBottomLeftRadius  = 4f;
+            track.style.borderBottomRightRadius = 4f;
+
+            var fill = new VisualElement();
+            fill.style.position = Position.Absolute;
+            fill.style.left   = 0f;
+            fill.style.top    = 0f;
+            fill.style.bottom = 0f;
+            fill.style.width  = new Length(progress * 100f, LengthUnit.Percent);
+            fill.style.backgroundColor = fillColor;
+            fill.pickingMode = PickingMode.Ignore; // clicks go through to the track
+            track.Add(fill);
+
+            var label = new Label((voted ? "Voted Skip " : "Vote Skip ") + "(" + votes + "/" + needed + ")");
+            label.style.position = Position.Absolute;
+            label.style.left   = 0f;
+            label.style.right  = 0f;
+            label.style.top    = 0f;
+            label.style.bottom = 0f;
+            label.style.unityTextAlign = TextAnchor.MiddleCenter;
+            label.style.color = Color.white;
+            label.style.fontSize = 13f;
+            label.style.unityFontStyleAndWeight = FontStyle.Bold;
+            label.pickingMode = PickingMode.Ignore;
+            track.Add(label);
+
+            track.RegisterCallback<ClickEvent>(_ => Plugin.ToggleVoteSkip());
+            track.RegisterCallback<MouseEnterEvent>(_ => track.style.backgroundColor = trackHover);
+            track.RegisterCallback<MouseLeaveEvent>(_ => track.style.backgroundColor = trackColor);
+            return track;
+        }
+
         private static string Truncate(string s, int max)
         {
             if (string.IsNullOrEmpty(s)) return "";
@@ -2565,6 +2965,7 @@ namespace WebsiteMOTD
             try
             {
                 if (string.IsNullOrWhiteSpace(url)) url = _url;
+                if (string.IsNullOrWhiteSpace(url)) return; // nothing to open
                 if (!url.StartsWith("http")) url = "https://" + url;
                 Application.OpenURL(url);
             }
@@ -2742,7 +3143,15 @@ namespace WebsiteMOTD
                     // Fetch raw bytes and decode all frames for animation
                     MOTDWebContent.FetchGif(imageUrl, frames =>
                     {
-                        if (imgContainer.parent == null) return;
+                        if (imgContainer.parent == null)
+                        {
+                            // Late callback — destroy decoded frames inline so they don't
+                            // sit on the GPU forever.
+                            if (frames != null)
+                                foreach (var f in frames)
+                                    if (f.Texture != null) UnityEngine.Object.Destroy(f.Texture);
+                            return;
+                        }
                         if (frames == null || frames.Length == 0)
                         {
                             placeholder.text = "[GIF failed to load]";
@@ -2751,6 +3160,12 @@ namespace WebsiteMOTD
                         }
 
                         imgContainer.Clear();
+
+                        // Track each decoded frame so CleanupVideoHosts can free GPU memory —
+                        // GifDecoder allocates a fresh Texture2D per frame.
+                        for (int fi = 0; fi < frames.Length; fi++)
+                            if (frames[fi].Texture != null)
+                                _managedTextures.Add(frames[fi].Texture);
 
                         float maxW = 900f;
                         var first = frames[0].Texture;
@@ -2783,7 +3198,13 @@ namespace WebsiteMOTD
                 {
                     MOTDWebContent.FetchImage(imageUrl, tex =>
                     {
-                        if (imgContainer.parent == null) return;
+                        if (imgContainer.parent == null)
+                        {
+                            // Late callback for a container that's already been cleared/destroyed.
+                            // Destroy the texture inline since it'll never be tracked.
+                            if (tex != null) UnityEngine.Object.Destroy(tex);
+                            return;
+                        }
 
                         if (tex == null)
                         {
@@ -2793,6 +3214,8 @@ namespace WebsiteMOTD
                             placeholder.style.color = new Color(0.6f, 0.4f, 0.4f);
                             return;
                         }
+
+                        _managedTextures.Add(tex);
 
                         imgContainer.Clear();
 
@@ -3059,7 +3482,9 @@ namespace WebsiteMOTD
 
             host = MOTDVideoHost.Create(url, _url, videoFrame, statusLabel);
             host.ConnectControls(setProgress, t => timeLabel.text = t);
-            host.SetVolume(1f);
+            // Honour the user's global mute/volume — starting at 1.0 ignored the slider
+            // and the mute button until the user re-touched a control.
+            host.SetVolume(EffectiveVolume);
             _videoHosts.Add(host);
         }
 
@@ -3288,6 +3713,29 @@ namespace WebsiteMOTD
             btn.RegisterCallback<MouseLeaveEvent>(e => btn.style.backgroundColor = accentColor);
 
             return btn;
+        }
+    }
+
+    /// <summary>
+    /// Polls the keyboard each frame and routes ESC to MOTDUI.OnEscapePressed.
+    /// UI Toolkit's KeyDownEvent only fires for the focused element, and the
+    /// WebView consumes its own key input, so a top-level poller is the only
+    /// way to catch ESC reliably regardless of where focus lives.
+    /// </summary>
+    internal class MOTDEscPoller : MonoBehaviour
+    {
+        void Update()
+        {
+            try
+            {
+                var kb = Keyboard.current;
+                if (kb != null && kb.escapeKey.wasPressedThisFrame)
+                    MOTDUI.OnEscapePressedFromPoller();
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("EscPoller: " + ex.Message);
+            }
         }
     }
 }

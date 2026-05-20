@@ -16,6 +16,8 @@ namespace WebsiteMOTD
         [DllImport("WebView")]
         private static extern IntPtr _CWebViewPlugin_Init(string gameObject, bool transparent, bool zoom, int width, int height, string ua, bool separated);
         [DllImport("WebView")]
+        private static extern void _CWebViewPlugin_AddScriptOnLoad(IntPtr instance, string js);
+        [DllImport("WebView")]
         private static extern int _CWebViewPlugin_Destroy(IntPtr instance);
         [DllImport("WebView")]
         private static extern void _CWebViewPlugin_SetVisibility(IntPtr instance, bool visibility);
@@ -55,6 +57,21 @@ namespace WebsiteMOTD
         private const float LoadActiveSec = 3.0f;   // full-speed capture after page load
         private const float LoadWindDownSec = 8.0f;  // half-speed for a few more seconds
 
+        // ─── Proximity audio ────────────────────────────────────────
+        // WebView2 plays audio directly to the Windows mixer — we can't route it
+        // through Unity's audio system without modifying the native plugin. As a
+        // close approximation, we sample the listener's distance to each screen
+        // every few frames and multiply the global WebView volume by a logarithmic
+        // attenuation curve. Two-screen contributions are summed (clamped to 1)
+        // so the player hears both when standing between them.
+        private const float ProxMinDistance = 5f;
+        private const float ProxMaxDistance = 40f;
+        private const int   ProxUpdateFrameInterval = 4;     // re-evaluate every N frames
+        private const float ProxVolumeEpsilon = 0.02f;       // skip JS update for tiny deltas
+        private static float _globalAudioMultiplier = 0.5f;  // from MOTDUI volume slider / mute
+        private static float _positionalMultiplier = 1f;     // computed from listener distance
+        private static AudioListener _cachedListener;        // resolved lazily, refreshed on miss
+
         // ─── Per-instance ───────────────────────────────────────────
         private MeshRenderer _renderer;
         private bool _isPrimary;
@@ -73,6 +90,12 @@ namespace WebsiteMOTD
                 Plugin.LogError("WorldScreen: WebView.dll not loaded, cannot spawn.");
                 return;
             }
+
+            // Force a fresh listener lookup and a fresh positional sample so the first
+            // EvaluateJS uses the right multiplier, not whatever was cached from a
+            // previous session.
+            _cachedListener = null;
+            _positionalMultiplier = 1f;
 
             Vector3 posA, posB;
             Quaternion rotA, rotB;
@@ -102,6 +125,10 @@ namespace WebsiteMOTD
             if (_screenA != null) { _screenA.Cleanup(); _screenA = null; }
             if (_screenB != null) { _screenB.Cleanup(); _screenB = null; }
             DestroySharedWebView();
+            // The AudioListener may belong to a player/camera that gets destroyed on
+            // scene change. Drop the reference so the next SpawnScreens re-resolves.
+            _cachedListener = null;
+            _positionalMultiplier = 1f;
         }
 
         // ─── Goal Finding ───────────────────────────────────────────
@@ -191,13 +218,11 @@ namespace WebsiteMOTD
 
             if (isPrimary)
             {
-                var audio = go.AddComponent<AudioSource>();
-                audio.spatialBlend = 1f;
-                audio.minDistance = 5f;
-                audio.maxDistance = 40f;
-                audio.rolloffMode = AudioRolloffMode.Linear;
-                audio.playOnAwake = false;
-
+                // No AudioSource: WebView2 audio plays through the Windows mixer, not
+                // through Unity's audio graph, so a positional AudioSource here would
+                // produce no sound. Proximity feel is achieved by sampling the
+                // listener distance per frame and scaling the WebView's JS volume —
+                // see UpdatePositionalVolume / ApplyVolume.
                 InitSharedWebView(go.name);
             }
 
@@ -249,6 +274,23 @@ namespace WebsiteMOTD
 
             _CWebViewPlugin_SetVisibility(_sharedWebView, true);
             _CWebViewPlugin_SetRect(_sharedWebView, TEX_WIDTH, TEX_HEIGHT);
+
+            // Volume hook runs before any page script, so freshly-created media
+            // elements can't sneak through at the default 1.0 volume. Tolerate older
+            // WebView.dll builds without this export — the spawn flow used to crash
+            // here with EntryPointNotFoundException and no screens would appear.
+            try
+            {
+                _CWebViewPlugin_AddScriptOnLoad(_sharedWebView, MOTDUI.PersistentVolumeHookJS);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                Plugin.LogError("WorldScreen: WebView.dll is older than C# mod — _CWebViewPlugin_AddScriptOnLoad missing. Loudness bursts on page-load won't be prevented; rebuild the native plugin to fix.");
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("WorldScreen: AddScriptOnLoad threw: " + ex.Message);
+            }
         }
 
         private static void DestroySharedWebView()
@@ -277,6 +319,12 @@ namespace WebsiteMOTD
             // Only the primary screen drives the shared webview
             if (_isPrimary && _sharedWebView != IntPtr.Zero)
             {
+                // Distance-based volume — sampled on a throttle so we don't
+                // bombard the WebView with EvaluateJS calls every frame.
+                if (Time.frameCount % ProxUpdateFrameInterval == 0)
+                    UpdatePositionalVolume();
+
+
                 // Pump message queue (always, even when not refreshing bitmap)
                 for (;;)
                 {
@@ -389,15 +437,95 @@ namespace WebsiteMOTD
                 _screenB._renderer.enabled = visible;
         }
 
+        /// <summary>
+        /// Update the global (slider/mute) audio multiplier and re-apply.
+        /// Positional attenuation is layered on top in <see cref="ApplyVolume"/>.
+        /// </summary>
         public static void SetVolume(float volume)
         {
+            _globalAudioMultiplier = Mathf.Clamp01(volume);
+            ApplyVolume();
+        }
+
+        /// <summary>
+        /// Push the current effective volume (global × positional) to the WebView's
+        /// media elements via JS. Idempotent — safe to call from both the slider and
+        /// the per-frame distance loop. JS includes prototype/play hooks that prevent
+        /// the loudness bursts you'd otherwise hear when a new video starts.
+        /// </summary>
+        private static void ApplyVolume()
+        {
             if (_sharedWebView == IntPtr.Zero) return;
-            string volStr = volume.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
-            _CWebViewPlugin_EvaluateJS(_sharedWebView,
-                "window.__motdVol=" + volStr + ";" +
-                "document.querySelectorAll('video,audio').forEach(function(e){e.volume=window.__motdVol;});" +
-                "if(!window.__motdVolWatch){window.__motdVolWatch=true;" +
-                "new MutationObserver(function(){document.querySelectorAll('video,audio').forEach(function(e){e.volume=window.__motdVol;});}).observe(document.body||document.documentElement,{childList:true,subtree:true});}");
+            float v = Mathf.Clamp01(_globalAudioMultiplier * _positionalMultiplier);
+            _CWebViewPlugin_EvaluateJS(_sharedWebView, MOTDUI.BuildVolumeJS(v));
+        }
+
+        /// <summary>
+        /// Logarithmic distance attenuation matching Unity's stock log rolloff —
+        /// 1.0 within <see cref="ProxMinDistance"/>, falling to 0 at
+        /// <see cref="ProxMaxDistance"/>. Returns 0 past max so out-of-range
+        /// screens don't keep contributing.
+        /// </summary>
+        private static float LogAttenuate(float distance)
+        {
+            if (distance <= ProxMinDistance) return 1f;
+            if (distance >= ProxMaxDistance) return 0f;
+            return Mathf.Log(ProxMaxDistance / distance) /
+                   Mathf.Log(ProxMaxDistance / ProxMinDistance);
+        }
+
+        private static Transform GetListenerTransform()
+        {
+            // Puck spawns multiple BaseCamera instances (player, main menu, etc.), each
+            // with its own AudioListener. Only one is enabled at a time — that's the
+            // listener actually routing audio. FindFirstObjectByType returns whichever
+            // Unity walks into first, which is usually the static main-menu listener
+            // and never moves. We need to filter to enabled ones, and re-resolve when
+            // the cached listener gets disabled (scene transition, camera swap).
+            if (_cachedListener == null || !_cachedListener.isActiveAndEnabled)
+            {
+                _cachedListener = null;
+                var all = UnityEngine.Object.FindObjectsByType<AudioListener>(FindObjectsSortMode.None);
+                foreach (var l in all)
+                {
+                    if (l != null && l.isActiveAndEnabled)
+                    {
+                        _cachedListener = l;
+                        break;
+                    }
+                }
+                // Last-ditch fallback: any listener (even disabled) is better than nothing.
+                if (_cachedListener == null && all.Length > 0)
+                    _cachedListener = all[0];
+            }
+            if (_cachedListener != null) return _cachedListener.transform;
+            var cam = Camera.main;
+            return cam != null ? cam.transform : null;
+        }
+
+        /// <summary>
+        /// Sample listener position and update <see cref="_positionalMultiplier"/>.
+        /// Both screens contribute and are summed (clamped to 1.0) so standing between
+        /// the goals gives full volume from both speakers.
+        /// </summary>
+        private static void UpdatePositionalVolume()
+        {
+            if (_sharedWebView == IntPtr.Zero) return;
+            if (_screenA == null && _screenB == null) return;
+
+            var listener = GetListenerTransform();
+            if (listener == null) return;
+            Vector3 lp = listener.position;
+
+            float attenA = _screenA != null
+                ? LogAttenuate(Vector3.Distance(lp, _screenA.transform.position)) : 0f;
+            float attenB = _screenB != null
+                ? LogAttenuate(Vector3.Distance(lp, _screenB.transform.position)) : 0f;
+
+            float combined = Mathf.Clamp01(attenA + attenB);
+            if (Mathf.Abs(combined - _positionalMultiplier) < ProxVolumeEpsilon) return;
+            _positionalMultiplier = combined;
+            ApplyVolume();
         }
 
         private static void InjectWorldAdBlockJS()

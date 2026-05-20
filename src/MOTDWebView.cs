@@ -54,6 +54,8 @@ namespace WebsiteMOTD
         [DllImport("WebView")]
         private static extern void _CWebViewPlugin_EvaluateJS(IntPtr instance, string js);
         [DllImport("WebView")]
+        private static extern void _CWebViewPlugin_AddScriptOnLoad(IntPtr instance, string js);
+        [DllImport("WebView")]
         private static extern int _CWebViewPlugin_Progress(IntPtr instance);
         [DllImport("WebView")]
         private static extern bool _CWebViewPlugin_CanGoBack(IntPtr instance);
@@ -104,8 +106,22 @@ namespace WebsiteMOTD
         private Action<string> _onJS;
 
         private static bool _nativeLoaded;
+        private static bool _preloadAttempted;   // prevents repeated probe + log spam after a failed load
         private static bool _staticInitDone;
         private static bool _bitmapGenSupported = true;
+
+        /// <summary>
+        /// The native WebView plugin (WebView2) is Windows-only. On Linux/macOS
+        /// the kernel32 + WebView DllImports throw DllNotFoundException at the
+        /// first call, which crashes the connect handler when the local client
+        /// has the MOTD site trusted (skipping the deny dialog). Probe once,
+        /// gracefully fall back to HTML-only mode everywhere else.
+        /// </summary>
+        public static bool IsSupportedPlatform()
+        {
+            return Application.platform == RuntimePlatform.WindowsPlayer
+                || Application.platform == RuntimePlatform.WindowsEditor;
+        }
 
         /// <summary>
         /// Ensures the native WebView2 static init is called exactly once.
@@ -114,6 +130,7 @@ namespace WebsiteMOTD
         public static void EnsureStaticInit()
         {
             if (_staticInitDone) return;
+            if (!IsSupportedPlatform()) return;
             bool isDX11 = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11;
             _CWebViewPlugin_InitStatic(false, isDX11);
             _staticInitDone = true;
@@ -134,6 +151,14 @@ namespace WebsiteMOTD
         public static bool PreloadNativeDLL()
         {
             if (_nativeLoaded) return true;
+            if (_preloadAttempted) return false;
+            _preloadAttempted = true;
+
+            if (!IsSupportedPlatform())
+            {
+                Plugin.Log("WebView mode skipped: native plugin is Windows-only (platform: " + Application.platform + ").");
+                return false;
+            }
 
             // Try multiple paths where the mod might ship the DLL
             string[] searchPaths = new[]
@@ -148,22 +173,25 @@ namespace WebsiteMOTD
 
             foreach (var path in searchPaths)
             {
-                if (File.Exists(path))
+                if (!File.Exists(path)) continue;
+                Plugin.Log("Loading WebView.dll from: " + path);
+
+                IntPtr handle;
+                try { handle = LoadLibraryW(path); }
+                catch (Exception ex)
                 {
-                    Plugin.Log("Loading WebView.dll from: " + path);
-                    IntPtr handle = LoadLibraryW(path);
-                    if (handle != IntPtr.Zero)
-                    {
-                        _nativeLoaded = true;
-                        Plugin.Log("WebView.dll loaded successfully.");
-                        return true;
-                    }
-                    else
-                    {
-                        int err = Marshal.GetLastWin32Error();
-                        Plugin.LogError("Failed to load WebView.dll (error " + err + "): " + path);
-                    }
+                    Plugin.LogError("LoadLibraryW threw for " + path + ": " + ex.Message);
+                    continue;
                 }
+
+                if (handle != IntPtr.Zero)
+                {
+                    _nativeLoaded = true;
+                    Plugin.Log("WebView.dll loaded successfully.");
+                    return true;
+                }
+                int err = Marshal.GetLastWin32Error();
+                Plugin.LogError("Failed to load WebView.dll (error " + err + "): " + path);
             }
 
             Plugin.LogError("WebView.dll not found in any search path. WebView mode unavailable.");
@@ -254,11 +282,28 @@ namespace WebsiteMOTD
             // Capture ALL key events at the panel level so game binds can't fire while webview has focus
             _targetElement.RegisterCallback<KeyDownEvent>(OnKeyDown, TrickleDown.TrickleDown);
             _targetElement.RegisterCallback<KeyUpEvent>(OnKeyUp, TrickleDown.TrickleDown);
+            // Track focus state so the global onTextInput hook + PollKeyboard don't
+            // bleed keystrokes into the WebView while the user is typing in the URL
+            // bar or the queue input. Without this, _hasFocus stays true forever after
+            // the first click into the webview and every keystroke goes to both places.
+            _targetElement.RegisterCallback<FocusInEvent>(OnFocusIn);
+            _targetElement.RegisterCallback<FocusOutEvent>(OnFocusOut);
 
             _targetElement.focusable = true;
 
             if (Keyboard.current != null)
                 Keyboard.current.onTextInput += OnTextInput;
+        }
+
+        private void OnFocusIn(FocusInEvent evt)
+        {
+            _hasFocus = true;
+            _lastInteractTime = Time.unscaledTime;
+        }
+
+        private void OnFocusOut(FocusOutEvent evt)
+        {
+            _hasFocus = false;
         }
 
         private (int x, int y) ToWebViewCoords(Vector2 localPos)
@@ -345,8 +390,10 @@ namespace WebsiteMOTD
             { _lastInteractTime = Time.unscaledTime; _CWebViewPlugin_SendKeyEvent(_webView, 0, 0, "\n", 13, 1); }
             if (kb.tabKey.wasPressedThisFrame)
             { _lastInteractTime = Time.unscaledTime; _CWebViewPlugin_SendKeyEvent(_webView, 0, 0, "\t", 9, 1); }
-            if (kb.escapeKey.wasPressedThisFrame)
-            { _lastInteractTime = Time.unscaledTime; _CWebViewPlugin_SendKeyEvent(_webView, 0, 0, "", 27, 1); }
+            // ESC intentionally NOT forwarded: MOTDUI uses ESC to close the overlay.
+            // Forwarding here would race with Hide() (frame-order dependent) and could
+            // also fire side-effects inside the page (e.g. exiting YouTube fullscreen)
+            // right before we destroy the WebView.
         }
 
         // ─── Public API ─────────────────────────────────────────────
@@ -370,6 +417,32 @@ namespace WebsiteMOTD
             if (_webView == IntPtr.Zero) return;
             _CWebViewPlugin_EvaluateJS(_webView, js);
         }
+
+        /// <summary>
+        /// Register a script that runs before any page script on every navigation.
+        /// Used for hooks that must beat the page's own JS (volume clamps, etc.).
+        /// The script persists for the lifetime of this WebView instance. Call once
+        /// after creation; subsequent calls add additional scripts (they accumulate).
+        /// Older WebView.dll builds don't export this; degrade gracefully rather than
+        /// crashing the spawn flow (the existing EvaluateJS fallback still works,
+        /// it just leaves the ~100ms loudness-burst window open).
+        /// </summary>
+        public void AddScriptOnLoad(string js)
+        {
+            if (_webView == IntPtr.Zero || string.IsNullOrEmpty(js)) return;
+            if (!_addScriptOnLoadSupported) return;
+            try { _CWebViewPlugin_AddScriptOnLoad(_webView, js); }
+            catch (EntryPointNotFoundException)
+            {
+                _addScriptOnLoadSupported = false;
+                Plugin.LogError("WebView.dll is older than the C# mod — _CWebViewPlugin_AddScriptOnLoad missing. Audio bursts on page-load won't be prevented; rebuild the native plugin to fix.");
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("AddScriptOnLoad threw: " + ex.Message);
+            }
+        }
+        private static bool _addScriptOnLoadSupported = true;
 
         public void GoBack()
         {
@@ -517,6 +590,8 @@ namespace WebsiteMOTD
                 _targetElement.UnregisterCallback<WheelEvent>(OnWheel);
                 _targetElement.UnregisterCallback<KeyDownEvent>(OnKeyDown, TrickleDown.TrickleDown);
                 _targetElement.UnregisterCallback<KeyUpEvent>(OnKeyUp, TrickleDown.TrickleDown);
+                _targetElement.UnregisterCallback<FocusInEvent>(OnFocusIn);
+                _targetElement.UnregisterCallback<FocusOutEvent>(OnFocusOut);
                 _targetElement.style.backgroundImage = new StyleBackground();
                 _targetElement = null;
             }

@@ -18,12 +18,13 @@ namespace WebsiteMOTD
         public string Url;
         public List<ulong> VoteSkippers = new List<ulong>();
 
-        // Monotonically increasing per-item ID assigned on the server when an item
-        // becomes _current. Used to dedupe video-ended signals (a single video can be
-        // reported "ended" by multiple sources — overlay WebView, world screen, every
-        // client — and we must advance exactly once per item). URL alone can't dedupe
-        // because two players can legitimately queue the same URL back-to-back.
-        public long Seq;
+        /// <summary>
+        /// Monotonically increasing, server-assigned identifier. Stable for the
+        /// lifetime of the item (assigned at add, never changes). Used as the
+        /// dedupe key for client→server remove requests so they target a specific
+        /// item even if its queue position has shifted in between.
+        /// </summary>
+        public long Id;
     }
 
     public class Plugin : IPuckPlugin
@@ -50,8 +51,22 @@ namespace WebsiteMOTD
         private static readonly List<QueueItem> _queue = new List<QueueItem>();
         private static QueueItem _current;
         private static string _lastLoadedWorldUrl; // prevents reloading on every state broadcast
-        private static long _itemSeqCounter;       // server-side monotonic source for QueueItem.Seq
-        private static long _endedForSeq;          // deduplicates video-ended signals (per-item, not per-URL)
+        private static long _nextItemId;           // server-side monotonic source for QueueItem.Id
+        private static float _lastAdvanceTimeUT;   // Time.unscaledTime of last ServerPlayNext — debounces "ended"
+
+        // ─── Server-side queue limits (defensive against spam/DoS) ─────
+        private const int MaxQueueLength = 50;          // total items across all players
+        private const int MaxPerPlayer = 5;             // including the currently-playing one
+        private const int MaxUrlLength = 2000;          // characters
+        private const float AddCooldownSeconds = 1f;    // per-client add throttle
+        // "Ended" debounce: a single video end fires multiple "ended" messages across
+        // peers (overlay + world-screen + every remote client). All arrive within ~2s
+        // of each other. Any non-ended advance (vote-skip, owner-veto, etc.) resets
+        // this timer too, so we never accidentally skip two videos for one event.
+        private const float EndedDebounceSeconds = 3f;
+
+        // Per-client add cooldown timestamps (server-only).
+        private static readonly Dictionary<ulong, float> _lastAddTimeUT = new Dictionary<ulong, float>();
 
         // Server config flags received by clients (default: all enabled)
         private static bool _serverScreensEnabled = true;
@@ -143,8 +158,9 @@ namespace WebsiteMOTD
             _queue.Clear();
             _current = null;
             _lastLoadedWorldUrl = null;
-            _endedForSeq = 0;
-            _itemSeqCounter = 0;
+            _nextItemId = 0;
+            _lastAdvanceTimeUT = 0f;
+            _lastAddTimeUT.Clear();
             _serverScreensEnabled = true;
             _serverQueueEnabled = true;
 
@@ -196,6 +212,10 @@ namespace WebsiteMOTD
             if (nm != null && nm.IsServer)
             {
                 bool changed = false;
+
+                // Drop their add cooldown entry so a reconnected client doesn't
+                // get blocked by their previous session's timestamp.
+                _lastAddTimeUT.Remove(clientId);
 
                 // Remove their queued items
                 for (int i = _queue.Count - 1; i >= 0; i--)
@@ -332,11 +352,11 @@ namespace WebsiteMOTD
                 if (!IsDedicatedServer())
                 {
                     MOTDUI.Show(url);
-                    if (screensEnabled)
-                    {
-                        MOTDWorldScreen.SpawnScreens();
-                        LoadCurrentOnWorldScreens();
-                    }
+                    // Always call LoadCurrentOnWorldScreens — it handles both the
+                    // server-enabled path and the theatre-claim path internally, so
+                    // OpenWorld's TheatreVideoScreen still gets content when the
+                    // server has level screens disabled.
+                    LoadCurrentOnWorldScreens();
                 }
             }
             catch (Exception ex)
@@ -350,7 +370,19 @@ namespace WebsiteMOTD
         /// <summary>Add a URL to the shared queue on behalf of the local player.</summary>
         public static void AddToQueue(string url)
         {
-            if (!_serverQueueEnabled) return;
+            // Surface a visible error when the queue is server-disabled — otherwise
+            // /q chat commands and the queue-panel button would silently no-op. Chat
+            // is the universal fallback since the panel itself is hidden when the
+            // server has the queue off.
+            if (!_serverQueueEnabled)
+            {
+                if (!IsDedicatedServer())
+                {
+                    LocalChat("The server has the queue disabled.");
+                    MOTDUI.ShowQueueError("The server has the queue disabled.");
+                }
+                return;
+            }
             if (string.IsNullOrWhiteSpace(url)) return;
             url = url.Trim();
             if (!url.StartsWith("http://") && !url.StartsWith("https://"))
@@ -369,16 +401,25 @@ namespace WebsiteMOTD
             }
         }
 
-        /// <summary>Toggle vote-skip on the currently playing item.</summary>
+        /// <summary>
+        /// Toggle vote-skip on the currently playing item. The current item's id is
+        /// captured at click time and bundled in the message; the server validates
+        /// the id still matches _current.Id when the message arrives, so a vote
+        /// can't accidentally target a different item that advanced into "current"
+        /// during the network round-trip.
+        /// </summary>
         public static void ToggleVoteSkip()
         {
+            if (_current == null) return;
+            long targetId = _current.Id;
+
             var nm = NetworkManager.Singleton;
             if (nm?.CustomMessagingManager == null) return;
 
             if (nm.IsServer)
-                ServerHandleVote(nm.LocalClientId);
+                ServerHandleVote(nm.LocalClientId, targetId);
             else
-                SendScreenMsg("vote");
+                SendScreenMsg("vote:" + targetId);
         }
 
         /// <summary>True if the local client queued the currently playing item.</summary>
@@ -392,30 +433,40 @@ namespace WebsiteMOTD
 
         /// <summary>
         /// Owner-only skip: the player who queued the current item can drop it
-        /// without waiting on votes. No-op for non-owners.
+        /// without waiting on votes. No-op for non-owners. Item id captured at
+        /// click time and validated server-side to prevent a stale veto from
+        /// dropping a different item that advanced during the round-trip.
         /// </summary>
         public static void OwnerVetoCurrent()
         {
+            if (_current == null) return;
+            long targetId = _current.Id;
+
             var nm = NetworkManager.Singleton;
             if (nm?.CustomMessagingManager == null) return;
             if (!IsLocalOwnerOfCurrent()) return;
 
             if (nm.IsServer)
-                ServerOwnerVeto(nm.LocalClientId);
+                ServerOwnerVeto(nm.LocalClientId, targetId);
             else
-                SendScreenMsg("veto");
+                SendScreenMsg("veto:" + targetId);
         }
 
-        /// <summary>Remove one of your queued items.</summary>
-        public static void RemoveFromQueue(int index)
+        /// <summary>
+        /// Remove one of your queued items by its server-assigned id (see
+        /// <see cref="QueueItem.Id"/>). Id is stable across the item's lifetime,
+        /// so this targets the right item even if the queue has shifted between
+        /// when the UI rendered and when the request arrives.
+        /// </summary>
+        public static void RemoveFromQueue(long itemId)
         {
             var nm = NetworkManager.Singleton;
             if (nm?.CustomMessagingManager == null) return;
 
             if (nm.IsServer)
-                ServerRemoveItem(nm.LocalClientId, index);
+                ServerRemoveItem(nm.LocalClientId, itemId);
             else
-                SendScreenMsg("remove:" + index);
+                SendScreenMsg("remove:" + itemId);
         }
 
         public static bool HasLocalVotedSkip()
@@ -437,32 +488,49 @@ namespace WebsiteMOTD
 
         /// <summary>
         /// Called when the local client's WebView detects that the current video ended.
-        /// Server advances the queue immediately; clients send a signal to the server.
-        /// On a listen server the overlay WebView and the world-screen WebView can both
-        /// fire this for the same video — and remote clients may pile on with their own
-        /// "ended" messages. Dedupe by the current item's Seq.
+        /// <paramref name="reportedItemId"/> is the queue item id the page was bound to
+        /// at load time (see __motdItemId injection). Server validates the id matches
+        /// _current.Id before advancing — so a stale "ended" message from a video that
+        /// was already skipped past can't double-advance the queue, AND a random video
+        /// in the overlay (id=0) doesn't affect the queue at all.
         /// </summary>
-        public static void VideoEnded()
+        public static void VideoEnded(long reportedItemId)
         {
+            if (reportedItemId == 0) return; // not a queue item — drop locally too
+
             var nm = NetworkManager.Singleton;
             if (nm?.CustomMessagingManager == null) return;
             if (nm.IsServer)
-            {
-                ServerTryAdvanceForEnded();
-            }
+                ServerTryAdvanceForEnded(reportedItemId);
             else
-            {
-                SendScreenMsg("ended");
-            }
+                SendScreenMsg("ended:" + reportedItemId);
         }
 
-        /// <summary>Server-side dedupe gate for ended-driven advances. Returns whether the queue advanced.</summary>
-        private static bool ServerTryAdvanceForEnded()
+        /// <summary>
+        /// Server-side gate for ended-driven advances. Two layers of dedupe:
+        ///   • Id match — the message reports which item the video belonged to;
+        ///     if it's not the active _current, it's a stale event from a past
+        ///     item that we've already advanced past. Drop.
+        ///   • Time debounce — multiple peers report ended for the SAME video
+        ///     within a couple seconds of each other; the time gate coalesces
+        ///     them into a single ServerPlayNext call.
+        /// Returns whether the queue advanced.
+        /// </summary>
+        private static bool ServerTryAdvanceForEnded(long reportedItemId)
         {
-            long seq = _current != null ? _current.Seq : 0;
-            if (seq == 0 || seq == _endedForSeq) return false;
-            _endedForSeq = seq;
-            Log("Video ended (seq=" + seq + ") — advancing queue.");
+            if (_current == null) return false;
+            if (_current.Id != reportedItemId)
+            {
+                // Stale: this "ended" is for an item we already moved past.
+                return false;
+            }
+            float elapsed = Time.unscaledTime - _lastAdvanceTimeUT;
+            if (elapsed < EndedDebounceSeconds)
+            {
+                // Same video, multiple peers reporting — coalesce.
+                return false;
+            }
+            Log("Video ended (id=" + _current.Id + ") — advancing queue.");
             ServerPlayNext();
             return true;
         }
@@ -491,8 +559,17 @@ namespace WebsiteMOTD
             if (nm?.CustomMessagingManager == null) return;
 
             byte[] msgBytes = Encoding.UTF8.GetBytes(msg);
+            ulong localId = nm.LocalClientId;
             foreach (ulong clientId in nm.ConnectedClientsIds)
+            {
+                // Skip the local client — the host already has the source-of-truth
+                // state and gets notified directly via OnQueueChanged. Sending
+                // through Netcode just bounces back to ourselves, allocates a
+                // FastBufferWriter for nothing, and the receive handler ignores
+                // it anyway (the "state:" branch only runs on non-server clients).
+                if (clientId == localId) continue;
                 SendScreenMsgToInternal(clientId, msgBytes);
+            }
         }
 
         private static void SendScreenMsgTo(ulong clientId, string msg)
@@ -539,27 +616,28 @@ namespace WebsiteMOTD
                         string username = GetPlayerName(senderClientId);
                         ServerAddItem(senderClientId, username, url);
                     }
-                    else if (msg == "vote")
+                    else if (msg.StartsWith("vote:"))
                     {
-                        ServerHandleVote(senderClientId);
+                        if (long.TryParse(msg.Substring(5), out long voteId))
+                            ServerHandleVote(senderClientId, voteId);
                     }
-                    else if (msg == "veto")
+                    else if (msg.StartsWith("veto:"))
                     {
-                        ServerOwnerVeto(senderClientId);
+                        if (long.TryParse(msg.Substring(5), out long vetoId))
+                            ServerOwnerVeto(senderClientId, vetoId);
                     }
-                    else if (msg == "ended")
+                    else if (msg.StartsWith("ended:"))
                     {
-                        // Dedupe routes through ServerTryAdvanceForEnded — same gate the
-                        // server-local VideoEnded path uses, so listen-server hosts don't
-                        // double-advance when both their own webview and a remote client
-                        // report the same video ending.
-                        if (ServerTryAdvanceForEnded())
-                            Log("Client " + senderClientId + " reported video ended.");
+                        if (long.TryParse(msg.Substring(6), out long endedId)
+                            && ServerTryAdvanceForEnded(endedId))
+                        {
+                            Log("Client " + senderClientId + " reported video ended (id=" + endedId + ").");
+                        }
                     }
                     else if (msg.StartsWith("remove:"))
                     {
-                        if (int.TryParse(msg.Substring(7), out int idx))
-                            ServerRemoveItem(senderClientId, idx);
+                        if (long.TryParse(msg.Substring(7), out long itemId))
+                            ServerRemoveItem(senderClientId, itemId);
                     }
                 }
                 else
@@ -587,13 +665,65 @@ namespace WebsiteMOTD
 
         // ─── Server-side queue logic ────────────────────────────────
 
+        /// <summary>
+        /// Surface a queue-rejection error to the client who tried the action.
+        /// Short-circuits to local chat + UI for the host (where routing back through
+        /// the messaging layer would land on the server branch and drop the err).
+        /// </summary>
+        private static void SendQueueError(ulong clientId, string msg)
+        {
+            Log("Queue error (client " + clientId + "): " + msg);
+            var nm = NetworkManager.Singleton;
+            if (nm != null && clientId == nm.LocalClientId)
+            {
+                LocalChat(msg);
+                if (!IsDedicatedServer()) MOTDUI.ShowQueueError(msg);
+            }
+            else
+            {
+                SendScreenMsgTo(clientId, "err:" + msg);
+            }
+        }
+
+        private static int CountItemsByClient(ulong clientId)
+        {
+            int n = 0;
+            if (_current != null && _current.ClientId == clientId) n++;
+            foreach (var q in _queue) if (q.ClientId == clientId) n++;
+            return n;
+        }
+
         private static void ServerAddItem(ulong clientId, string username, string url)
         {
             // Source-of-truth for whether the queue is enabled is _serverQueueEnabled;
             // see SendMOTDToClient for why we don't read ServerConfig directly here.
-            if (!_serverQueueEnabled) return;
+            if (!_serverQueueEnabled)
+            {
+                SendQueueError(clientId, "The server has the queue disabled.");
+                return;
+            }
             if (string.IsNullOrWhiteSpace(url)) return;
             url = url.Trim();
+
+            // URL length cap — defends against accidental paste of giant blobs and
+            // intentional bloat that would balloon the state broadcast.
+            if (url.Length > MaxUrlLength)
+            {
+                SendQueueError(clientId, "URL is too long (max " + MaxUrlLength + " characters).");
+                return;
+            }
+
+            // Per-client add cooldown — light spam protection. Applied before the
+            // (slightly more expensive) allowlist check so spammers get throttled
+            // even when they're hammering with rejected URLs.
+            float nowUT = Time.unscaledTime;
+            if (_lastAddTimeUT.TryGetValue(clientId, out float lastUT)
+                && nowUT - lastUT < AddCooldownSeconds)
+            {
+                SendQueueError(clientId, "You're adding too fast — wait a moment.");
+                return;
+            }
+
             if (!url.StartsWith("http://") && !url.StartsWith("https://"))
                 url = "https://" + url;
 
@@ -603,51 +733,59 @@ namespace WebsiteMOTD
             if (!ServerConfig.IsQueueUrlAllowed(url))
             {
                 string allowed = string.Join(", ", ServerConfig.QueueAllowedSites);
-                string msg = "Queue only accepts URLs from: " + allowed;
-                Log("Rejected queue URL from client " + clientId + " (" + url + ") — not in allowlist.");
-
-                // On a listen server the rejected client IS the host, so
-                // routing through the network layer would bounce to the
-                // server-side message branch and drop the err. Short-circuit.
-                var nm = NetworkManager.Singleton;
-                if (nm != null && clientId == nm.LocalClientId)
-                {
-                    LocalChat(msg);
-                    if (!IsDedicatedServer()) MOTDUI.ShowQueueError(msg);
-                }
-                else
-                {
-                    SendScreenMsgTo(clientId, "err:" + msg);
-                }
+                SendQueueError(clientId, "Queue only accepts URLs from: " + allowed);
                 return;
             }
+
+            // Global queue cap.
+            if (_queue.Count >= MaxQueueLength)
+            {
+                SendQueueError(clientId, "Queue is full (" + MaxQueueLength + " items max).");
+                return;
+            }
+
+            // Per-player cap (counts the currently-playing item too — otherwise a
+            // player could permanently park one of their videos as _current and still
+            // queue MaxPerPlayer more).
+            if (CountItemsByClient(clientId) >= MaxPerPlayer)
+            {
+                SendQueueError(clientId, "You already have " + MaxPerPlayer + " items in the queue.");
+                return;
+            }
+
+            // All validation passed — commit the add and record the cooldown timestamp.
+            _lastAddTimeUT[clientId] = nowUT;
 
             var item = new QueueItem
             {
                 ClientId = clientId,
                 Username = username ?? ("Player " + clientId),
-                Url = url
+                Url = url,
+                Id = ++_nextItemId,
             };
 
             if (_current == null)
             {
-                item.Seq = ++_itemSeqCounter;
                 _current = item;
-                Log("Now playing (seq=" + item.Seq + "): " + username + " → " + url);
+                Log("Now playing (id=" + item.Id + "): " + username + " → " + url);
                 LoadCurrentOnWorldScreens();
             }
             else
             {
                 _queue.Add(item);
-                Log("Queued: " + username + " → " + url + " (pos " + _queue.Count + ")");
+                Log("Queued (id=" + item.Id + "): " + username + " → " + url + " (pos " + _queue.Count + ")");
             }
 
             ServerBroadcastQueueState();
         }
 
-        private static void ServerHandleVote(ulong clientId)
+        private static void ServerHandleVote(ulong clientId, long targetItemId)
         {
             if (_current == null) return;
+            // Stale: client clicked vote when item A was current, but item B is
+            // now current. The user voted on what they saw, not what's playing now —
+            // drop the vote rather than misapply it to a different item.
+            if (_current.Id != targetItemId) return;
 
             if (_current.VoteSkippers.Contains(clientId))
                 _current.VoteSkippers.Remove(clientId);
@@ -659,13 +797,15 @@ namespace WebsiteMOTD
         }
 
         /// <summary>
-        /// Owner-only skip on the server side. The sender must be the player who
-        /// queued the current item — otherwise the request is ignored.
+        /// Owner-only skip on the server side. Validates both that the sender is the
+        /// owner of the current item AND that the item id matches what the client
+        /// clicked on — guards against a stale veto skipping the wrong item.
         /// </summary>
-        private static void ServerOwnerVeto(ulong clientId)
+        private static void ServerOwnerVeto(ulong clientId, long targetItemId)
         {
             if (_current == null) return;
-            if (_current.ClientId != clientId) return;
+            if (_current.Id != targetItemId) return;     // stale — drop
+            if (_current.ClientId != clientId) return;   // not the owner — drop
             Log("Owner " + clientId + " vetoed their own queued item — advancing.");
             ServerPlayNext();
         }
@@ -682,18 +822,33 @@ namespace WebsiteMOTD
             }
         }
 
-        private static void ServerRemoveItem(ulong clientId, int index)
+        /// <summary>
+        /// Remove a queued item by its server-assigned <see cref="QueueItem.Id"/>.
+        /// Indexes can shift between client→server roundtrips (e.g. when another
+        /// player's item plays out), so removing by index would race; the id-based
+        /// lookup always targets the intended item.
+        /// </summary>
+        private static void ServerRemoveItem(ulong clientId, long itemId)
         {
-            if (index < 0 || index >= _queue.Count) return;
-            // Only the owner can remove their own items
-            if (_queue[index].ClientId != clientId) return;
-
-            _queue.RemoveAt(index);
-            ServerBroadcastQueueState();
+            for (int i = 0; i < _queue.Count; i++)
+            {
+                var item = _queue[i];
+                if (item.Id != itemId) continue;
+                if (item.ClientId != clientId) return; // not the owner — silently ignore
+                _queue.RemoveAt(i);
+                ServerBroadcastQueueState();
+                return;
+            }
+            // Item not found — already played out or removed; no-op.
         }
 
         private static void ServerPlayNext()
         {
+            // Every advance bumps the debounce timer so late "ended" signals for the
+            // outgoing video can't accidentally skip the new one too. See
+            // ServerTryAdvanceForEnded for the dedupe gate.
+            _lastAdvanceTimeUT = Time.unscaledTime;
+
             if (_queue.Count == 0)
             {
                 _current = null;
@@ -703,12 +858,8 @@ namespace WebsiteMOTD
             {
                 _current = _queue[0];
                 _queue.RemoveAt(0);
-                _current.Seq = ++_itemSeqCounter;
-                Log("Now playing (seq=" + _current.Seq + "): " + _current.Username + " → " + _current.Url);
+                Log("Now playing (id=" + _current.Id + "): " + _current.Username + " → " + _current.Url);
             }
-            // NOTE: _endedForSeq is intentionally NOT cleared here. It tracks the last
-            // item we advanced past, so late "ended" signals for the previous item are
-            // ignored and don't double-advance through the new _current.
             LoadCurrentOnWorldScreens();
             ServerBroadcastQueueState();
         }
@@ -718,10 +869,29 @@ namespace WebsiteMOTD
             // Dedicated servers have no renderer — skip entirely
             if (IsDedicatedServer()) return;
 
-            // Server disabled level screens for this lobby
-            if (!_serverScreensEnabled) return;
+            // Always try to claim the OpenWorld TheatreVideoScreen — when present,
+            // it should receive the WebView texture regardless of server/client
+            // screens settings (cooperative API; see TheatreVideoScreenBridge).
+            MOTDWorldScreen.EnsureTheatreClaim();
+            bool hasTheatre = MOTDWorldScreen.HasTheatreScreen;
 
-            MOTDWorldScreen.SpawnScreens();
+            if (_serverScreensEnabled)
+            {
+                // Normal path: spawn our own A/B screens.
+                MOTDWorldScreen.SpawnScreens();
+            }
+            else if (hasTheatre)
+            {
+                // Server disabled level screens, but the theatre screen is claimed —
+                // run a headless driver so the WebView still pumps content to it.
+                MOTDWorldScreen.EnsureDriver();
+            }
+            else
+            {
+                // No regular screens, no theatre claim — nothing to do.
+                return;
+            }
+
             string url = _current != null ? _current.Url : MOTD_URL;
 
             // Only reload if the URL actually changed — otherwise every queue
@@ -729,14 +899,23 @@ namespace WebsiteMOTD
             if (url == _lastLoadedWorldUrl) return;
             string prevWorldUrl = _lastLoadedWorldUrl;
             _lastLoadedWorldUrl = url;
-            MOTDWorldScreen.LoadOnAllScreens(url);
+            long worldItemId = _current != null ? _current.Id : 0;
+            MOTDWorldScreen.LoadOnAllScreens(url, worldItemId);
 
             // Also navigate the overlay WebView, but ONLY if the user is currently
             // viewing the page that the world screens were just showing (or has
             // nothing loaded yet). Otherwise an active browse gets yanked back to
             // the queue URL every time someone votes or a video advances.
+            //
+            // Pass the queue item id so the overlay binds videoEnded events to this
+            // specific item. Without that, any random video the player browses
+            // ending could advance the queue, and stale "ended" messages from past
+            // items could double-skip.
             if (MOTDUI.IsVisible && MOTDUI.ShouldFollowWorldScreen(prevWorldUrl))
-                MOTDUI.NavigateTo(url, addToHistory: false);
+            {
+                long itemId = _current != null ? _current.Id : 0;
+                MOTDUI.NavigateTo(url, addToHistory: false, queueItemId: itemId);
+            }
         }
 
         private static void ServerBroadcastQueueState()
@@ -744,8 +923,10 @@ namespace WebsiteMOTD
             string serialized = SerializeQueueState();
             BroadcastScreenMsg("state:" + serialized);
 
-            // Also update our own cached state (server needs it for UI + world screen loading)
-            ParseQueueState(serialized);
+            // The server is the source of truth — _queue/_current already reflect
+            // what we just serialized. The old code re-parsed our own broadcast,
+            // tearing down and rebuilding the same QueueItem objects with the same
+            // data; pure waste. Just notify subscribers.
             OnQueueChanged?.Invoke();
         }
 
@@ -758,14 +939,14 @@ namespace WebsiteMOTD
         // ─── Queue state serialization ──────────────────────────────
         //
         // Format (line-delimited):
-        //   cur|clientId|username|url|voter1,voter2,...|seq
-        //   qu|clientId|username|url
-        //   qu|clientId|username|url
+        //   cur|clientId|username|url|voter1,voter2,...|id
+        //   qu|clientId|username|url|id
+        //   qu|clientId|username|url|id
         //
         // "cur" line omitted when nothing is playing.
         // URLs and usernames are base64-encoded to avoid delimiter collisions.
-        // The trailing seq field is server-internal but ships in the broadcast so
-        // the server can re-parse its own state without losing the dedupe key.
+        // The id field ships in the broadcast so clients can send remove-by-id
+        // requests that target a specific item even after the queue shifts.
 
         private static string SerializeQueueState()
         {
@@ -780,13 +961,14 @@ namespace WebsiteMOTD
                     if (i > 0) sb.Append(',');
                     sb.Append(_current.VoteSkippers[i]);
                 }
-                sb.Append('|').Append(_current.Seq).Append('\n');
+                sb.Append('|').Append(_current.Id).Append('\n');
             }
             foreach (var item in _queue)
             {
                 sb.Append("qu|").Append(item.ClientId).Append('|')
                   .Append(B64(item.Username)).Append('|')
-                  .Append(B64(item.Url)).Append('\n');
+                  .Append(B64(item.Url)).Append('|')
+                  .Append(item.Id).Append('\n');
             }
             return sb.ToString();
         }
@@ -822,18 +1004,21 @@ namespace WebsiteMOTD
                             if (ulong.TryParse(v, out ulong voter))
                                 item.VoteSkippers.Add(voter);
                     }
-                    if (parts.Length >= 6 && long.TryParse(parts[5], out long seq))
-                        item.Seq = seq;
+                    if (parts.Length >= 6 && long.TryParse(parts[5], out long id))
+                        item.Id = id;
                     _current = item;
                 }
                 else if (kind == "qu")
                 {
-                    _queue.Add(new QueueItem
+                    var item = new QueueItem
                     {
                         ClientId = cid,
                         Username = username,
                         Url = url
-                    });
+                    };
+                    if (parts.Length >= 5 && long.TryParse(parts[4], out long id))
+                        item.Id = id;
+                    _queue.Add(item);
                 }
             }
         }

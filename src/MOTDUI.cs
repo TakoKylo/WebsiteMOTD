@@ -5,7 +5,9 @@ using System.IO;
 using System.Reflection;
 using Steamworks;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.UI;
 using UnityEngine.UIElements;
 
 namespace WebsiteMOTD
@@ -105,6 +107,20 @@ namespace WebsiteMOTD
         // the WebView, which caused legitimate onLoaded/onStarted updates to be
         // silently swallowed.)
         private static string _lastUrlFieldValue;
+
+        // Action maps disabled by BlockGameplayInput. Restored by UnblockGameplayInput
+        // so the game's input setup goes back to whatever it was before we touched it.
+        // null when we're not currently blocking (overlay closed).
+        private static List<InputActionMap> _disabledActionMaps;
+
+        // Non-zero when the overlay is currently displaying a specific queue item
+        // (the URL was loaded via the queue path, not a user navigation). Injected
+        // into the page as window.__motdItemId so the videoEnded JS hook can include
+        // it in the message — the server then validates _current.Id == reportedId
+        // and drops stale events. Cleared on any user-initiated navigation so a
+        // random video the player happens to be browsing can't accidentally advance
+        // the queue when it ends.
+        private static long _overlayQueueItemId;
 
         // ── ESC-to-close poller ──
         // UI Toolkit KeyDownEvents only fire when an inner element has focus, and the
@@ -303,10 +319,19 @@ namespace WebsiteMOTD
         }
 
         /// <summary>
-        /// Sets the game's <c>IsMouseRequired</c> flag so PlayerInput.UpdateInputs
-        /// (and the per-action handlers like Jump/Dash/BladeAngle) all short-circuit.
-        /// The Harmony patch on <c>UIManager.CheckMouseRequirement</c> keeps the flag
-        /// true even if a stock UIView toggles in/out while MOTD is open.
+        /// Block all gameplay/mod input while the overlay is open. Does three things:
+        ///   1. Sets <c>IsMouseRequired=true</c> so PlayerInput.UpdateInputs and the
+        ///      per-action handlers (Jump/Dash/BladeAngle) short-circuit. A Harmony
+        ///      patch on <c>UIManager.CheckMouseRequirement</c> keeps the flag sticky
+        ///      while stock UIViews toggle around us.
+        ///   2. Disables every <see cref="InputActionMap"/> on every loaded
+        ///      <see cref="InputActionAsset"/> — except the one feeding the UI
+        ///      Toolkit input module. This is the only way to reliably block keys
+        ///      bound by other mods (custom UIs, debug commands, hotkey toggles)
+        ///      that don't go through stock <c>UIManager</c> handlers we've patched.
+        ///   3. The WebView itself reads input through <c>Keyboard.current</c>
+        ///      (device-level), not through actions, so its own typing/keystroke
+        ///      forwarding keeps working with all maps disabled.
         /// </summary>
         private static void BlockGameplayInput()
         {
@@ -324,6 +349,129 @@ namespace WebsiteMOTD
             {
                 Plugin.LogError("BlockGameplayInput failed: " + ex.Message);
             }
+
+            DisableForeignActionMaps();
+        }
+
+        /// <summary>
+        /// Disable every currently-enabled InputActionMap so game and mod actions
+        /// stop firing. The map(s) backing the UI Toolkit input module are kept
+        /// alive so the overlay's own clicks/keys still work. Idempotent — calling
+        /// while already blocking is a no-op.
+        /// </summary>
+        private static void DisableForeignActionMaps()
+        {
+            if (_disabledActionMaps != null) return; // already blocking
+
+            try
+            {
+                InputActionAsset uiAsset = GetUIInputAsset();
+                var disabled = new List<InputActionMap>();
+
+                // FindObjectsOfTypeAll catches assets that aren't in the active scene
+                // (e.g. the global InputSystem.actions asset) which FindObjectsByType
+                // misses.
+                foreach (var asset in Resources.FindObjectsOfTypeAll<InputActionAsset>())
+                {
+                    if (asset == null) continue;
+                    foreach (var map in asset.actionMaps)
+                    {
+                        if (map == null || !map.enabled) continue;
+                        // Keep UI maps alive — that's what feeds the overlay's mouse
+                        // clicks and keyboard navigation. Detection by either (a) being
+                        // the asset the UI input module references, or (b) containing
+                        // canonical UI actions in case some game consolidated them
+                        // into a non-default asset.
+                        if (asset == uiAsset || IsUIActionMap(map)) continue;
+
+                        try
+                        {
+                            map.Disable();
+                            disabled.Add(map);
+                        }
+                        catch (Exception ex)
+                        {
+                            Plugin.LogError("Disable map '" + map.name + "' failed: " + ex.Message);
+                        }
+                    }
+                }
+                _disabledActionMaps = disabled;
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("DisableForeignActionMaps failed: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Re-enable any maps we disabled in <see cref="DisableForeignActionMaps"/>.
+        /// Skips maps that the game/mods have already re-enabled themselves and ones
+        /// that have been destroyed since (scene change, mod reload).
+        /// </summary>
+        private static void RestoreForeignActionMaps()
+        {
+            if (_disabledActionMaps == null) return;
+            foreach (var map in _disabledActionMaps)
+            {
+                if (map == null) continue;
+                try
+                {
+                    if (!map.enabled) map.Enable();
+                }
+                catch (Exception ex)
+                {
+                    Plugin.LogError("Re-enable map '" + map.name + "' failed: " + ex.Message);
+                }
+            }
+            _disabledActionMaps = null;
+        }
+
+        /// <summary>
+        /// Resolve the InputActionAsset feeding UI Toolkit's input module so we don't
+        /// kill the overlay's own input when blocking. Returns null if the asset
+        /// can't be found — we fall back to <see cref="IsUIActionMap"/> heuristics.
+        /// </summary>
+        private static InputActionAsset GetUIInputAsset()
+        {
+            try
+            {
+                var es = EventSystem.current;
+                if (es != null)
+                {
+                    var module = es.GetComponent<InputSystemUIInputModule>();
+                    if (module != null) return module.actionsAsset;
+                }
+                // Fallback: scan loaded modules in case EventSystem.current isn't set.
+                foreach (var m in Resources.FindObjectsOfTypeAll<InputSystemUIInputModule>())
+                {
+                    if (m != null && m.actionsAsset != null) return m.actionsAsset;
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("GetUIInputAsset failed: " + ex.Message);
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Heuristic: a map containing canonical UI actions (Point/Click/Navigate/etc.)
+        /// is treated as a UI map and kept enabled. Catches cases where a game/mod
+        /// puts UI actions in a non-default asset that GetUIInputAsset doesn't find.
+        /// </summary>
+        private static bool IsUIActionMap(InputActionMap map)
+        {
+            foreach (var a in map.actions)
+            {
+                if (a == null || string.IsNullOrEmpty(a.name)) continue;
+                string n = a.name;
+                if (n == "Point" || n == "Click" || n == "Navigate"
+                    || n == "Submit" || n == "Cancel" || n == "ScrollWheel"
+                    || n == "MiddleClick" || n == "RightClick" || n == "TrackedDevicePosition"
+                    || n == "TrackedDeviceOrientation")
+                    return true;
+            }
+            return false;
         }
 
         /// <summary>
@@ -335,6 +483,11 @@ namespace WebsiteMOTD
         /// </summary>
         private static void UnblockGameplayInput()
         {
+            // Re-enable action maps first so input is ready by the time the mouse-
+            // required flag clears. Order matters: if a game system re-evaluates
+            // input state on flag-change, it should see the maps already alive.
+            RestoreForeignActionMaps();
+
             try
             {
                 var uiManager = MonoBehaviourSingleton<UIManager>.Instance;
@@ -424,10 +577,21 @@ namespace WebsiteMOTD
         /// <summary>
         /// Navigate the in-overlay browser to a new URL.
         /// Called by links, the Go button, and the Back button.
+        ///
+        /// <paramref name="queueItemId"/> is non-zero ONLY when the caller is the
+        /// queue-load path (see <see cref="Plugin.LoadCurrentOnWorldScreens"/>) —
+        /// it gets injected into the page so videoEnded events can be bound to a
+        /// specific item id, preventing stale "ended" messages from advancing the
+        /// queue and stopping random browsing from triggering an advance.
         /// </summary>
-        public static void NavigateTo(string url, bool addToHistory = true)
+        public static void NavigateTo(string url, bool addToHistory = true, long queueItemId = 0)
         {
             if (string.IsNullOrWhiteSpace(url)) return;
+
+            // Any user-driven navigation breaks the queue-item binding: the page
+            // they're going to is NOT the queue's current item (or if it happens
+            // to be, the queue-load path will set this again on its own).
+            _overlayQueueItemId = queueItemId;
 
             // Auto-restore if the player navigates while the browser is minimized
             if (_isMinimized) ToggleMinimize();
@@ -890,19 +1054,30 @@ namespace WebsiteMOTD
             Plugin.Log("WebView initial viewport: " + wvWidth + "x" + wvHeight);
 
             // Resize the WebView texture whenever the display element's layout changes,
-            // so the browser viewport always matches the card aspect ratio. Reference
-            // height is fixed at 1080 so pages always see a standard 1080p-tall browser
-            // viewport regardless of the player's physical resolution — content stays
-            // the same physical size, and the zoom slider lets users adjust from there.
+            // so the browser viewport always matches the card aspect ratio AND the
+            // texture matches the element's actual on-screen pixel size. The old code
+            // pinned the texture to 1080p reference and let UI Toolkit upscale it,
+            // which looked fuzzy on 1440p / 4K displays and downscale-fuzzy on small
+            // windowed panels. Reading the panel's scaledPixelsPerPoint converts the
+            // panel-space rect into real screen pixels, giving (close to) 1:1 sampling.
+            // Clamped to [720p, 2160p] so we don't waste GPU on extreme outliers.
             _webViewElement.RegisterCallback<GeometryChangedEvent>(evt =>
             {
                 if (_webView == null) return;
                 float w = evt.newRect.width;
                 float h = evt.newRect.height;
                 if (w <= 1f || h <= 1f) return;
-                const int refHeight = 1080;
-                int targetH = refHeight;
-                int targetW = Mathf.Clamp(Mathf.RoundToInt(refHeight * (w / h)), 640, 3840);
+
+                float ppp = 1f;
+                if (_webViewElement.panel != null)
+                {
+                    float p = _webViewElement.panel.scaledPixelsPerPoint;
+                    if (p > 0.01f) ppp = p;
+                }
+
+                int targetH = Mathf.Clamp(Mathf.RoundToInt(h * ppp), 720, 2160);
+                int targetW = Mathf.Clamp(Mathf.RoundToInt(w * ppp), 1280, 3840);
+
                 if (Mathf.Abs(targetW - _lastWebViewWidth) < 16 && Mathf.Abs(targetH - _lastWebViewHeight) < 16)
                     return;
                 _lastWebViewWidth = targetW;
@@ -924,6 +1099,10 @@ namespace WebsiteMOTD
                     SetUrlFieldIfNotEditing(url);
                     InjectAdBlockJS();
                     ApplyWebViewVolume();
+                    // Bind the page to its queue item id (if any) BEFORE the media
+                    // hook installs — the hook reads window.__motdItemId when it
+                    // fires "ended". 0 means "not a queue item, ignore endings."
+                    _webView?.EvaluateJS("window.__motdItemId=" + _overlayQueueItemId + ";");
                     InjectMediaHelperJS();
                     ApplyWebViewZoom();
                     UpdateBackForwardButtons();
@@ -941,8 +1120,32 @@ namespace WebsiteMOTD
                 },
                 onJS: msg =>
                 {
-                    if (msg == "videoEnded")
-                        Plugin.VideoEnded();
+                    if (msg.StartsWith("videoEnded:"))
+                    {
+                        if (long.TryParse(msg.Substring(11), out long endedId))
+                            Plugin.VideoEnded(endedId);
+                    }
+                    else if (msg.StartsWith("navTo:"))
+                    {
+                        // SPA navigation reported from the in-page nav-tracker hook —
+                        // see NavTrackerJS. The native plugin only fires onLoaded for
+                        // full document loads, so without this the URL bar stayed
+                        // stale while clicking around YouTube etc.
+                        string newUrl = msg.Substring(6);
+                        if (!string.IsNullOrEmpty(newUrl))
+                        {
+                            _url = newUrl;
+                            // SPA navigation breaks the queue-item binding — the
+                            // player just clicked away from whatever queue item
+                            // they were on. Re-bind window.__motdItemId to 0 so
+                            // an "ended" event on this new page can't be mistaken
+                            // for the queue item ending.
+                            _overlayQueueItemId = 0;
+                            _webView?.EvaluateJS("window.__motdItemId=0;");
+                            SetUrlFieldIfNotEditing(newUrl);
+                            UpdateBackForwardButtons();
+                        }
+                    }
                 }
             );
 
@@ -950,6 +1153,9 @@ namespace WebsiteMOTD
             // this for every future navigation, so we no longer race against the page's
             // own player setup — the engine default 1.0 never reaches the speakers.
             _webView?.AddScriptOnLoad(PersistentVolumeHookJS);
+            // SPA URL tracker — see NavTrackerJS. Catches history.pushState etc. that
+            // the native NavigationStarting/Completed events miss.
+            _webView?.AddScriptOnLoad(NavTrackerJS);
 
             return _webView != null;
         }
@@ -1143,6 +1349,43 @@ namespace WebsiteMOTD
         ///   • A capture-phase loadstart listener for lazy-loaded players.
         ///   • A MutationObserver as a final safety net.
         /// </summary>
+        /// <summary>
+        /// SPA navigation tracker. The native WebView2 plugin only fires
+        /// CallOnStarted/CallOnLoaded for full-document navigations, so URL changes
+        /// driven by history.pushState/replaceState (YouTube video-to-video clicks,
+        /// any modern SPA) never reach C# — the URL bar stays stale.
+        ///
+        /// This hook monkey-patches history.pushState/replaceState and listens for
+        /// popstate + hashchange, posting "navTo:&lt;url&gt;" back to C# whenever the
+        /// address actually changes. Installed via AddScriptOnLoad so it runs at
+        /// document-start, before any page script can shim history itself.
+        ///
+        /// Guarded by window.__motdNavHook to stay idempotent across persistent
+        /// documents (SPA pushState doesn't reload, so the same script wouldn't run
+        /// twice — but full navigations get a fresh window and re-install cleanly).
+        /// </summary>
+        internal const string NavTrackerJS =
+            "(function(){" +
+            "if(window.__motdNavHook)return;" +
+            "window.__motdNavHook=true;" +
+            "var last=location.href;" +
+            "function send(){" +
+            "try{var h=location.href;if(h===last)return;last=h;" +
+            "if(window.Unity&&typeof window.Unity.call==='function')" +
+            "window.Unity.call('navTo:'+h);}catch(_e){}" +
+            "}" +
+            "try{var p=history.pushState;history.pushState=function(){" +
+            "var r=p.apply(this,arguments);send();return r;};}catch(_e){}" +
+            "try{var rp=history.replaceState;history.replaceState=function(){" +
+            "var r=rp.apply(this,arguments);send();return r;};}catch(_e){}" +
+            "window.addEventListener('popstate',send);" +
+            "window.addEventListener('hashchange',send);" +
+            // Light safety net for SPAs that route via a custom mechanism — 1Hz poll
+            // is imperceptible cost. Real SPAs (YouTube, Twitch) use the history API
+            // so this rarely fires, but cheap insurance.
+            "setInterval(send,1000);" +
+            "})();";
+
         internal const string PersistentVolumeHookJS =
             "(function(){" +
             "if(window.__motdVolHook)return;" +
@@ -1209,6 +1452,11 @@ namespace WebsiteMOTD
         /// can change src or navigate away) and notifies C# to advance the queue.
         /// A MutationObserver attaches the listener to video elements added after inject.
         /// (YouTube chrome is NOT hidden here — the user is browsing interactively.)
+        ///
+        /// The "ended" message includes window.__motdItemId so the server can validate
+        /// it's still the active queue item before advancing. If __motdItemId is 0
+        /// (random page the player navigated to), the hook silently drops the event
+        /// — random browsing must not advance the shared queue.
         /// </summary>
         private static void InjectMediaHelperJS()
         {
@@ -1219,8 +1467,10 @@ namespace WebsiteMOTD
                 "window.__motdMedia=true;" +
                 "var _sent=false;" +
                 "function notifyEnded(){" +
+                "var id=window.__motdItemId||0;" +
+                "if(id===0)return;" + // not a queue item — drop
                 "if(window.Unity&&typeof window.Unity.call==='function')" +
-                "window.Unity.call('videoEnded');" +
+                "window.Unity.call('videoEnded:'+id);" +
                 "}" +
                 // onEnded: guard against ads and duplicate signals
                 "function onEnded(e){" +
@@ -2517,6 +2767,12 @@ namespace WebsiteMOTD
 
         private static void BuildQueuePanel(VisualElement parent)
         {
+            // Skip the entire panel when the server has the queue disabled — there's
+            // nothing actionable in it, and showing a dead tab is worse than a clean
+            // overlay. RefreshQueuePanel / ShowQueueError already null-guard so the
+            // queue-disabled feedback for AddToQueue still surfaces via LocalChat.
+            if (!Plugin.IsQueueEnabled) return;
+
             // Outer wrapper: horizontal row containing a thin tab + (optional) expanded content.
             _queuePanel = new VisualElement();
             _queuePanel.style.flexDirection = FlexDirection.Row;
@@ -2789,7 +3045,7 @@ namespace WebsiteMOTD
                 for (int i = 0; i < queue.Count; i++)
                 {
                     var item = queue[i];
-                    int idx = i; // capture for lambda
+                    long itemId = item.Id; // capture for lambda — id is stable across shifts
 
                     var row = new VisualElement();
                     row.style.flexDirection = FlexDirection.Row;
@@ -2827,7 +3083,7 @@ namespace WebsiteMOTD
                     {
                         var rmBtn = CreateStyledButton("✕", new Color(0.55f, 0.2f, 0.2f), () =>
                         {
-                            Plugin.RemoveFromQueue(idx);
+                            Plugin.RemoveFromQueue(itemId);
                         });
                         rmBtn.style.width = 24f;
                         rmBtn.style.height = 24f;

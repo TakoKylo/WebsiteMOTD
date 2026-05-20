@@ -50,12 +50,20 @@ namespace WebsiteMOTD
         private static bool _bitmapGenSupported = true;
         private static float _lastLoadTime;  // Unity time of last page load (for adaptive refresh)
 
-        private const int TEX_WIDTH = 1280;
-        private const int TEX_HEIGHT = 720;
+        // 1080p texture for the in-world screens. 720p was visibly soft up close
+        // (the quads are 10×5.625 world units — players can stand 2-3m away).
+        private const int TEX_WIDTH = 1920;
+        private const int TEX_HEIGHT = 1080;
 
-        // Adaptive refresh tiers (seconds since last page load)
-        private const float LoadActiveSec = 3.0f;   // full-speed capture after page load
-        private const float LoadWindDownSec = 8.0f;  // half-speed for a few more seconds
+        // Refresh strategy: stay at full speed whenever the bitmap is actually
+        // changing (video playback, scrolling, animations) OR a page just loaded.
+        // Only throttle when content has been static for a while. This keeps video
+        // playback smooth indefinitely instead of dropping to 7.5fps after 8s.
+        private const float LoadActiveSec = 3.0f;        // grace window after load
+        private const int   StaticChecksForIdle = 30;    // ~0.5s @ 60fps of no change → throttle
+        private const int   IdleFrameInterval = 8;       // ~7.5fps when truly idle
+        private const int   NoBitmapGenFrameInterval = 4; // fallback when DLL lacks BitmapGeneration
+        private static int  _consecutiveStaticChecks;
 
         // ─── Proximity audio ────────────────────────────────────────
         // WebView2 plays audio directly to the Windows mixer — we can't route it
@@ -65,7 +73,7 @@ namespace WebsiteMOTD
         // attenuation curve. Two-screen contributions are summed (clamped to 1)
         // so the player hears both when standing between them.
         private const float ProxMinDistance = 5f;
-        private const float ProxMaxDistance = 40f;
+        private const float ProxMaxDistance = 60f;
         private const int   ProxUpdateFrameInterval = 4;     // re-evaluate every N frames
         private const float ProxVolumeEpsilon = 0.02f;       // skip JS update for tiny deltas
         private static float _globalAudioMultiplier = 0.5f;  // from MOTDUI volume slider / mute
@@ -79,7 +87,131 @@ namespace WebsiteMOTD
         private static MOTDWorldScreen _screenA;
         private static MOTDWorldScreen _screenB;
 
+        // ─── OpenWorld "TheatreVideoScreen" claim ───────────────────
+        // OpenWorldPracticeMod ships a screen prefab and exposes a TryClaim/Release
+        // API for cooperative ownership — see TheatreVideoScreenBridge. While we
+        // hold the claim, the OpenWorld mod stops its showcase video and lets us
+        // drive the screen's material. We bind our shared WebView texture to the
+        // standard texture slots (_MainTex / _BaseMap / _EmissionMap) so it lights
+        // up regardless of shader (URP-Lit, Unlit, Standard, etc).
+        private static GameObject _theatreScreen;
+        private static Renderer _theatreRenderer;
+        private const int TheatreClaimRetryInterval = 60; // ~1s @ 60fps
+
+        // Driver-only screen: spawned when no A/B screens exist but the theatre
+        // screen is claimed, so the WebView still gets pumped. No MeshRenderer —
+        // it exists purely to drive Update() on the shared webview.
+        private static MOTDWorldScreen _driver;
+
+        /// <summary>True if we currently hold the OpenWorld theatre screen claim.</summary>
+        public static bool HasTheatreScreen => _theatreScreen != null && _theatreRenderer != null;
+
         // ─── Static API ─────────────────────────────────────────────
+
+        /// <summary>
+        /// Try to claim the OpenWorld theatre screen if it's available and we don't
+        /// already hold it. Returns the claimed screen GameObject or null. Safe and
+        /// cheap to call repeatedly — no-ops once we hold the claim, no-ops when the
+        /// OpenWorld mod isn't loaded.
+        /// </summary>
+        public static GameObject EnsureTheatreClaim()
+        {
+            if (!TheatreVideoScreenBridge.ApiPresent) return null;
+
+            // Drop stale cache if the screen prefab vanished (e.g. scene unloaded).
+            if (!TheatreVideoScreenBridge.IsAvailable)
+            {
+                if (_theatreScreen != null)
+                {
+                    _theatreScreen = null;
+                    _theatreRenderer = null;
+                }
+                return null;
+            }
+
+            // Already claimed by us — nothing to do.
+            if (_theatreScreen != null && TheatreVideoScreenBridge.IsClaimedByUs)
+                return _theatreScreen;
+
+            // Either we never claimed, or another mod displaced us — try (re)claim.
+            GameObject go = TheatreVideoScreenBridge.TryClaim();
+            if (go == null)
+            {
+                _theatreScreen = null;
+                _theatreRenderer = null;
+                return null;
+            }
+
+            // Prefer the OpenWorld mod's authoritative ScreenRenderer reference;
+            // fall back to a component lookup on the GameObject if the property
+            // resolved-but-returned-null (shouldn't happen, but be defensive).
+            _theatreScreen = go;
+            _theatreRenderer = TheatreVideoScreenBridge.GetScreenRenderer()
+                ?? go.GetComponent<Renderer>()
+                ?? go.GetComponentInChildren<Renderer>();
+
+            if (_theatreRenderer != null)
+                Plugin.Log("TheatreVideoScreen claimed — driving with WebView texture.");
+            else
+                Plugin.LogError("TheatreVideoScreen claimed but no Renderer found on the screen GameObject.");
+            return go;
+        }
+
+        /// <summary>Release the theatre claim so OpenWorld can resume its own video.</summary>
+        public static void ReleaseTheatreClaim()
+        {
+            if (_theatreScreen == null && !TheatreVideoScreenBridge.IsClaimedByUs) return;
+            _theatreScreen = null;
+            _theatreRenderer = null;
+            TheatreVideoScreenBridge.Release();
+        }
+
+        /// <summary>
+        /// Bind <paramref name="tex"/> to the standard texture slots on
+        /// <paramref name="mat"/>. Sets all of _MainTex/_BaseMap/_EmissionMap that
+        /// exist so the texture shows up regardless of shader pipeline (URP-Lit
+        /// uses _BaseMap, built-in uses _MainTex, emissive shaders use _EmissionMap).
+        /// </summary>
+        private static void BindTextureToScreenMaterial(Material mat, Texture tex)
+        {
+            if (mat == null || tex == null) return;
+            if (mat.HasProperty("_MainTex") && mat.GetTexture("_MainTex") != tex)
+                mat.SetTexture("_MainTex", tex);
+            if (mat.HasProperty("_BaseMap") && mat.GetTexture("_BaseMap") != tex)
+                mat.SetTexture("_BaseMap", tex);
+            if (mat.HasProperty("_EmissionMap") && mat.GetTexture("_EmissionMap") != tex)
+                mat.SetTexture("_EmissionMap", tex);
+        }
+
+        /// <summary>
+        /// Spawn an invisible "driver" GameObject that pumps the shared WebView when
+        /// the regular A/B screens are disabled by config but external mirrors exist.
+        /// No-op if the regular screens are already spawned or a driver already exists.
+        /// </summary>
+        public static void EnsureDriver()
+        {
+            if (_screenA != null || _driver != null) return;
+
+            if (!MOTDWebView.PreloadNativeDLL())
+            {
+                Plugin.LogError("WorldScreen: WebView.dll not loaded, cannot start driver.");
+                return;
+            }
+
+            _cachedListener = null;
+            _positionalMultiplier = 1f;
+
+            var go = new GameObject("MOTD_WorldScreen_Driver");
+            go.hideFlags = HideFlags.DontSave;
+            UnityEngine.Object.DontDestroyOnLoad(go);
+
+            _driver = go.AddComponent<MOTDWorldScreen>();
+            _driver._renderer = null;
+            _driver._isPrimary = true;
+
+            InitSharedWebView(go.name);
+            Plugin.Log("WorldScreen driver started (regular screens off, theater mirrors active).");
+        }
 
         public static void SpawnScreens()
         {
@@ -89,6 +221,18 @@ namespace WebsiteMOTD
             {
                 Plugin.LogError("WorldScreen: WebView.dll not loaded, cannot spawn.");
                 return;
+            }
+
+            // If a driver was already running (theater-only mode), hand off cleanly:
+            // the new screenA takes over the primary role and the existing shared
+            // WebView is reused. We null out _driver before Destroy so its OnDestroy
+            // doesn't tear down the WebView we're about to keep using.
+            if (_driver != null)
+            {
+                var oldDriver = _driver;
+                _driver = null;
+                oldDriver._isPrimary = false;
+                Destroy(oldDriver.gameObject);
             }
 
             // Force a fresh listener lookup and a fresh positional sample so the first
@@ -110,20 +254,37 @@ namespace WebsiteMOTD
         /// <summary>
         /// Load a URL on the shared world screen webview. Uses a raw LoadURL call
         /// to match the behavior of the UI webview (which handles YouTube/Twitch fine).
+        ///
+        /// <paramref name="itemId"/> is the queue item id this load represents — it
+        /// gets injected into the page as window.__motdItemId so the videoEnded JS
+        /// hook can bind the event to a specific item, letting the server drop
+        /// stale messages from videos that have already been skipped past.
         /// </summary>
-        public static void LoadOnAllScreens(string url)
+        public static void LoadOnAllScreens(string url, long itemId = 0)
         {
             if (_sharedWebView == IntPtr.Zero) return;
             string embedUrl = MOTDUI.ConvertToEmbedUrl(url);
             _lastLoadTime = Time.unscaledTime;
-            Plugin.Log("WorldScreen loading: " + embedUrl);
+            _pendingItemId = itemId;
+            Plugin.Log("WorldScreen loading (id=" + itemId + "): " + embedUrl);
             _CWebViewPlugin_LoadURL(_sharedWebView, embedUrl);
         }
 
+        // Item id captured at LoadOnAllScreens time. Injected as __motdItemId at
+        // CallOnLoaded. Used by the videoEnded JS hook to tag its "ended" message
+        // so the server can validate it against _current.Id before advancing.
+        private static long _pendingItemId;
+
         public static void DestroyScreens()
         {
+            // Release the OpenWorld claim BEFORE destroying the webview/screens
+            // so the OpenWorld mod can swap back to its showcase video while its
+            // GameObject is still alive.
+            ReleaseTheatreClaim();
+
             if (_screenA != null) { _screenA.Cleanup(); _screenA = null; }
             if (_screenB != null) { _screenB.Cleanup(); _screenB = null; }
+            if (_driver != null) { _driver.Cleanup(); _driver = null; }
             DestroySharedWebView();
             // The AudioListener may belong to a player/camera that gets destroyed on
             // scene change. Drop the reference so the next SpawnScreens re-resolves.
@@ -310,6 +471,7 @@ namespace WebsiteMOTD
 
             _sharedTextureBuffer = null;
             _sharedLastGen = 0;
+            _consecutiveStaticChecks = 0;
         }
 
         // ─── Per-frame update ───────────────────────────────────────
@@ -333,28 +495,40 @@ namespace WebsiteMOTD
                     if (msg.StartsWith("CallOnLoaded:"))
                     {
                         _lastLoadTime = Time.unscaledTime;
+                        _consecutiveStaticChecks = 0;
+                        // Bind page to the queue item id BEFORE the media hook
+                        // installs — the hook reads __motdItemId when firing ended.
+                        _CWebViewPlugin_EvaluateJS(_sharedWebView,
+                            "window.__motdItemId=" + _pendingItemId + ";");
                         InjectWorldAdBlockJS();
                         InjectWorldVolumeJS();
                         InjectWorldVideoEndedJS();
                     }
                     else if (msg.StartsWith("CallFromJS:"))
                     {
-                        if (msg.Substring(11) == "videoEnded")
-                            Plugin.VideoEnded();
+                        string body = msg.Substring(11);
+                        if (body.StartsWith("videoEnded:"))
+                        {
+                            if (long.TryParse(body.Substring(11), out long reportedId))
+                                Plugin.VideoEnded(reportedId);
+                        }
                     }
                 }
 
-                // Adaptive refresh: fast after page load, then wind down to idle
+                // Adaptive refresh: full-speed during the post-load grace window OR
+                // whenever the page is actively producing new bitmaps (video, anim,
+                // scrolling). Only throttle once content has been static for a beat.
                 float idleSec = Time.unscaledTime - _lastLoadTime;
+                bool nearLoad = idleSec < LoadActiveSec;
+                bool pageActive = _consecutiveStaticChecks < StaticChecksForIdle;
+
                 bool shouldRefresh;
                 if (!_bitmapGenSupported)
-                    shouldRefresh = (Time.frameCount % 4 == 0);        // ~15fps without change-detection
-                else if (idleSec < LoadActiveSec)
-                    shouldRefresh = true;                               // full speed after load
-                else if (idleSec < LoadWindDownSec)
-                    shouldRefresh = (Time.frameCount % 2 == 0);        // ~30fps
+                    shouldRefresh = (Time.frameCount % NoBitmapGenFrameInterval == 0);
+                else if (nearLoad || pageActive)
+                    shouldRefresh = true;
                 else
-                    shouldRefresh = (Time.frameCount % 8 == 0);        // ~7.5fps idle
+                    shouldRefresh = (Time.frameCount % IdleFrameInterval == 0);
 
                 _CWebViewPlugin_Update(_sharedWebView, shouldRefresh, 1);
 
@@ -368,7 +542,15 @@ namespace WebsiteMOTD
                         {
                             ulong gen = _CWebViewPlugin_BitmapGeneration(_sharedWebView);
                             bitmapChanged = (gen != _sharedLastGen);
-                            if (bitmapChanged) _sharedLastGen = gen;
+                            if (bitmapChanged)
+                            {
+                                _sharedLastGen = gen;
+                                _consecutiveStaticChecks = 0; // page is moving — stay fast
+                            }
+                            else if (_consecutiveStaticChecks < int.MaxValue)
+                            {
+                                _consecutiveStaticChecks++;   // count toward idle decision
+                            }
                         }
                         catch (System.EntryPointNotFoundException)
                         {
@@ -411,6 +593,21 @@ namespace WebsiteMOTD
                 && _renderer.material.mainTexture != _sharedTexture)
             {
                 _renderer.material.mainTexture = _sharedTexture;
+            }
+
+            // Primary also drives the OpenWorld theatre screen: periodically (re)claim
+            // when available, then keep the shared texture bound to its material.
+            // Theatre screen runs regardless of server/client screens settings —
+            // that's the whole point of the cooperation with OpenWorldPracticeMod.
+            if (_isPrimary)
+            {
+                if (Time.frameCount % TheatreClaimRetryInterval == 0)
+                    EnsureTheatreClaim();
+
+                if (_sharedTexture != null && _theatreRenderer != null && _theatreRenderer.material != null)
+                {
+                    BindTextureToScreenMaterial(_theatreRenderer.material, _sharedTexture);
+                }
             }
         }
 
@@ -558,11 +755,15 @@ namespace WebsiteMOTD
                 "+'#ytd-player,#movie_player{position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;max-height:none!important;z-index:9999!important}';" +
                 "(document.head||document.documentElement).appendChild(s);" +
                 "}" +
-                // Event-listener based ended detection — fires before YouTube changes src
+                // Event-listener based ended detection — fires before YouTube changes src.
+                // Message includes window.__motdItemId so the server can validate it's
+                // still the active queue item before advancing.
                 "var _sent=false;" +
                 "function notifyEnded(){" +
+                "var id=window.__motdItemId||0;" +
+                "if(id===0)return;" +
                 "if(window.Unity&&typeof window.Unity.call==='function')" +
-                "window.Unity.call('videoEnded');" +
+                "window.Unity.call('videoEnded:'+id);" +
                 "}" +
                 "function onEnded(e){" +
                 "var v=e.target;" +

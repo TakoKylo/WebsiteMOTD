@@ -471,11 +471,21 @@ namespace WebsiteMOTD
         }
 
         // ─── Per-frame update ───────────────────────────────────────
+        //
+        // Refresh strategy: full-speed capture whenever the bitmap is actually
+        // changing (video playback, animation, scrolling) OR the user has
+        // recently interacted. Only throttle when the page is genuinely
+        // static — detected by counting consecutive refresh-checks that found
+        // no bitmap change. This avoids the old failure mode where a long
+        // video would drop to 7.5fps a few seconds after starting (no input →
+        // assumed idle, even though pixels were moving 30× per second).
 
-        // Refresh rate tiers based on how recently the user interacted
-        private const float ActiveWindowSec  = 2.0f;  // full-speed capture for 2s after input
-        private const float WindDownSec      = 5.0f;  // half-speed capture for next 3s
-        // After WindDownSec: moderate idle rate to catch CSS animations / async content
+        private const float ActiveWindowSec = 2.0f;       // input grace window
+        private const int   StaticChecksForIdle = 30;     // ~0.5s @ 60fps of no change → throttle
+        private const int   IdleFrameInterval = 8;        // ~7.5fps when truly idle
+        private const int   NoBitmapGenFrameInterval = 6; // ~10fps when DLL lacks BitmapGeneration export
+
+        private int _consecutiveStaticChecks;
 
         void Update()
         {
@@ -499,10 +509,12 @@ namespace WebsiteMOTD
                     case "CallOnError":   _onError?.Invoke(body); break;
                     case "CallOnLoaded":
                         _lastInteractTime = Time.unscaledTime; // page loaded — capture it
+                        _consecutiveStaticChecks = 0;          // and unblock fast refresh
                         _onLoaded?.Invoke(body);
                         break;
                     case "CallOnStarted":
                         _lastInteractTime = Time.unscaledTime;
+                        _consecutiveStaticChecks = 0;
                         _onStarted?.Invoke(body);
                         break;
                 }
@@ -511,21 +523,21 @@ namespace WebsiteMOTD
             if (!_visible) return;
 
             // Decide whether to request a new bitmap capture this frame.
-            // Active interaction → every frame.  Winding down → every 2nd frame.  Idle → every 8th frame (~7.5fps).
-            // When bitmapGen is unavailable we cap to every 6 frames (~10fps) to avoid
-            // uploading a full-resolution bitmap unconditionally at 60fps.
+            // - Without BitmapGeneration export: fixed time-based throttle.
+            // - Within input grace window OR page actively changing → every frame.
+            // - Otherwise (truly idle): throttle to ~7.5fps, but probe often enough
+            //   that we accelerate immediately when the page wakes up again.
             float idleSec = Time.unscaledTime - _lastInteractTime;
+            bool nearInteraction = idleSec < ActiveWindowSec;
+            bool pageActive = _consecutiveStaticChecks < StaticChecksForIdle;
+
             bool shouldRefresh;
             if (!_bitmapGenSupported)
-            {
-                shouldRefresh = (Time.frameCount % 6 == 0);        // ~10fps — safe without change-detection
-            }
-            else if (idleSec < ActiveWindowSec)
-                shouldRefresh = true;                              // full speed
-            else if (idleSec < WindDownSec)
-                shouldRefresh = (Time.frameCount % 2 == 0);       // ~30fps
+                shouldRefresh = (Time.frameCount % NoBitmapGenFrameInterval == 0);
+            else if (nearInteraction || pageActive)
+                shouldRefresh = true;
             else
-                shouldRefresh = (Time.frameCount % 8 == 0);       // ~7.5fps idle
+                shouldRefresh = (Time.frameCount % IdleFrameInterval == 0);
 
             _CWebViewPlugin_Update(_webView, shouldRefresh, 1);
 
@@ -538,7 +550,15 @@ namespace WebsiteMOTD
                 try
                 {
                     ulong gen = _CWebViewPlugin_BitmapGeneration(_webView);
-                    if (gen == _lastBitmapGen) return;
+                    if (gen == _lastBitmapGen)
+                    {
+                        // Same bitmap as last time — bump the static counter so we
+                        // eventually decide the page is idle and drop to throttle.
+                        if (_consecutiveStaticChecks < int.MaxValue)
+                            _consecutiveStaticChecks++;
+                        return;
+                    }
+                    _consecutiveStaticChecks = 0; // page is moving — stay fast
                     _lastBitmapGen = gen;
                 }
                 catch (System.EntryPointNotFoundException)

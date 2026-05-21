@@ -123,8 +123,22 @@ namespace WebsiteMOTD
 
         // ─── Setup / Teardown ────────────────────────────────────────
 
+        // Set once when the network half of Setup has wired callbacks. Used as a
+        // guard for the retry path so we don't double-register if Setup runs
+        // again after NetworkManager becomes available.
+        private static bool _networkSetupDone;
+
+        // Spawned only when Setup runs while NetworkManager isn't available yet.
+        // Polls each frame and finishes the network half once NM appears.
+        private static MOTDSetupRetrier _setupRetrier;
+
+        // Plugin instance pointer for the retrier — needed because Setup is
+        // an instance method but the retrier is a separate MonoBehaviour.
+        private static Plugin _activeInstance;
+
         private void Setup()
         {
+            _activeInstance = this;
             if (_isSetup) return;
             _isSetup = true;
 
@@ -136,25 +150,75 @@ namespace WebsiteMOTD
                 _serverQueueEnabled   = ServerConfig.QueueEnabled;
                 MOTD_URL              = ServerConfig.MotdUrl;
             }
+            else
+            {
+                // F2 toggles the overlay. Spawn the poller on clients only —
+                // dedicated servers don't render UI. The poller itself is
+                // cross-platform; on Linux pressing F2 routes through MOTDUI.Show
+                // which falls back to the Steam overlay rather than touching the
+                // Windows-only WebView native plugin.
+                MOTDUI.EnableHotkeys();
+            }
 
+            TrySetupNetwork();
+        }
+
+        /// <summary>
+        /// Idempotent network-setup step. Registers connection callbacks and the
+        /// initial messaging handler once NetworkManager is available. If NM is
+        /// still null, spawns a one-shot poller that retries each frame — so a
+        /// plugin enabled before Unity's network bootstrap completes still
+        /// finishes wiring up on its own instead of staying half-initialized.
+        /// </summary>
+        internal static void TrySetupNetwork()
+        {
+            if (_networkSetupDone) return;
             var nm = NetworkManager.Singleton;
             if (nm == null)
             {
-                Log("NetworkManager not available yet, deferring setup.");
+                EnsureSetupRetrier();
                 return;
             }
 
-            nm.OnClientConnectedCallback += OnClientConnected;
-            nm.OnClientDisconnectCallback += OnClientDisconnected;
+            nm.OnClientConnectedCallback    += _activeInstance.OnClientConnected;
+            nm.OnClientDisconnectCallback   += _activeInstance.OnClientDisconnected;
 
             if (nm.IsConnectedClient || nm.IsServer)
-                InitializeMessaging();
+                _activeInstance.InitializeMessaging();
+
+            _networkSetupDone = true;
+            DestroySetupRetrier();
+            Log("Network setup complete.");
+        }
+
+        private static void EnsureSetupRetrier()
+        {
+            if (_setupRetrier != null) return;
+            try
+            {
+                var go = new GameObject("MOTD_SetupRetrier");
+                go.hideFlags = HideFlags.HideAndDontSave;
+                UnityEngine.Object.DontDestroyOnLoad(go);
+                _setupRetrier = go.AddComponent<MOTDSetupRetrier>();
+                Log("NetworkManager not available yet — retrier spawned, will complete setup when it appears.");
+            }
+            catch (Exception ex) { LogError("EnsureSetupRetrier failed: " + ex.Message); }
+        }
+
+        private static void DestroySetupRetrier()
+        {
+            if (_setupRetrier == null) return;
+            try { UnityEngine.Object.Destroy(_setupRetrier.gameObject); }
+            catch (Exception ex) { LogError("DestroySetupRetrier failed: " + ex.Message); }
+            _setupRetrier = null;
         }
 
         private void Teardown()
         {
             _isSetup = false;
+            _networkSetupDone = false;
             _messagingInitialized = false;
+            DestroySetupRetrier();
             _queue.Clear();
             _current = null;
             _lastLoadedWorldUrl = null;
@@ -180,9 +244,14 @@ namespace WebsiteMOTD
 
             if (!IsDedicatedServer())
             {
+                MOTDUI.DisableHotkeys();
                 MOTDUI.Hide();
                 MOTDWorldScreen.DestroyScreens();
             }
+
+            // Drop the reflective OWP bridge cache so a re-enable cycle re-resolves
+            // it cleanly (defends against OWP being reloaded between sessions).
+            TheatreVideoScreenBridge.ResetCachedState();
 
             MOTDWebContent.Cleanup();
             OnQueueChanged?.Invoke();
@@ -1217,6 +1286,25 @@ namespace WebsiteMOTD
             }
 
             return true;
+        }
+    }
+
+    /// <summary>
+    /// One-shot retrier: spawned by <see cref="Plugin.Setup"/> only when
+    /// <c>NetworkManager.Singleton</c> isn't available yet at enable time.
+    /// Polls every frame and calls <see cref="Plugin.TrySetupNetwork"/> until
+    /// the network half of setup actually completes — then self-destructs.
+    ///
+    /// Without this, a plugin enabled before Unity's network bootstrap finished
+    /// would stay half-initialized forever (the original code logged "deferring
+    /// setup" but never retried).
+    /// </summary>
+    internal class MOTDSetupRetrier : MonoBehaviour
+    {
+        void Update()
+        {
+            try { Plugin.TrySetupNetwork(); }
+            catch (Exception ex) { Plugin.LogError("SetupRetrier: " + ex.Message); }
         }
     }
 }

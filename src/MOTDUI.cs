@@ -128,6 +128,13 @@ namespace WebsiteMOTD
         // regardless of focus state.
         private static MOTDEscPoller _escPoller;
 
+        // ── F2 toggle poller ──
+        // Lives for the whole plugin lifetime so the hotkey works even before the
+        // overlay has ever been opened. Distinct from _escPoller (which only exists
+        // while the overlay IS open) because that one would never get a chance to
+        // see the OPEN keypress.
+        private static MOTDHotkeyPoller _hotkeyPoller;
+
         public static bool IsVisible => _isVisible;
 
         /// <summary>
@@ -404,6 +411,47 @@ namespace WebsiteMOTD
         }
 
         /// <summary>
+        /// Catch action maps that got enabled AFTER our initial block sweep — e.g.
+        /// a mod that lazily registers an action map the first time the user uses
+        /// its feature. Called periodically from <see cref="MOTDHotkeyPoller"/>
+        /// while the overlay is up. Maps we already disabled are skipped via
+        /// reference equality, so we don't disable the same one twice or replace
+        /// existing entries.
+        /// </summary>
+        internal static void ReDisableForeignActionMaps()
+        {
+            if (_disabledActionMaps == null) return; // not currently blocking
+            try
+            {
+                InputActionAsset uiAsset = GetUIInputAsset();
+                foreach (var asset in Resources.FindObjectsOfTypeAll<InputActionAsset>())
+                {
+                    if (asset == null || asset == uiAsset) continue;
+                    foreach (var map in asset.actionMaps)
+                    {
+                        if (map == null || !map.enabled) continue;
+                        if (IsUIActionMap(map)) continue;
+                        if (_disabledActionMaps.Contains(map)) continue;
+
+                        try
+                        {
+                            map.Disable();
+                            _disabledActionMaps.Add(map);
+                        }
+                        catch (Exception ex)
+                        {
+                            Plugin.LogError("Late-disable map '" + map.name + "' failed: " + ex.Message);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("ReDisableForeignActionMaps failed: " + ex.Message);
+            }
+        }
+
+        /// <summary>
         /// Re-enable any maps we disabled in <see cref="DisableForeignActionMaps"/>.
         /// Skips maps that the game/mods have already re-enabled themselves and ones
         /// that have been destroyed since (scene change, mod reload).
@@ -570,6 +618,37 @@ namespace WebsiteMOTD
             if (_escPoller == null) return;
             UnityEngine.Object.Destroy(_escPoller.gameObject);
             _escPoller = null;
+        }
+
+        /// <summary>
+        /// Spawn the F2-toggle poller. Called from Plugin setup on non-dedicated
+        /// clients. Safe on Linux: the poller only reads the keyboard device and
+        /// calls <see cref="Show"/>, which itself falls back to the Steam overlay
+        /// when the native WebView isn't available on the platform.
+        /// </summary>
+        public static void EnableHotkeys()
+        {
+            if (_hotkeyPoller != null) return;
+            try
+            {
+                var go = new GameObject("MOTD_HotkeyPoller");
+                go.hideFlags = HideFlags.HideAndDontSave;
+                UnityEngine.Object.DontDestroyOnLoad(go);
+                _hotkeyPoller = go.AddComponent<MOTDHotkeyPoller>();
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("EnableHotkeys failed: " + ex.Message);
+            }
+        }
+
+        /// <summary>Tear down the F2 poller. Called on plugin disable.</summary>
+        public static void DisableHotkeys()
+        {
+            if (_hotkeyPoller == null) return;
+            try { UnityEngine.Object.Destroy(_hotkeyPoller.gameObject); }
+            catch (Exception ex) { Plugin.LogError("DisableHotkeys failed: " + ex.Message); }
+            _hotkeyPoller = null;
         }
 
         // ─── Navigation ─────────────────────────────────────────────
@@ -813,6 +892,12 @@ namespace WebsiteMOTD
 
         private static void GoBack()
         {
+            // Back/forward is a user-driven navigation — break the queue-item
+            // binding so the destination page isn't treated as the queue's
+            // active item just because it happens to share a URL with one.
+            _overlayQueueItemId = 0;
+            _webView?.EvaluateJS("window.__motdItemId=0;");
+
             if (_useWebView && _webView != null)
             {
                 _webView.GoBack();
@@ -859,6 +944,10 @@ namespace WebsiteMOTD
 
         private static void GoForward()
         {
+            // See GoBack — same reasoning for clearing the queue-item binding.
+            _overlayQueueItemId = 0;
+            _webView?.EvaluateJS("window.__motdItemId=0;");
+
             if (_useWebView && _webView != null)
             {
                 _webView.GoForward();
@@ -3991,6 +4080,52 @@ namespace WebsiteMOTD
             catch (Exception ex)
             {
                 Plugin.LogError("EscPoller: " + ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Persistent poller that toggles the MOTD overlay when F2 is pressed.
+    /// Lives for the lifetime of the plugin (separate from the ESC poller, which
+    /// only exists while the overlay is open). Uses device-level Keyboard.current
+    /// polling so this still works even when our BlockGameplayInput has disabled
+    /// every InputActionMap — and is cross-platform (Unity Input System works on
+    /// Linux too), so this never reaches the native WebView code path on its own.
+    /// MOTDUI.Show internally falls back to the Steam overlay on non-Windows, so
+    /// pressing F2 on Linux is safe: it never tries to load WebView.dll.
+    /// </summary>
+    internal class MOTDHotkeyPoller : MonoBehaviour
+    {
+        // Periodic re-snapshot interval for the action-map blocker. The user can't
+        // see this — it just defends against mods that lazily register a new
+        // InputActionMap after the overlay was already open.
+        private const int ActionMapRescanFrameInterval = 30; // ~0.5s @ 60fps
+
+        void Update()
+        {
+            try
+            {
+                var kb = Keyboard.current;
+                if (kb != null && kb.f2Key.wasPressedThisFrame)
+                {
+                    // Use IsAnyOverlayVisible so F2 also dismisses the trust-
+                    // confirm dialog — otherwise pressing F2 with the dialog up
+                    // would re-trigger Show and just rebuild the same dialog.
+                    if (MOTDUI.IsAnyOverlayVisible)
+                        MOTDUI.Hide();
+                    else
+                        MOTDUI.Show(Plugin.MOTD_URL);
+                }
+
+                // While the overlay is open, periodically catch action maps that
+                // got enabled after we did our initial sweep (e.g. mods that
+                // lazily register a binding the first time their feature is used).
+                if (MOTDUI.IsAnyOverlayVisible && Time.frameCount % ActionMapRescanFrameInterval == 0)
+                    MOTDUI.ReDisableForeignActionMaps();
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("HotkeyPoller: " + ex.Message);
             }
         }
     }

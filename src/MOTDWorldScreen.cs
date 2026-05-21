@@ -89,14 +89,17 @@ namespace WebsiteMOTD
 
         // ─── OpenWorld "TheatreVideoScreen" claim ───────────────────
         // OpenWorldPracticeMod ships a screen prefab and exposes a TryClaim/Release
-        // API for cooperative ownership — see TheatreVideoScreenBridge. While we
-        // hold the claim, the OpenWorld mod stops its showcase video and lets us
-        // drive the screen's material. We bind our shared WebView texture to the
-        // standard texture slots (_MainTex / _BaseMap / _EmissionMap) so it lights
-        // up regardless of shader (URP-Lit, Unlit, Standard, etc).
+        // API plus a ClaimChanged event for cooperative ownership — see
+        // TheatreVideoScreenBridge. While we hold the claim, the OWP mod stops its
+        // showcase video and lets us drive the screen's material. We bind our shared
+        // WebView texture across _MainTex / _BaseMap / _EmissionMap so it lights up
+        // regardless of shader pipeline (URP-Lit, Unlit, Standard, etc).
+        //
+        // Re-attach handling is event-driven: OWP destroys + recreates the screen
+        // GameObject across open-world teardown/re-entry, so we subscribe to
+        // ClaimChanged and re-bind to the fresh GameObject when it fires.
         private static GameObject _theatreScreen;
         private static Renderer _theatreRenderer;
-        private const int TheatreClaimRetryInterval = 60; // ~1s @ 60fps
 
         // Driver-only screen: spawned when no A/B screens exist but the theatre
         // screen is claimed, so the WebView still gets pumped. No MeshRenderer —
@@ -110,15 +113,21 @@ namespace WebsiteMOTD
 
         /// <summary>
         /// Try to claim the OpenWorld theatre screen if it's available and we don't
-        /// already hold it. Returns the claimed screen GameObject or null. Safe and
-        /// cheap to call repeatedly — no-ops once we hold the claim, no-ops when the
-        /// OpenWorld mod isn't loaded.
+        /// already hold it. Subscribes to the ClaimChanged event on first call so
+        /// later teardown/re-attach events automatically re-bind the texture without
+        /// per-frame polling. Safe and cheap to call repeatedly.
         /// </summary>
         public static GameObject EnsureTheatreClaim()
         {
             if (!TheatreVideoScreenBridge.ApiPresent) return null;
 
-            // Drop stale cache if the screen prefab vanished (e.g. scene unloaded).
+            // Subscribe first so we don't miss a ClaimChanged that fires between
+            // TryClaim and the event hookup. The bridge's subscribe is idempotent
+            // when called with the same handler.
+            TheatreVideoScreenBridge.SubscribeClaimChanged(OnTheatreClaimChanged);
+
+            // Drop stale cache if the screen prefab vanished (e.g. open-world torn
+            // down). The ClaimChanged event will re-notify us when it returns.
             if (!TheatreVideoScreenBridge.IsAvailable)
             {
                 if (_theatreScreen != null)
@@ -142,24 +151,64 @@ namespace WebsiteMOTD
                 return null;
             }
 
-            // Prefer the OpenWorld mod's authoritative ScreenRenderer reference;
-            // fall back to a component lookup on the GameObject if the property
-            // resolved-but-returned-null (shouldn't happen, but be defensive).
+            BindToTheatreScreen(go);
+            Plugin.Log("TheatreVideoScreen claimed — driving with WebView texture.");
+            return go;
+        }
+
+        /// <summary>
+        /// Cache the screen GameObject + resolve its renderer. Centralised so the
+        /// event-driven re-attach path and the initial-claim path stay in sync.
+        /// </summary>
+        private static void BindToTheatreScreen(GameObject go)
+        {
             _theatreScreen = go;
             _theatreRenderer = TheatreVideoScreenBridge.GetScreenRenderer()
-                ?? go.GetComponent<Renderer>()
-                ?? go.GetComponentInChildren<Renderer>();
+                ?? (go != null ? (go.GetComponent<Renderer>() ?? go.GetComponentInChildren<Renderer>()) : null);
 
-            if (_theatreRenderer != null)
-                Plugin.Log("TheatreVideoScreen claimed — driving with WebView texture.");
-            else
+            if (go != null && _theatreRenderer == null)
                 Plugin.LogError("TheatreVideoScreen claimed but no Renderer found on the screen GameObject.");
-            return go;
+        }
+
+        /// <summary>
+        /// ClaimChanged callback from the OWP bridge. Three cases:
+        ///   • newOwner == our id: we (still) own it — could be a fresh claim ACK or
+        ///     a re-attach after open-world teardown. Re-bind to the (possibly new) GO.
+        ///   • newOwner == null: screen released to default. If queue content is live,
+        ///     try to retake; otherwise stay out.
+        ///   • newOwner == something else: another mod claimed it. Drop our refs so we
+        ///     don't stomp their content.
+        /// </summary>
+        private static void OnTheatreClaimChanged(string newOwner, GameObject screen)
+        {
+            if (newOwner == TheatreVideoScreenBridge.OwnerId)
+            {
+                BindToTheatreScreen(screen);
+                Plugin.Log("TheatreVideoScreen re-attached (we still own it) — re-bound to new GameObject.");
+            }
+            else if (string.IsNullOrEmpty(newOwner))
+            {
+                // Screen available & unclaimed. Retake if we're actively driving content.
+                _theatreScreen = null;
+                _theatreRenderer = null;
+                if (_sharedWebView != IntPtr.Zero)
+                    EnsureTheatreClaim();
+            }
+            else
+            {
+                Plugin.Log("TheatreVideoScreen taken by '" + newOwner + "' — releasing local refs.");
+                _theatreScreen = null;
+                _theatreRenderer = null;
+            }
         }
 
         /// <summary>Release the theatre claim so OpenWorld can resume its own video.</summary>
         public static void ReleaseTheatreClaim()
         {
+            // Unsubscribe BEFORE Release so the bridge doesn't bounce our own
+            // release back to OnTheatreClaimChanged and immediately re-claim.
+            TheatreVideoScreenBridge.UnsubscribeClaimChanged();
+
             if (_theatreScreen == null && !TheatreVideoScreenBridge.IsClaimedByUs) return;
             _theatreScreen = null;
             _theatreRenderer = null;
@@ -171,16 +220,55 @@ namespace WebsiteMOTD
         /// <paramref name="mat"/>. Sets all of _MainTex/_BaseMap/_EmissionMap that
         /// exist so the texture shows up regardless of shader pipeline (URP-Lit
         /// uses _BaseMap, built-in uses _MainTex, emissive shaders use _EmissionMap).
+        ///
+        /// Also applies a vertical flip via the texture transform: WebView2's bitmap
+        /// is top-down (row 0 = top) but Unity texture sampling assumes bottom-up
+        /// (row 0 = bottom). Our own world quads compensate via flipped mesh UVs
+        /// (see <see cref="CreateQuadMesh"/>), but we can't modify the OWP screen's
+        /// mesh — scale (1,-1) + offset (0,1) on the material does the same thing
+        /// per-shader-property without touching the renderer's geometry.
         /// </summary>
+        private static readonly Vector2 FlipScale = new Vector2(1f, -1f);
+        private static readonly Vector2 FlipOffset = new Vector2(0f, 1f);
+
         private static void BindTextureToScreenMaterial(Material mat, Texture tex)
         {
             if (mat == null || tex == null) return;
-            if (mat.HasProperty("_MainTex") && mat.GetTexture("_MainTex") != tex)
-                mat.SetTexture("_MainTex", tex);
-            if (mat.HasProperty("_BaseMap") && mat.GetTexture("_BaseMap") != tex)
-                mat.SetTexture("_BaseMap", tex);
-            if (mat.HasProperty("_EmissionMap") && mat.GetTexture("_EmissionMap") != tex)
-                mat.SetTexture("_EmissionMap", tex);
+            bool boundAny = false;
+            boundAny |= BindSlot(mat, "_MainTex",     tex);
+            boundAny |= BindSlot(mat, "_BaseMap",     tex);
+            boundAny |= BindSlot(mat, "_EmissionMap", tex);
+
+            // Fallback for shaders that name their main texture something else
+            // (e.g. a custom theater-screen shader using "_Texture" or "_Albedo").
+            // Material.mainTexture writes to whichever property the shader marks
+            // as [MainTexture] (or the default _MainTex). Same for the scale/offset.
+            if (!boundAny)
+            {
+                try
+                {
+                    if (mat.mainTexture != tex) mat.mainTexture = tex;
+                    mat.mainTextureScale = FlipScale;
+                    mat.mainTextureOffset = FlipOffset;
+                }
+                catch (Exception ex)
+                {
+                    Plugin.LogError("Theatre material mainTexture fallback failed: " + ex.Message);
+                }
+            }
+        }
+
+        private static bool BindSlot(Material mat, string prop, Texture tex)
+        {
+            if (!mat.HasProperty(prop)) return false;
+            if (mat.GetTexture(prop) != tex)
+                mat.SetTexture(prop, tex);
+            // Set every frame — cheap matrix update, defends against the OWP mod
+            // resetting material state (e.g., after a teardown/re-attach we may
+            // get a fresh material with default 1,0 / 0,0 transform).
+            mat.SetTextureScale(prop, FlipScale);
+            mat.SetTextureOffset(prop, FlipOffset);
+            return true;
         }
 
         /// <summary>
@@ -595,19 +683,18 @@ namespace WebsiteMOTD
                 _renderer.material.mainTexture = _sharedTexture;
             }
 
-            // Primary also drives the OpenWorld theatre screen: periodically (re)claim
-            // when available, then keep the shared texture bound to its material.
-            // Theatre screen runs regardless of server/client screens settings —
-            // that's the whole point of the cooperation with OpenWorldPracticeMod.
-            if (_isPrimary)
+            // Primary also drives the OpenWorld theatre screen: keep the shared
+            // texture bound to its material every frame. (Re)claiming is event-
+            // driven via TheatreVideoScreenBridge.ClaimChanged — see
+            // OnTheatreClaimChanged — so no per-frame polling is needed. Theatre
+            // screen runs regardless of server/client screens settings, that's
+            // the whole point of the cooperation with OpenWorldPracticeMod.
+            if (_isPrimary
+                && _sharedTexture != null
+                && _theatreRenderer != null
+                && _theatreRenderer.material != null)
             {
-                if (Time.frameCount % TheatreClaimRetryInterval == 0)
-                    EnsureTheatreClaim();
-
-                if (_sharedTexture != null && _theatreRenderer != null && _theatreRenderer.material != null)
-                {
-                    BindTextureToScreenMaterial(_theatreRenderer.material, _sharedTexture);
-                }
+                BindTextureToScreenMaterial(_theatreRenderer.material, _sharedTexture);
             }
         }
 
@@ -702,13 +789,18 @@ namespace WebsiteMOTD
 
         /// <summary>
         /// Sample listener position and update <see cref="_positionalMultiplier"/>.
-        /// Both screens contribute and are summed (clamped to 1.0) so standing between
-        /// the goals gives full volume from both speakers.
+        /// Every active screen — the two arena screens AND the OWP theatre screen
+        /// when we've claimed it — contributes an attenuation value; the sum is
+        /// clamped to 1.0. Standing between any two of them gives full volume from
+        /// both "speakers". Treating the theatre screen as just another source
+        /// matches the audio feel of the arena screens and lets a player in the
+        /// open-world hub hear queue audio without it staying at full volume from
+        /// across the map.
         /// </summary>
         private static void UpdatePositionalVolume()
         {
             if (_sharedWebView == IntPtr.Zero) return;
-            if (_screenA == null && _screenB == null) return;
+            if (_screenA == null && _screenB == null && _theatreScreen == null) return;
 
             var listener = GetListenerTransform();
             if (listener == null) return;
@@ -718,8 +810,10 @@ namespace WebsiteMOTD
                 ? LogAttenuate(Vector3.Distance(lp, _screenA.transform.position)) : 0f;
             float attenB = _screenB != null
                 ? LogAttenuate(Vector3.Distance(lp, _screenB.transform.position)) : 0f;
+            float attenT = _theatreScreen != null
+                ? LogAttenuate(Vector3.Distance(lp, _theatreScreen.transform.position)) : 0f;
 
-            float combined = Mathf.Clamp01(attenA + attenB);
+            float combined = Mathf.Clamp01(attenA + attenB + attenT);
             if (Mathf.Abs(combined - _positionalMultiplier) < ProxVolumeEpsilon) return;
             _positionalMultiplier = combined;
             ApplyVolume();

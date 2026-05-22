@@ -484,8 +484,16 @@ namespace WebsiteMOTD
         private const int   StaticChecksForIdle = 30;     // ~0.5s @ 60fps of no change → throttle
         private const int   IdleFrameInterval = 8;        // ~7.5fps when truly idle
         private const int   NoBitmapGenFrameInterval = 6; // ~10fps when DLL lacks BitmapGeneration export
+        // Real-time cap on bitmap captures: on a 144 Hz Unity loop, asking the
+        // WebView to capture every frame produces ~144 capture requests/sec for
+        // content that paints at 30–60 fps. The BitmapGeneration gate skips the
+        // texture upload when nothing changed, but the capture itself still has
+        // a cost that competes with the Unity render thread; pinning the rate
+        // here is what smooths the overlay on high-refresh monitors.
+        private const float MinCaptureIntervalSec = 1f / 60f;
 
         private int _consecutiveStaticChecks;
+        private float _lastCaptureUT;
 
         void Update()
         {
@@ -539,9 +547,14 @@ namespace WebsiteMOTD
             else
                 shouldRefresh = (Time.frameCount % IdleFrameInterval == 0);
 
+            // Real-time rate cap — see MinCaptureIntervalSec.
+            if (shouldRefresh && Time.unscaledTime - _lastCaptureUT < MinCaptureIntervalSec)
+                shouldRefresh = false;
+
             _CWebViewPlugin_Update(_webView, shouldRefresh, 1);
 
             if (!shouldRefresh) return;
+            _lastCaptureUT = Time.unscaledTime;
 
             // Check if the native bitmap actually changed since last upload.
             // Fall back to always-upload if this DLL export is missing.

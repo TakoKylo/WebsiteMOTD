@@ -663,7 +663,7 @@ namespace WebsiteMOTD
         /// specific item id, preventing stale "ended" messages from advancing the
         /// queue and stopping random browsing from triggering an advance.
         /// </summary>
-        public static void NavigateTo(string url, bool addToHistory = true, long queueItemId = 0)
+        public static void NavigateTo(string url, bool addToHistory = true, long queueItemId = 0, int startOffsetSec = 0)
         {
             if (string.IsNullOrWhiteSpace(url)) return;
 
@@ -701,9 +701,9 @@ namespace WebsiteMOTD
             if (_useWebView && _webView != null)
             {
                 EnsureWebViewVisible();
-                string embedUrl = ConvertToEmbedUrl(url);
+                string embedUrl = ConvertToEmbedUrl(url, startOffsetSec);
                 _webView.LoadURL(embedUrl);
-                Plugin.Log("WebView navigating to: " + embedUrl);
+                Plugin.Log("WebView navigating to (t=" + startOffsetSec + "s): " + embedUrl);
                 return;
             }
 
@@ -994,17 +994,24 @@ namespace WebsiteMOTD
 
         /// <summary>
         /// Whether the overlay should auto-navigate when the world-screen URL changes.
-        /// True when the user hasn't browsed away from the queue's current page — i.e.
-        /// their overlay is showing the same URL the world screens were showing, the
-        /// home/MOTD URL, or nothing yet. Avoids hijacking active browsing every time
-        /// someone votes or the queue advances.
+        /// True when the user hasn't browsed away from the queue's current page.
+        ///
+        /// The reliable signal is <see cref="_overlayQueueItemId"/>: it's set when the
+        /// queue-load path navigates the overlay (see Plugin.LoadCurrentOnWorldScreens)
+        /// and cleared the moment the user does anything browsing-like — typing a URL,
+        /// clicking a link (NavigateTo with queueItemId=0), GoBack/GoForward, or a
+        /// WebView SPA navigation (navTo:). URL string comparison alone is unreliable
+        /// because WebView's onLoaded rewrites <c>_url</c> to a post-redirect/canonical
+        /// form that drifts from the raw <c>previousWorldUrl</c> the caller has.
         /// </summary>
         public static bool ShouldFollowWorldScreen(string previousWorldUrl)
         {
-            if (string.IsNullOrEmpty(_url)) return true;          // nothing loaded yet
-            if (_url == previousWorldUrl) return true;            // user is on the screen page
-            if (_url == _homeUrl) return true;                    // user is on home
-            if (_url == Plugin.MOTD_URL) return true;             // user is on MOTD
+            // Bound to a queue item and untouched since — definitely follow.
+            if (_overlayQueueItemId != 0) return true;
+            // Not yet navigated, or sitting on the home/MOTD page — safe to follow.
+            if (string.IsNullOrEmpty(_url)) return true;
+            if (_url == _homeUrl) return true;
+            if (_url == Plugin.MOTD_URL) return true;
             return false;
         }
 
@@ -1284,8 +1291,13 @@ namespace WebsiteMOTD
         /// Converts YouTube, YouTube Music, Twitch, and Spotify URLs into
         /// embeddable autoplay/fullscreen variants for the WebView.
         /// Returns the original URL unchanged if no conversion applies.
+        ///
+        /// <paramref name="startOffsetSec"/>, when &gt; 0, appends a platform-
+        /// appropriate seek param so a late-joining client jumps into the
+        /// video where it's actually playing (mid-join sync). Ignored for
+        /// platforms with no meaningful seek (Twitch live, Spotify).
         /// </summary>
-        public static string ConvertToEmbedUrl(string url)
+        public static string ConvertToEmbedUrl(string url, int startOffsetSec = 0)
         {
             if (string.IsNullOrEmpty(url)) return url;
             string lower = url.ToLowerInvariant();
@@ -1329,7 +1341,9 @@ namespace WebsiteMOTD
                 // Use the full watch page, NOT the /embed/ URL.
                 // The embed player requires an iframe origin and returns error 153 when loaded
                 // directly in WebView2. youtube.com/watch works natively in WebView2 (Edge).
-                return "https://www.youtube.com/watch?v=" + ytId + "&autoplay=1";
+                string baseUrl = "https://www.youtube.com/watch?v=" + ytId + "&autoplay=1";
+                if (startOffsetSec > 0) baseUrl += "&t=" + startOffsetSec + "s";
+                return baseUrl;
             }
 
             // ── Twitch channels and VODs ──
@@ -1342,8 +1356,14 @@ namespace WebsiteMOTD
                     if (path.StartsWith("videos/"))
                     {
                         string vodId = path.Substring(7).Split('/')[0].Split('?')[0];
-                        return "https://player.twitch.tv/?video=" + vodId
+                        string vodUrl = "https://player.twitch.tv/?video=" + vodId
                             + "&parent=localhost&autoplay=true&muted=false";
+                        // Twitch VOD seek uses HhMmSs (the embed player accepts the same
+                        // format as the watch page). Live channels (handled below) can't
+                        // be seeked into — joining mid-stream gets the live edge.
+                        if (startOffsetSec > 0)
+                            vodUrl += "&time=" + FormatHhMmSs(startOffsetSec);
+                        return vodUrl;
                     }
                     string channel = path.Split('/')[0];
                     if (!string.IsNullOrEmpty(channel)
@@ -1375,7 +1395,23 @@ namespace WebsiteMOTD
                 catch { }
             }
 
+            // ── Direct media files: HTML5 media-fragment seek (#t=Ns) ──
+            // Works for <video>/<audio> the browser plays natively from a URL.
+            if (startOffsetSec > 0 && (IsDirectVideoUrl(url)))
+            {
+                // Don't double-append if the caller already supplied a fragment.
+                if (url.IndexOf('#') < 0) return url + "#t=" + startOffsetSec;
+            }
+
             return url;
+        }
+
+        private static string FormatHhMmSs(int totalSec)
+        {
+            int h = totalSec / 3600;
+            int m = (totalSec % 3600) / 60;
+            int s = totalSec % 60;
+            return h + "h" + m + "m" + s + "s";
         }
 
         private static string ExtractQueryParam(string url, string key)
@@ -1558,13 +1594,34 @@ namespace WebsiteMOTD
                 "function notifyEnded(){" +
                 "var id=window.__motdItemId||0;" +
                 "if(id===0)return;" + // not a queue item — drop
+                // Ad → main transition can fire 'ended' on the ad video; by the time
+                // this delayed notify runs, the main video is already playing in the
+                // same element. Recheck — but ONLY inside the main player container,
+                // because hover-preview loops on YouTube's recommended-videos rail are
+                // also <video> elements that report !paused && !ended, and the overlay
+                // browse view shows those previews; checking them all would reset the
+                // guard for legitimate end-of-video events.
+                "var mp=document.querySelector('#movie_player, .html5-video-player');" +
+                "if(mp){" +
+                "var vids=mp.querySelectorAll('video');" +
+                "for(var i=0;i<vids.length;i++){" +
+                "var w=vids[i];" +
+                "if(w&&!w.paused&&!w.ended&&w.currentTime>0.5&&isFinite(w.duration)&&w.currentTime<w.duration-1){" +
+                "_sent=false;return;}}" +
+                "}" +
                 "if(window.Unity&&typeof window.Unity.call==='function')" +
                 "window.Unity.call('videoEnded:'+id);" +
                 "}" +
                 // onEnded: guard against ads and duplicate signals
                 "function onEnded(e){" +
                 "var v=e.target;" +
-                "if(!v||v.duration<=5)return;" +
+                "if(!v||!isFinite(v.duration)||v.duration<=5)return;" +
+                // AdBlock JS fast-forwards ads via playbackRate=16; surviving rate at
+                // 'ended' time tells us this was an ad we sped past, not the queued video.
+                "if(v.playbackRate>3)return;" +
+                // Fallback: YouTube ad markers on the player container.
+                "var p=v.closest&&v.closest('.html5-video-player');" +
+                "if(p&&(p.classList.contains('ad-showing')||p.classList.contains('ad-interrupting')))return;" +
                 "if(document.querySelector('.ad-showing'))return;" +
                 "if(_sent)return;" +
                 "_sent=true;" +
@@ -2111,7 +2168,17 @@ namespace WebsiteMOTD
             Plugin.Log("Saved trusted domain: " + domain);
         }
 
-        private static void LoadSettings()
+        private static void LoadSettings() => EnsureSettingsLoaded();
+
+        /// <summary>
+        /// Hydrate the volume / mute / screens-disabled / zoom static fields from
+        /// ClientMOTD.json. Idempotent. Called both lazily from Show() and eagerly
+        /// from <see cref="Plugin.Setup"/> on non-dedicated clients — without the
+        /// eager call, the world screens spawned on join (in response to the MOTD
+        /// or queue-state messages) would ignore the saved preferences until the
+        /// user first opens the overlay.
+        /// </summary>
+        public static void EnsureSettingsLoaded()
         {
             if (_settingsLoaded) return;
             if (Plugin.IsDedicatedServer()) return; // client-only config
@@ -2123,6 +2190,12 @@ namespace WebsiteMOTD
             _zoomLevel       = ClientConfig.Zoom;
             _settingsLoaded  = true;
             Plugin.Log("MOTD settings loaded from ClientMOTD.json.");
+        }
+
+        /// <summary>True if the user has disabled the in-world screens locally.</summary>
+        public static bool ScreensDisabled
+        {
+            get { EnsureSettingsLoaded(); return _screensDisabled; }
         }
 
         private static void SaveSettings()
@@ -2412,14 +2485,29 @@ namespace WebsiteMOTD
 
         private static void TryOpenSteamBrowser(string url)
         {
+            if (string.IsNullOrEmpty(url)) return;
             try
             {
-                if (SteamManager.IsInitialized && !string.IsNullOrEmpty(url))
+                // ActivateGameOverlayToWebPage silently no-ops when the user has
+                // the Steam overlay disabled in client settings — Steamworks
+                // returns success without doing anything. SteamUtils.IsOverlayEnabled
+                // tells us whether the overlay is actually usable; if not, route
+                // through the OS default browser so the user still sees the page
+                // (matches the "Open in System Browser" button's behavior).
+                bool overlayOk = SteamManager.IsInitialized && SteamUtils.IsOverlayEnabled();
+                if (overlayOk)
+                {
                     SteamFriends.ActivateGameOverlayToWebPage(url);
+                    return;
+                }
+                Plugin.Log("Steam overlay disabled — opening in system browser instead.");
+                Application.OpenURL(url);
             }
             catch (Exception ex)
             {
                 Plugin.LogError("Steam overlay failed: " + ex.Message);
+                // Last-ditch: try the system browser so the user isn't stranded.
+                try { Application.OpenURL(url); } catch { }
             }
         }
 
@@ -3015,6 +3103,43 @@ namespace WebsiteMOTD
             useCurrentBtn.style.paddingLeft = 8f;
             useCurrentBtn.style.paddingRight = 8f;
             addRow.Add(useCurrentBtn);
+
+            // Quick browse shortcuts — navigate the in-overlay WebView to the
+            // major queue-friendly platforms so players can find a video and
+            // copy its URL without alt-tabbing. NavigateTo handles the trusted-
+            // domain bypass and goes through the same WebView the rest of the
+            // overlay uses.
+            var browseRow = new VisualElement();
+            browseRow.style.flexDirection = FlexDirection.Row;
+            browseRow.style.marginTop = 8f;
+            _queueContent.Add(browseRow);
+
+            var browseLabel = new Label("Browse:");
+            browseLabel.style.fontSize = 11f;
+            browseLabel.style.color = new Color(0.6f, 0.6f, 0.65f);
+            browseLabel.style.unityTextAlign = TextAnchor.MiddleLeft;
+            browseLabel.style.marginRight = 6f;
+            browseLabel.style.minWidth = 48f;
+            browseRow.Add(browseLabel);
+
+            var ytBtn = CreateStyledButton("YouTube", new Color(0.7f, 0.15f, 0.15f),
+                () => NavigateTo("https://www.youtube.com/"));
+            ytBtn.style.height = 26f;
+            ytBtn.style.flexGrow = 1f;
+            ytBtn.style.fontSize = 12f;
+            ytBtn.style.paddingLeft = 6f;
+            ytBtn.style.paddingRight = 6f;
+            ytBtn.style.marginRight = 4f;
+            browseRow.Add(ytBtn);
+
+            var twitchBtn = CreateStyledButton("Twitch", new Color(0.4f, 0.25f, 0.65f),
+                () => NavigateTo("https://www.twitch.tv/directory"));
+            twitchBtn.style.height = 26f;
+            twitchBtn.style.flexGrow = 1f;
+            twitchBtn.style.fontSize = 12f;
+            twitchBtn.style.paddingLeft = 6f;
+            twitchBtn.style.paddingRight = 6f;
+            browseRow.Add(twitchBtn);
         }
 
         private static void ToggleQueuePanel()
@@ -3101,7 +3226,10 @@ namespace WebsiteMOTD
                         "Skip (your video)",
                         new Color(0.6f, 0.35f, 0.2f),
                         Plugin.OwnerVetoCurrent);
-                    _voteSkipBtn.style.height = 28f;
+                    // Matches the progress-bar height below and the Add/Use buttons
+                    // further down the panel. 28 was too short for the bold label
+                    // to read; 36 (the earlier attempt) was visually oversized.
+                    _voteSkipBtn.style.height = 30f;
                     _voteSkipBtn.style.flexGrow = 1f;
                 }
                 else
@@ -3206,7 +3334,9 @@ namespace WebsiteMOTD
             Color fillColor  = voted ? new Color(0.85f, 0.62f, 0.30f) : new Color(0.85f, 0.30f, 0.30f);
 
             var track = new VisualElement();
-            track.style.height = 28f;
+            // 28 was too short for the centered label to read clearly; 30 matches
+            // the owner-veto button height and the rest of the queue panel buttons.
+            track.style.height = 30f;
             track.style.flexGrow = 1f;
             track.style.position = Position.Relative;
             track.style.overflow = Overflow.Hidden;
@@ -3236,6 +3366,9 @@ namespace WebsiteMOTD
             label.style.color = Color.white;
             label.style.fontSize = 13f;
             label.style.unityFontStyleAndWeight = FontStyle.Bold;
+            // Soft shadow keeps the text readable against either the dim track
+            // background (low fill) or the saturated fill colour (high fill).
+            label.style.textShadow = new TextShadow { offset = new Vector2(0f, 1f), blurRadius = 2f, color = new Color(0f, 0f, 0f, 0.85f) };
             label.pickingMode = PickingMode.Ignore;
             track.Add(label);
 

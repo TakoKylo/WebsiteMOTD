@@ -62,6 +62,14 @@ namespace WebsiteMOTD
         public bool queue_enabled = false;
         public string motd_url = "https://poncepuck.net/motd/";
 
+        // Hard cap on how long a single queue item is allowed to remain
+        // "current" before the server force-advances. Defends against the
+        // dedicated-server-has-no-WebView case where the server depends on
+        // clients reporting "ended" — if every client has disconnected,
+        // crashed, or had its ad-block JS misfire, the queue would otherwise
+        // stall on that item forever. 0 disables the cap.
+        public int max_item_seconds = 1800;
+
         // Host allowlist for the shared queue. Domain is matched against
         // the URL's host; subdomains are accepted (e.g. "youtube.com"
         // also allows "m.youtube.com"). An empty list disables the
@@ -87,6 +95,7 @@ namespace WebsiteMOTD
         public static bool ScreensEnabled => _data.screens_enabled;
         public static bool QueueEnabled   => _data.queue_enabled;
         public static string MotdUrl      => _data.motd_url;
+        public static int MaxItemSeconds  => _data.max_item_seconds;
 
         public static IReadOnlyList<string> QueueAllowedSites =>
             _data.queue_allowed_sites ?? new List<string>();

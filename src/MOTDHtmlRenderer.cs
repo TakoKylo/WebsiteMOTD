@@ -11,6 +11,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using UnityEngine;
@@ -392,8 +393,18 @@ namespace WebsiteMOTD
             int dot = clean.LastIndexOf('.');
             if (dot >= 0 && clean.Length - dot <= 5) ext = clean.Substring(dot);
 
+            // Hash the full URL so two different videos can't collide on the
+            // 32-bit GetHashCode space (which has plenty of overlap in practice
+            // and would serve a previously-downloaded video under the new URL).
+            // Truncated SHA-256 hex is collision-free for any realistic count.
+            string urlHash;
+            using (var sha = SHA256.Create())
+            {
+                byte[] digest = sha.ComputeHash(Encoding.UTF8.GetBytes(url));
+                urlHash = BitConverter.ToString(digest, 0, 8).Replace("-", "");
+            }
             _tempFile = Path.Combine(Application.temporaryCachePath,
-                "motd_" + Mathf.Abs(url.GetHashCode()) + ext);
+                "motd_" + urlHash + ext);
 
             if (!File.Exists(_tempFile))
             {
@@ -639,6 +650,13 @@ namespace WebsiteMOTD
             }
         }
 
+        // Hard cap on HTML size before parsing. ParseHtml runs synchronously on
+        // Unity's main thread with regex backtracking that can stall the game on
+        // pathological input — cap the input length so a hostile page can't
+        // freeze the client. 256 KB is far more than any reasonable MOTD page;
+        // truncation produces a degraded render (cut mid-tag) but never a hang.
+        private const int MaxHtmlBytesForParse = 256 * 1024;
+
         private static IEnumerator FetchCoroutine(string url, Action<List<ContentElement>> onSuccess, Action<string> onError)
         {
             using (var req = UnityWebRequest.Get(url))
@@ -649,7 +667,10 @@ namespace WebsiteMOTD
                 yield return req.SendWebRequest();
                 if (req.result != UnityWebRequest.Result.Success)
                 { onError?.Invoke(req.error); yield break; }
-                onSuccess?.Invoke(ParseHtml(req.downloadHandler.text, url));
+                string body = req.downloadHandler.text ?? "";
+                if (body.Length > MaxHtmlBytesForParse)
+                    body = body.Substring(0, MaxHtmlBytesForParse);
+                onSuccess?.Invoke(ParseHtml(body, url));
             }
         }
 
@@ -1209,7 +1230,11 @@ namespace WebsiteMOTD
 
         private static string AttrVal(string tag, string attr)
         {
-            var m = Regex.Match(tag, attr + @"\s*=\s*[""']([^""']+)[""']", RegexOptions.IgnoreCase);
+            // Anchor to a name-boundary (start-of-tag, whitespace) so looking up
+            // "src" against <img data-src="..."> doesn't match the data-src.
+            var m = Regex.Match(tag,
+                @"(?:^|\s|<\w+)" + Regex.Escape(attr) + @"\s*=\s*[""']([^""']+)[""']",
+                RegexOptions.IgnoreCase);
             return m.Success ? m.Groups[1].Value : null;
         }
 

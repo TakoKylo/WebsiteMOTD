@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -63,7 +64,16 @@ namespace WebsiteMOTD
         private const int   StaticChecksForIdle = 30;    // ~0.5s @ 60fps of no change → throttle
         private const int   IdleFrameInterval = 8;       // ~7.5fps when truly idle
         private const int   NoBitmapGenFrameInterval = 4; // fallback when DLL lacks BitmapGeneration
+        // Cap active-mode bitmap captures to ~60 Hz regardless of Unity frame rate.
+        // Without this, a 144 Hz Unity loop asks the WebView to capture 144 times/sec
+        // for content that only repaints at 30–60 fps — wasted native work and
+        // texture upload churn that competes with the Unity render thread. The
+        // BitmapGeneration check skips the upload when nothing changed, but the
+        // *capture request itself* still costs; capping the request rate is what
+        // smooths out the choppiness players reported on high-refresh monitors.
+        private const float MinCaptureIntervalSec = 1f / 60f;
         private static int  _consecutiveStaticChecks;
+        private static float _lastCaptureUT;
 
         // ─── Proximity audio ────────────────────────────────────────
         // WebView2 plays audio directly to the Windows mixer — we can't route it
@@ -336,6 +346,15 @@ namespace WebsiteMOTD
             _screenA = CreateScreen("MOTD_WorldScreen_A", posA, rotA, true);
             _screenB = CreateScreen("MOTD_WorldScreen_B", posB, rotB, false);
 
+            // Apply the user's "screens off" preference immediately. Without this
+            // the screens are visible on every spawn until the player opens the
+            // overlay at least once (because the screens-disabled flag was only
+            // applied from MOTDUI.Show). Volume is handled via InjectWorldVolumeJS
+            // on CallOnLoaded, which reads MOTDUI.EffectiveVolume — already loaded
+            // eagerly by Plugin.Setup, so no extra wiring needed here.
+            if (MOTDUI.ScreensDisabled)
+                SetScreensVisible(false);
+
             Plugin.Log("World screens spawned at " + posA + " and " + posB);
         }
 
@@ -347,14 +366,20 @@ namespace WebsiteMOTD
         /// gets injected into the page as window.__motdItemId so the videoEnded JS
         /// hook can bind the event to a specific item, letting the server drop
         /// stale messages from videos that have already been skipped past.
+        ///
+        /// <paramref name="startOffsetSec"/> seeks into the video by appending a
+        /// platform-appropriate time param (YouTube &amp;t=, Twitch VOD &amp;time=,
+        /// direct media #t=). Used by the mid-join sync path so a player joining
+        /// 30 s into a video doesn't restart it from 0:00. 0 means start at the
+        /// beginning.
         /// </summary>
-        public static void LoadOnAllScreens(string url, long itemId = 0)
+        public static void LoadOnAllScreens(string url, long itemId = 0, int startOffsetSec = 0)
         {
             if (_sharedWebView == IntPtr.Zero) return;
-            string embedUrl = MOTDUI.ConvertToEmbedUrl(url);
+            string embedUrl = MOTDUI.ConvertToEmbedUrl(url, startOffsetSec);
             _lastLoadTime = Time.unscaledTime;
             _pendingItemId = itemId;
-            Plugin.Log("WorldScreen loading (id=" + itemId + "): " + embedUrl);
+            Plugin.Log("WorldScreen loading (id=" + itemId + ", t=" + startOffsetSec + "s): " + embedUrl);
             _CWebViewPlugin_LoadURL(_sharedWebView, embedUrl);
         }
 
@@ -362,6 +387,90 @@ namespace WebsiteMOTD
         // CallOnLoaded. Used by the videoEnded JS hook to tag its "ended" message
         // so the server can validate it against _current.Id before advancing.
         private static long _pendingItemId;
+
+        // ─── Drift correction ───────────────────────────────────────
+        // Server broadcasts a periodic "tick:<id>:<elapsedSec>" with the current
+        // item's authoritative elapsed time. On receipt we ask the WebView for
+        // its actual video.currentTime via EvaluateJS (the answer comes back on
+        // the message queue as "videoTime:<id>:<currentTime>:<playbackRate>"),
+        // then seek forward if the local position has fallen behind the server
+        // by more than DriftThresholdSec. We only ever seek FORWARD — if the
+        // local playback is ahead of the server (rare; usually means we got
+        // lucky with buffering while the server's _currentStartedAtUT was
+        // pessimistic), seeking backward would be more jarring than the drift.
+        private const float DriftThresholdSec = 5f;
+        private const double DriftSeekCooldownSec = 30.0;
+        private static long   _lastTickItemId;
+        private static int    _lastTickElapsedSec;
+        private static double _lastTickRxUT;
+        private static double _lastDriftSeekUT;
+
+        /// <summary>
+        /// Server heartbeat receiver: kick a drift check for the world-screen
+        /// WebView. The actual position read is async (EvaluateJS injects a
+        /// callback that lands on the message queue in <see cref="Update"/>),
+        /// so this method only records the latest server-reported position and
+        /// fires the query — the comparison happens in the message-loop branch
+        /// for "videoTime:".
+        ///
+        /// No-op when the WebView hasn't loaded the item the tick references —
+        /// the load is still in flight or we've already advanced past this item
+        /// locally (rare but possible if a state message lapped the tick).
+        /// </summary>
+        public static void HandleServerTick(long itemId, int elapsedSec)
+        {
+            if (_sharedWebView == IntPtr.Zero) return;
+            if (_pendingItemId != itemId) return;
+
+            _lastTickItemId = itemId;
+            _lastTickElapsedSec = elapsedSec;
+            _lastTickRxUT = Time.unscaledTimeAsDouble;
+
+            // Read currentTime and playbackRate; ad-fast-forward (rate>3) is
+            // checked downstream so we don't seek mid-ad. Limit the lookup to
+            // the main player container — hover-preview <video>s on YouTube's
+            // sidebar would otherwise dominate the picker.
+            _CWebViewPlugin_EvaluateJS(_sharedWebView,
+                "(function(){" +
+                "var mp=document.querySelector('#movie_player,.html5-video-player');" +
+                "var v=mp?mp.querySelector('video'):document.querySelector('video');" +
+                "if(!v||!isFinite(v.duration))return;" +
+                "if(window.Unity&&typeof window.Unity.call==='function')" +
+                "window.Unity.call('videoTime:" + itemId + ":'+v.currentTime+':'+v.playbackRate);" +
+                "})();");
+        }
+
+        /// <summary>
+        /// Apply drift correction once the WebView has reported its actual
+        /// playback position. Only seeks FORWARD when local lags server beyond
+        /// the threshold, throttled by <see cref="DriftSeekCooldownSec"/>.
+        /// </summary>
+        private static void TryCorrectDrift(long itemId, float localTime, float playbackRate)
+        {
+            if (_sharedWebView == IntPtr.Zero) return;
+            if (itemId != _lastTickItemId) return;
+            // AdBlock JS sets rate=16 to fast-forward ads — that's the signal
+            // we're not in the main video yet; don't seek into a future of an
+            // ad-stream that isn't ours.
+            if (playbackRate > 3f) return;
+
+            double serverNow = _lastTickElapsedSec + (Time.unscaledTimeAsDouble - _lastTickRxUT);
+            double drift = serverNow - localTime; // positive = local is behind
+            if (drift < DriftThresholdSec) return;
+            if (Time.unscaledTimeAsDouble - _lastDriftSeekUT < DriftSeekCooldownSec) return;
+
+            _lastDriftSeekUT = Time.unscaledTimeAsDouble;
+            // Tiny forward bias to account for the round-trip of the seek itself.
+            double targetSec = serverNow + 0.5;
+            Plugin.Log("Drift correction (item " + itemId + "): local=" + localTime.ToString("0.0")
+                + "s server=" + serverNow.ToString("0.0") + "s → seek " + targetSec.ToString("0.0") + "s");
+            _CWebViewPlugin_EvaluateJS(_sharedWebView,
+                "(function(){" +
+                "var mp=document.querySelector('#movie_player,.html5-video-player');" +
+                "var v=mp?mp.querySelector('video'):document.querySelector('video');" +
+                "if(v&&isFinite(v.duration)){try{v.currentTime=" + targetSec.ToString("0.00", CultureInfo.InvariantCulture) + ";}catch(e){}}" +
+                "})();");
+        }
 
         public static void DestroyScreens()
         {
@@ -378,6 +487,18 @@ namespace WebsiteMOTD
             // scene change. Drop the reference so the next SpawnScreens re-resolves.
             _cachedListener = null;
             _positionalMultiplier = 1f;
+
+            // Drop drift / load tracking state too. Without this, a plugin
+            // disable/enable cycle can leave _lastTickItemId pointing at an id
+            // from the previous session. Server-side _nextItemId restarts at 0
+            // on Teardown, so a future item could collide with the stale id and
+            // trigger a phantom drift seek immediately on load.
+            _pendingItemId       = 0;
+            _lastTickItemId      = 0;
+            _lastTickElapsedSec  = 0;
+            _lastTickRxUT        = 0d;
+            _lastDriftSeekUT     = 0d;
+            _lastLoadTime        = 0f;
         }
 
         // ─── Goal Finding ───────────────────────────────────────────
@@ -600,6 +721,22 @@ namespace WebsiteMOTD
                             if (long.TryParse(body.Substring(11), out long reportedId))
                                 Plugin.VideoEnded(reportedId);
                         }
+                        else if (body.StartsWith("videoTime:"))
+                        {
+                            // videoTime:<itemId>:<currentTime>:<playbackRate>
+                            // Async response to the HandleServerTick EvaluateJS;
+                            // routed into the drift-correction decision.
+                            var parts = body.Substring(10).Split(':');
+                            if (parts.Length >= 2
+                                && long.TryParse(parts[0], out long vId)
+                                && float.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out float vTime))
+                            {
+                                float rate = 1f;
+                                if (parts.Length >= 3)
+                                    float.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out rate);
+                                TryCorrectDrift(vId, vTime, rate);
+                            }
+                        }
                     }
                 }
 
@@ -618,7 +755,15 @@ namespace WebsiteMOTD
                 else
                     shouldRefresh = (Time.frameCount % IdleFrameInterval == 0);
 
+                // Real-time rate cap. Frame-count throttling doesn't help here
+                // because the rate it produces varies with Unity's FPS, while
+                // WebView2 paints at a fixed cadence (≈ vsync of its own DComp
+                // surface). Pin the capture rate so we don't outpace it.
+                if (shouldRefresh && Time.unscaledTime - _lastCaptureUT < MinCaptureIntervalSec)
+                    shouldRefresh = false;
+
                 _CWebViewPlugin_Update(_sharedWebView, shouldRefresh, 1);
+                if (shouldRefresh) _lastCaptureUT = Time.unscaledTime;
 
                 if (shouldRefresh)
                 {
@@ -841,13 +986,25 @@ namespace WebsiteMOTD
                 "if(location.hostname.indexOf('youtube.com')>=0){" +
                 "var s=document.createElement('style');" +
                 "s.textContent=" +
-                "'html,body{overflow:hidden!important;background:#000!important}'" +
+                "'html,body{overflow:hidden!important;background:#000!important;margin:0!important;padding:0!important}'" +
                 "+'#masthead-container,tp-yt-app-header-layout,ytd-mini-guide-renderer{display:none!important}'" +
                 "+'ytd-watch-flexy #secondary,#secondary{display:none!important}'" +
                 "+'ytd-watch-metadata,#below-the-fold,ytd-comments,ytd-item-section-renderer{display:none!important}'" +
-                "+'ytd-watch-flexy[is-two-columns_] #primary{max-width:100%!important}'" +
-                "+'#ytd-player,#movie_player{position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;max-height:none!important;z-index:9999!important}';" +
+                "+'ytd-watch-flexy[is-two-columns_] #primary{max-width:100%!important;margin:0!important;padding:0!important}'" +
+                "+'#ytd-player,#movie_player{position:fixed!important;top:0!important;left:0!important;width:100vw!important;height:100vh!important;max-height:none!important;z-index:9999!important}'" +
+                // The outer player only sizes the chrome — without forcing the inner
+                // container + video element, YouTube's aspect-ratio JS leaves the
+                // actual frame letterboxed inside a maximized player box. Force the
+                // container to fill, then absolute-position the <video> at 100%/100%
+                // with object-fit:contain so the picture itself stretches to the
+                // viewport (no inline transform/margin/top from YT's layout pass).
+                "+'#movie_player .html5-video-container{position:absolute!important;top:0!important;left:0!important;width:100%!important;height:100%!important;transform:none!important}'" +
+                "+'#movie_player video.html5-main-video,#movie_player .video-stream{position:absolute!important;top:0!important;left:0!important;width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;margin:0!important;transform:none!important;object-fit:contain!important}';" +
                 "(document.head||document.documentElement).appendChild(s);" +
+                // YouTube's resize handler reads the player rect on a ResizeObserver
+                // and rewrites the <video> inline style; nudge it once so the inline
+                // styles get cleared and our !important rules win on the first paint.
+                "try{window.dispatchEvent(new Event('resize'));}catch(_e){}" +
                 "}" +
                 // Event-listener based ended detection — fires before YouTube changes src.
                 // Message includes window.__motdItemId so the server can validate it's
@@ -856,12 +1013,36 @@ namespace WebsiteMOTD
                 "function notifyEnded(){" +
                 "var id=window.__motdItemId||0;" +
                 "if(id===0)return;" +
+                // Ad → main transition can fire 'ended' on the ad video; by the time
+                // this delayed notify runs, the main video is already playing in the
+                // same element. Recheck — but ONLY inside the main player container,
+                // because hover-preview loops on YouTube's recommended-videos rail are
+                // also <video> elements that report !paused && !ended, and would
+                // otherwise cause us to reset the guard and never notify the real end.
+                "var mp=document.querySelector('#movie_player, .html5-video-player');" +
+                "if(mp){" +
+                "var vids=mp.querySelectorAll('video');" +
+                "for(var i=0;i<vids.length;i++){" +
+                "var w=vids[i];" +
+                "if(w&&!w.paused&&!w.ended&&w.currentTime>0.5&&isFinite(w.duration)&&w.currentTime<w.duration-1){" +
+                "_sent=false;return;}}" +
+                "}" +
                 "if(window.Unity&&typeof window.Unity.call==='function')" +
                 "window.Unity.call('videoEnded:'+id);" +
                 "}" +
                 "function onEnded(e){" +
                 "var v=e.target;" +
-                "if(!v||v.duration<=5)return;" +
+                "if(!v||!isFinite(v.duration)||v.duration<=5)return;" +
+                // Our AdBlock JS sets playbackRate=16 to fast-forward ads. When the
+                // ad reaches its end, that elevated rate is still in effect — a clean
+                // signal that this 'ended' belongs to an ad we sped through, not the
+                // queued video the player actually wanted to watch.
+                "if(v.playbackRate>3)return;" +
+                // Fallback: YouTube ad markers on the player container catch ads
+                // that finished naturally (without the rate-bump) before the
+                // .ad-showing class was removed in the same tick.
+                "var p=v.closest&&v.closest('.html5-video-player');" +
+                "if(p&&(p.classList.contains('ad-showing')||p.classList.contains('ad-interrupting')))return;" +
                 "if(document.querySelector('.ad-showing'))return;" +
                 "if(_sent)return;" +
                 "_sent=true;" +

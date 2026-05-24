@@ -11,3 +11,8 @@ obj/
 *.tmp
 *.swp
 *.claude
+# uBlock Origin (and any other bundled browser extension) is downloaded on
+# demand via native/fetch-ublock.ps1 — committing the unpacked extension would
+# bloat the repo (~5MB) and pin a stale version. End users run the script
+# post-clone to pull the latest release.
+native/x64/extensions/

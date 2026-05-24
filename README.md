@@ -16,6 +16,7 @@ bar, a trusted-sites prompt, and WebView2-backed rendering for JS-heavy pages.
   - [MOTDWorldScreen.cs](src/MOTDWorldScreen.cs) — the 3D in-world screens that play whatever the queue is showing.
 - **[libs/](libs/)** — Puck game DLLs referenced at build time (not copied into the output).
 - **[native/](native/)** — WebView2 native binaries, copied next to the built DLL.
+- **[native/fetch-ublock.ps1](native/fetch-ublock.ps1)** — one-shot helper to grab the latest uBlock Origin chromium build into `native/x64/extensions/ublock0/` so the mod loads it as a real WebView2 extension (see _Ad-block_ below).
 - **[MOTD.csproj](MOTD.csproj)** — SDK-style project. Output drops directly into `Puck/Plugins/WebsiteMOTD/`.
 
 ## Build
@@ -102,6 +103,29 @@ The old files are left on disk so you can downgrade without losing data.
 - Vote-skip threshold is majority of connected clients (including the server).
 - Items are rejected if the host isn't on `queue_allowed_sites`; the requester gets a chat message listing the permitted domains.
 - Disconnecting clients have their queued items and votes cleaned up automatically; if the owner of the currently playing item leaves, the queue advances.
+
+## Ad-block (uBlock Origin)
+
+The overlay's WebView2 instance supports loading Chromium browser extensions via `ICoreWebView2Profile7::AddBrowserExtensionAsync` (WebView2 runtime ≥ Edge 119, June 2024). The mod auto-detects any unpacked extensions under `native/x64/extensions/<name>/` and loads them once per process into the shared profile.
+
+To install uBlock Origin:
+
+```
+pwsh native/fetch-ublock.ps1
+```
+
+The script pulls the latest `uBlock0_*.chromium.zip` from [gorhill/uBlock](https://github.com/gorhill/uBlock) releases and unpacks the contents (including `manifest.json`) into `native/x64/extensions/ublock0/`. On next mod load you should see:
+
+```
+[WebsiteMOTD] Loading browser extension: ...\native\x64\extensions\ublock0
+[WebsiteMOTD] Browser extension loaded: cjpalhdlnbpafiamejdnhcphjbkeiagm
+```
+
+Extensions are profile-bound: once installed, they persist in `%LOCALAPPDATA%\UnityWebView2`, so subsequent runs are idempotent (no re-install on every launch). Removing the folder + re-running the script upgrades to the latest uBlock release.
+
+If you see `ExtensionError:no-icorewebview2profile7`, the user's WebView2 runtime is too old — they need a Windows Update or to install the [Evergreen Standalone runtime](https://developer.microsoft.com/microsoft-edge/webview2/). The mod degrades gracefully without uBlock: the legacy JS ad-block (YouTube CSS selectors, skip-button click) still runs.
+
+Other ad-block extensions (AdBlock, Adblock Plus, etc.) work the same way — drop their unpacked Chromium folder into `native/x64/extensions/<whatever>/` and they'll be picked up. The mod loads every subfolder that contains a `manifest.json`.
 
 ## Companion website
 

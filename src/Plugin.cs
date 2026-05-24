@@ -39,7 +39,7 @@ namespace WebsiteMOTD
     public class Plugin : IPuckPlugin
     {
         public static string MOD_NAME = "WebsiteMOTD";
-        public static string MOD_VERSION = "1.0.1";
+        public static string MOD_VERSION = "1.1.0";
 
         private Harmony _harmony;
 
@@ -624,6 +624,58 @@ namespace WebsiteMOTD
         }
 
         /// <summary>
+        /// Admin-only force-skip: server admins (per Puck's AdminLevel) can
+        /// advance the queue past any item without votes or owner consent.
+        /// Same id-validation pattern as owner-veto so a stale fskip doesn't
+        /// drop a different item that advanced during the round-trip.
+        /// No-op when the local player isn't an admin — UI hides the button
+        /// in that case too, but the server enforces independently.
+        /// </summary>
+        public static void AdminForceSkip()
+        {
+            if (_current == null) return;
+            long targetId = _current.Id;
+
+            var nm = NetworkManager.Singleton;
+            if (nm?.CustomMessagingManager == null) return;
+            if (!IsLocalClientAdmin()) return;
+
+            if (nm.IsServer)
+                ServerAdminForceSkip(nm.LocalClientId, targetId);
+            else
+                SendScreenMsg("fskip:" + targetId);
+        }
+
+        /// <summary>True if the local player has Puck admin (AdminLevel &gt; 0).</summary>
+        public static bool IsLocalClientAdmin()
+        {
+            try
+            {
+                var nm = NetworkManager.Singleton;
+                if (nm == null) return false;
+                return IsClientAdmin(nm.LocalClientId);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Resolve a connected client's admin status via PlayerManager. Reads the
+        /// AdminLevel NetworkVariable which is server-authoritative and synced
+        /// to all clients, so this returns the right answer on both sides.
+        /// </summary>
+        private static bool IsClientAdmin(ulong clientId)
+        {
+            try
+            {
+                var pm = MonoBehaviourSingleton<PlayerManager>.Instance;
+                var player = pm?.GetPlayerByClientId(clientId);
+                if (player == null) return false;
+                return player.AdminLevel.Value > 0;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
         /// Remove one of your queued items by its server-assigned id (see
         /// <see cref="QueueItem.Id"/>). Id is stable across the item's lifetime,
         /// so this targets the right item even if the queue has shifted between
@@ -791,7 +843,8 @@ namespace WebsiteMOTD
                     // ServerAddItem so the URL-length / allowlist checks still get
                     // to surface their err: feedback to legitimate users.
                     if ((msg.StartsWith("vote:") || msg.StartsWith("veto:")
-                         || msg.StartsWith("remove:") || msg.StartsWith("ended:"))
+                         || msg.StartsWith("remove:") || msg.StartsWith("ended:")
+                         || msg.StartsWith("fskip:"))
                         && !ServerAllowAction(senderClientId))
                         return;
 
@@ -839,6 +892,11 @@ namespace WebsiteMOTD
                     {
                         if (long.TryParse(msg.Substring(5), out long vetoId))
                             ServerOwnerVeto(senderClientId, vetoId);
+                    }
+                    else if (msg.StartsWith("fskip:"))
+                    {
+                        if (long.TryParse(msg.Substring(6), out long fskipId))
+                            ServerAdminForceSkip(senderClientId, fskipId);
                     }
                     else if (msg.StartsWith("ended:"))
                     {
@@ -1063,6 +1121,26 @@ namespace WebsiteMOTD
             if (_current.Id != targetItemId) return;     // stale — drop
             if (_current.ClientId != clientId) return;   // not the owner — drop
             Log("Owner " + clientId + " vetoed their own queued item — advancing.");
+            ServerPlayNext();
+        }
+
+        /// <summary>
+        /// Admin-only force-skip on the server side. Bypasses both the owner check
+        /// and the vote threshold. Validates that the sender is actually an admin
+        /// (we don't trust the message itself — a non-admin client could send the
+        /// fskip wire format and we'd refuse) and that the item id matches what
+        /// the admin clicked on.
+        /// </summary>
+        private static void ServerAdminForceSkip(ulong clientId, long targetItemId)
+        {
+            if (_current == null) return;
+            if (_current.Id != targetItemId) return;     // stale — drop
+            if (!IsClientAdmin(clientId))
+            {
+                SendQueueError(clientId, "Force-skip requires admin.");
+                return;
+            }
+            Log("Admin " + clientId + " force-skipped item " + targetItemId + " — advancing.");
             ServerPlayNext();
         }
 
@@ -1603,6 +1681,27 @@ namespace WebsiteMOTD
                 {
                     Plugin.AddToQueue(arg);
                 }
+                return false;
+            }
+
+            if (cmd == "/fskip" || cmd == "/forceskip")
+            {
+                // Admin-only. Server enforces the admin check regardless of what
+                // the client sends, so this is just a friendlier UX path than
+                // hunting for the button. Surfaces a chat hint when used by a
+                // non-admin or with nothing currently queued so they know why
+                // nothing happened (silent no-ops on chat commands are confusing).
+                if (!Plugin.IsLocalClientAdmin())
+                {
+                    Plugin.LocalChat("Force-skip requires admin.");
+                    return false;
+                }
+                if (Plugin.Current == null)
+                {
+                    Plugin.LocalChat("Nothing is currently playing.");
+                    return false;
+                }
+                Plugin.AdminForceSkip();
                 return false;
             }
 

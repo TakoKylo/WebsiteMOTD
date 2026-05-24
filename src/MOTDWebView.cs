@@ -55,6 +55,8 @@ namespace WebsiteMOTD
         private static extern void _CWebViewPlugin_EvaluateJS(IntPtr instance, string js);
         [DllImport("WebView")]
         private static extern void _CWebViewPlugin_AddScriptOnLoad(IntPtr instance, string js);
+        [DllImport("WebView", CharSet = CharSet.Ansi)]
+        private static extern void _CWebViewPlugin_LoadExtension(IntPtr instance, string extensionFolderPath);
         [DllImport("WebView")]
         private static extern int _CWebViewPlugin_Progress(IntPtr instance);
         [DllImport("WebView")]
@@ -109,6 +111,12 @@ namespace WebsiteMOTD
         private static bool _preloadAttempted;   // prevents repeated probe + log spam after a failed load
         private static bool _staticInitDone;
         private static bool _bitmapGenSupported = true;
+        // Browser extensions are profile-bound (single LOCALAPPDATA\UnityWebView2 dir
+        // shared across all WebView instances), so we only need to call
+        // AddBrowserExtensionAsync once per process. Tracking the attempt rather
+        // than the success keeps the runtime's idempotent "already installed"
+        // result from re-emitting an ExtensionLoaded log on every spawn.
+        private static bool _extensionLoadAttempted;
 
         /// <summary>
         /// The native WebView plugin (WebView2) is Windows-only. On Linux/macOS
@@ -134,6 +142,77 @@ namespace WebsiteMOTD
             bool isDX11 = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Direct3D11;
             _CWebViewPlugin_InitStatic(false, isDX11);
             _staticInitDone = true;
+        }
+
+        /// <summary>
+        /// Try to load a bundled browser extension into the given WebView's profile.
+        /// First call per process actually dispatches; subsequent calls are no-ops
+        /// because the extension persists profile-wide and we don't want repeated
+        /// log noise. The extension folder is resolved relative to the mod DLL:
+        /// <c>native/x64/extensions/&lt;subfolder&gt;</c>. Returns true if a load was
+        /// attempted, false if no extension folder was found (degrades gracefully
+        /// — the JS-only ad-block still runs).
+        ///
+        /// We pick the first subfolder of <c>extensions/</c> that contains a
+        /// <c>manifest.json</c>. Lets the user drop in either an unpacked uBlock
+        /// build (uBlock0.chromium) or any other extension without code changes.
+        /// </summary>
+        public static bool TryLoadBundledExtensions(MOTDWebView wv)
+        {
+            if (wv == null || wv._webView == IntPtr.Zero) return false;
+            return TryLoadBundledExtensions(wv._webView);
+        }
+
+        /// <summary>
+        /// IntPtr overload for callers that hold a raw native instance pointer
+        /// (e.g. MOTDWorldScreen, which uses its own DllImports rather than the
+        /// MOTDWebView wrapper). Same once-per-process gating.
+        /// </summary>
+        public static bool TryLoadBundledExtensions(IntPtr instance)
+        {
+            if (instance == IntPtr.Zero) return false;
+            if (_extensionLoadAttempted) return false;
+            _extensionLoadAttempted = true;
+
+            try
+            {
+                string dllDir = Path.GetDirectoryName(typeof(MOTDWebView).Assembly.Location) ?? "";
+                string extRoot = Path.Combine(dllDir, "native", "x64", "extensions");
+                if (!Directory.Exists(extRoot))
+                {
+                    Plugin.Log("No extensions directory at " + extRoot + " — ad-block stays in JS-only mode.");
+                    return false;
+                }
+
+                int loaded = 0;
+                foreach (string subdir in Directory.GetDirectories(extRoot))
+                {
+                    if (!File.Exists(Path.Combine(subdir, "manifest.json"))) continue;
+                    Plugin.Log("Loading browser extension: " + subdir);
+                    if (!_loadExtensionSupported) break;
+                    try { _CWebViewPlugin_LoadExtension(instance, subdir); }
+                    catch (EntryPointNotFoundException)
+                    {
+                        _loadExtensionSupported = false;
+                        Plugin.LogError("WebView.dll is older than the C# mod — _CWebViewPlugin_LoadExtension missing. Falling back to JS-only ad-block; rebuild the native plugin to enable uBlock Origin.");
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        Plugin.LogError("LoadExtension threw: " + ex.Message);
+                        break;
+                    }
+                    loaded++;
+                }
+                if (loaded == 0)
+                    Plugin.Log("Extensions directory exists but contains no manifest.json subfolders: " + extRoot);
+                return loaded > 0;
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("TryLoadBundledExtensions failed: " + ex.Message);
+                return false;
+            }
         }
 
         public Texture2D Texture => _texture;
@@ -306,18 +385,42 @@ namespace WebsiteMOTD
             _hasFocus = false;
         }
 
-        private (int x, int y) ToWebViewCoords(Vector2 localPos)
+        /// <summary>
+        /// Map a panel-space pointer position to WebView2 viewport pixels.
+        ///
+        /// Reference rect is <see cref="VisualElement.worldBound"/> — the actually
+        /// rendered rect in panel space — rather than <c>resolvedStyle.width</c>,
+        /// which can disagree with the visible rect when ancestors apply transforms.
+        /// X drift that scaled with the cursor's horizontal position came from
+        /// that mismatch.
+        ///
+        /// Y needs an explicit flip here. <c>panelPos.y - wb.yMin</c> gives the
+        /// distance from the visual TOP of the element (top-down), but the native
+        /// plugin's <c>winY = rectHeight - 1 - data->y</c> step assumes the
+        /// incoming Y is bottom-up. Send the inverted ratio so the two flips line
+        /// up: user clicks visual top → data->y ≈ rectHeight → native flips to 0
+        /// → WebView2 mouse at the top of its bitmap → that bitmap row is rendered
+        /// at the visual top thanks to the element's <c>scaleY(-1)</c>. The old
+        /// <c>evt.localPosition</c>-based code got the right answer because UI
+        /// Toolkit's local position is in pre-transform space (visual top mapped
+        /// to layout bottom for this element); we're choosing panel-space for
+        /// transform robustness, which means we do the flip explicitly.
+        /// </summary>
+        private (int x, int y) ToWebViewCoords(Vector2 panelPos)
         {
-            float elW = _targetElement.resolvedStyle.width;
-            float elH = _targetElement.resolvedStyle.height;
-            if (elW <= 0) elW = _viewWidth;
-            if (elH <= 0) elH = _viewHeight;
+            Rect wb = _targetElement.worldBound;
+            float elW = wb.width;
+            float elH = wb.height;
+            if (elW <= 0f || float.IsNaN(elW)) elW = _viewWidth;
+            if (elH <= 0f || float.IsNaN(elH)) elH = _viewHeight;
 
-            // localPosition is pre-transform (before scaleY(-1)), so y=0 is layout top.
-            // WebView2 DLL expects y=0 at bottom (matching Unity screen coords).
-            // With scaleY(-1), layout y=0 IS the visual bottom = WebView y=0, so map directly.
-            int x = Mathf.Clamp((int)(localPos.x / elW * _viewWidth), 0, _viewWidth);
-            int y = Mathf.Clamp((int)(localPos.y / elH * _viewHeight), 0, _viewHeight);
+            float localX = panelPos.x - wb.xMin;
+            float localY = panelPos.y - wb.yMin;
+
+            int x = Mathf.Clamp((int)(localX / elW * _viewWidth), 0, _viewWidth);
+            // Flip Y so the native plugin's own flip lands the cursor at the
+            // visual position the user clicked. See remarks above.
+            int y = Mathf.Clamp((int)((1f - localY / elH) * _viewHeight), 0, _viewHeight);
             return (x, y);
         }
 
@@ -327,7 +430,7 @@ namespace WebsiteMOTD
             _hasFocus = true;
             _lastInteractTime = Time.unscaledTime;
             _targetElement.Focus();
-            var (x, y) = ToWebViewCoords(evt.localPosition);
+            var (x, y) = ToWebViewCoords(evt.position);
             _CWebViewPlugin_SendMouseEvent(_webView, x, y, 0f, 1); // 1 = down
             _targetElement.CapturePointer(evt.pointerId);
             evt.StopPropagation();
@@ -337,7 +440,7 @@ namespace WebsiteMOTD
         {
             if (_webView == IntPtr.Zero) return;
             _lastInteractTime = Time.unscaledTime;
-            var (x, y) = ToWebViewCoords(evt.localPosition);
+            var (x, y) = ToWebViewCoords(evt.position);
             int state = _targetElement.HasPointerCapture(evt.pointerId) ? 2 : 0; // 2 = drag, 0 = move
             _CWebViewPlugin_SendMouseEvent(_webView, x, y, 0f, state);
         }
@@ -345,7 +448,7 @@ namespace WebsiteMOTD
         private void OnPointerUp(PointerUpEvent evt)
         {
             if (_webView == IntPtr.Zero) return;
-            var (x, y) = ToWebViewCoords(evt.localPosition);
+            var (x, y) = ToWebViewCoords(evt.position);
             _CWebViewPlugin_SendMouseEvent(_webView, x, y, 0f, 3); // 3 = up
             if (_targetElement.HasPointerCapture(evt.pointerId))
                 _targetElement.ReleasePointer(evt.pointerId);
@@ -356,7 +459,12 @@ namespace WebsiteMOTD
         {
             if (_webView == IntPtr.Zero || !_hasFocus) return;
             _lastInteractTime = Time.unscaledTime;
-            var (x, y) = ToWebViewCoords(evt.localMousePosition);
+            // WheelEvent doesn't expose a panel-space "position" field on every
+            // Unity version, so reconstruct it from the element's worldBound +
+            // the wheel event's element-local position.
+            Rect wb = _targetElement.worldBound;
+            Vector2 panelPos = new Vector2(wb.xMin + evt.localMousePosition.x, wb.yMin + evt.localMousePosition.y);
+            var (x, y) = ToWebViewCoords(panelPos);
             _CWebViewPlugin_SendMouseEvent(_webView, x, y, -evt.delta.y, 0);
             evt.StopPropagation();
         }
@@ -444,6 +552,37 @@ namespace WebsiteMOTD
         }
         private static bool _addScriptOnLoadSupported = true;
 
+        /// <summary>
+        /// Load an unpacked Chromium extension (e.g. uBlock Origin) into this
+        /// WebView's profile. <paramref name="extensionFolderPath"/> must be an
+        /// absolute path to a directory containing a manifest.json.
+        ///
+        /// Extensions are profile-bound and persist in the user data folder, so
+        /// the call is idempotent across sessions — the runtime re-resolves the
+        /// install by id. Result is reported asynchronously through the normal
+        /// message queue as <c>ExtensionLoaded:&lt;id&gt;</c> or
+        /// <c>ExtensionError:&lt;reason&gt;</c>; see <see cref="Update"/>.
+        ///
+        /// Gracefully degrades to a no-op on native plugins that don't export
+        /// the symbol — older DLLs simply leave ad-block in JS-only mode.
+        /// </summary>
+        public void LoadExtension(string extensionFolderPath)
+        {
+            if (_webView == IntPtr.Zero || string.IsNullOrEmpty(extensionFolderPath)) return;
+            if (!_loadExtensionSupported) return;
+            try { _CWebViewPlugin_LoadExtension(_webView, extensionFolderPath); }
+            catch (EntryPointNotFoundException)
+            {
+                _loadExtensionSupported = false;
+                Plugin.LogError("WebView.dll is older than the C# mod — _CWebViewPlugin_LoadExtension missing. Falling back to JS-only ad-block; rebuild the native plugin to enable uBlock Origin.");
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("LoadExtension threw: " + ex.Message);
+            }
+        }
+        private static bool _loadExtensionSupported = true;
+
         public void GoBack()
         {
             if (_webView == IntPtr.Zero) return;
@@ -484,13 +623,15 @@ namespace WebsiteMOTD
         private const int   StaticChecksForIdle = 30;     // ~0.5s @ 60fps of no change → throttle
         private const int   IdleFrameInterval = 8;        // ~7.5fps when truly idle
         private const int   NoBitmapGenFrameInterval = 6; // ~10fps when DLL lacks BitmapGeneration export
-        // Real-time cap on bitmap captures: on a 144 Hz Unity loop, asking the
-        // WebView to capture every frame produces ~144 capture requests/sec for
-        // content that paints at 30–60 fps. The BitmapGeneration gate skips the
-        // texture upload when nothing changed, but the capture itself still has
-        // a cost that competes with the Unity render thread; pinning the rate
-        // here is what smooths the overlay on high-refresh monitors.
-        private const float MinCaptureIntervalSec = 1f / 60f;
+        // Real-time cap on bitmap captures. The BitmapGeneration gate skips
+        // texture uploads when nothing changed, so the cap is purely about how
+        // often we ASK the WebView for a new frame — too high and the STA
+        // thread is overloaded; too low and high-refresh monitors see judder
+        // because we sample below the page's actual paint rate. 120Hz is the
+        // sweet spot for modern monitors: a 144Hz refresh sees a fresh capture
+        // every ~1.2 frames, video playback looks smooth, and the STA thread
+        // still has 8ms of headroom per capture cycle.
+        private const float MinCaptureIntervalSec = 1f / 120f;
 
         private int _consecutiveStaticChecks;
         private float _lastCaptureUT;
@@ -524,6 +665,16 @@ namespace WebsiteMOTD
                         _lastInteractTime = Time.unscaledTime;
                         _consecutiveStaticChecks = 0;
                         _onStarted?.Invoke(body);
+                        break;
+                    // Async results from LoadExtension. Logged for visibility; no
+                    // gameplay reaction is required — the extension either started
+                    // filtering or didn't, and a JS fallback covers the latter.
+                    case "ExtensionLoaded":
+                        Plugin.Log("Browser extension loaded: " + body);
+                        break;
+                    case "ExtensionError":
+                        Plugin.LogError("Browser extension load failed: " + body
+                            + " (ad-block falling back to JS-only; check that uBlock files are present and WebView2 runtime is recent enough).");
                         break;
                 }
             }

@@ -64,14 +64,14 @@ namespace WebsiteMOTD
         private const int   StaticChecksForIdle = 30;    // ~0.5s @ 60fps of no change → throttle
         private const int   IdleFrameInterval = 8;       // ~7.5fps when truly idle
         private const int   NoBitmapGenFrameInterval = 4; // fallback when DLL lacks BitmapGeneration
-        // Cap active-mode bitmap captures to ~60 Hz regardless of Unity frame rate.
-        // Without this, a 144 Hz Unity loop asks the WebView to capture 144 times/sec
-        // for content that only repaints at 30–60 fps — wasted native work and
-        // texture upload churn that competes with the Unity render thread. The
-        // BitmapGeneration check skips the upload when nothing changed, but the
-        // *capture request itself* still costs; capping the request rate is what
-        // smooths out the choppiness players reported on high-refresh monitors.
-        private const float MinCaptureIntervalSec = 1f / 60f;
+        // Cap active-mode bitmap captures. The BitmapGeneration check gates
+        // texture uploads, so the cap controls only how often we ASK for a
+        // fresh frame. 60Hz was visibly judder-y on 120/144Hz monitors during
+        // video playback: a 60Hz sample of 60Hz content drops frames whenever
+        // sample alignment slips. 120Hz keeps the screens smooth on common
+        // high-refresh setups while still leaving headroom on the STA thread
+        // (each capture cycle gets ~8ms before the next request).
+        private const float MinCaptureIntervalSec = 1f / 120f;
         private static int  _consecutiveStaticChecks;
         private static float _lastCaptureUT;
 
@@ -661,6 +661,11 @@ namespace WebsiteMOTD
             {
                 Plugin.LogError("WorldScreen: AddScriptOnLoad threw: " + ex.Message);
             }
+
+            // Load bundled extensions (e.g. uBlock Origin) into the shared
+            // profile. Profile-bound + once-per-process, so this is a no-op
+            // when the overlay WebView already triggered the load.
+            MOTDWebView.TryLoadBundledExtensions(_sharedWebView);
         }
 
         private static void DestroySharedWebView()
@@ -701,6 +706,17 @@ namespace WebsiteMOTD
                 {
                     string msg = _CWebViewPlugin_GetMessage(_sharedWebView);
                     if (msg == null) break;
+                    if (msg.StartsWith("ExtensionLoaded:"))
+                    {
+                        Plugin.Log("WorldScreen browser extension loaded: " + msg.Substring(16));
+                        continue;
+                    }
+                    if (msg.StartsWith("ExtensionError:"))
+                    {
+                        Plugin.LogError("WorldScreen browser extension load failed: " + msg.Substring(15)
+                            + " (ad-block falling back to JS-only).");
+                        continue;
+                    }
                     if (msg.StartsWith("CallOnLoaded:"))
                     {
                         _lastLoadTime = Time.unscaledTime;
@@ -1005,6 +1021,31 @@ namespace WebsiteMOTD
                 // and rewrites the <video> inline style; nudge it once so the inline
                 // styles get cleared and our !important rules win on the first paint.
                 "try{window.dispatchEvent(new Event('resize'));}catch(_e){}" +
+                // Kill autoplay-next on the world-screen WebView too. Without this,
+                // when a queued video ends YouTube auto-rolls into a recommendation
+                // and our notifyEnded check ("any video still playing?" → bail)
+                // never fires, so the server's queue stalls until the per-item
+                // deadline. See MOTDUI.InjectMediaHelperJS for the full rationale
+                // (defensive aria-label check, observer auto-disconnect).
+                "var _ytObs=null,_ytKilled=false;" +
+                "function killYtAutoplay(){" +
+                "if(_ytKilled)return;" +
+                "try{var t=document.querySelector('.ytp-autonav-toggle-button');" +
+                "if(!t)return;" +
+                "var label=(t.getAttribute('aria-label')||'').toLowerCase();" +
+                "if(label.indexOf('autoplay')===-1)return;" +
+                "if(t.getAttribute('aria-checked')==='true'){try{t.click();}catch(_e){}}" +
+                "_ytKilled=true;" +
+                "if(_ytObs){_ytObs.disconnect();_ytObs=null;}" +
+                "}catch(_e){}" +
+                "}" +
+                "setTimeout(killYtAutoplay,800);" +
+                "setTimeout(killYtAutoplay,2500);" +
+                "setTimeout(killYtAutoplay,5000);" +
+                "try{_ytObs=new MutationObserver(killYtAutoplay);" +
+                "_ytObs.observe(document.body||document.documentElement,{childList:true,subtree:true});" +
+                "setTimeout(function(){if(_ytObs){_ytObs.disconnect();_ytObs=null;}},30000);" +
+                "}catch(_e){}" +
                 "}" +
                 // Event-listener based ended detection — fires before YouTube changes src.
                 // Message includes window.__motdItemId so the server can validate it's

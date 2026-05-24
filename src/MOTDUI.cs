@@ -61,7 +61,10 @@ namespace WebsiteMOTD
         private static Label _queueErrorLabel;
         private static IVisualElementScheduledItem _queueErrorHide;
         private static bool _queueEventSubscribed;
-        private static bool _queueExpanded; // persists across Show/Hide calls
+        // Default expanded so the vote-skip / now-playing controls are visible the
+        // first time the overlay opens. Persists across Show/Hide once the user
+        // collapses it, but a fresh session starts with the panel open.
+        private static bool _queueExpanded = true;
 
         // ── Audio / screen controls (client-side only) ──
         private static float _globalVolume = 0.5f;
@@ -1253,6 +1256,12 @@ namespace WebsiteMOTD
             // the native NavigationStarting/Completed events miss.
             _webView?.AddScriptOnLoad(NavTrackerJS);
 
+            // Try to load any bundled extension (uBlock Origin) into the shared
+            // profile. Profile-bound + idempotent, so this is a no-op on the
+            // second/subsequent WebView spawn. Logs result via the message queue.
+            if (_webView != null)
+                MOTDWebView.TryLoadBundledExtensions(_webView);
+
             return _webView != null;
         }
 
@@ -1590,6 +1599,47 @@ namespace WebsiteMOTD
                 "(function(){" +
                 "if(window.__motdMedia)return;" +
                 "window.__motdMedia=true;" +
+                // YouTube autoplay-next killer. The autoplay-toggle button in the
+                // player chrome controls whether the next recommended video plays
+                // when the current one ends. If it's ON, YouTube swaps the player
+                // src to the next video within ~1s of 'ended' firing, and our
+                // delayed notifyEnded check below incorrectly bails (it sees a
+                // video "still playing" and assumes ad→main transition). Click
+                // the toggle off as soon as we can find it; the preference then
+                // persists via YouTube's PREF cookie, so we don't have to keep
+                // watching.
+                //
+                // Selector + aria-label safety: YouTube periodically renames its
+                // class names, so we verify the matched element's aria-label
+                // mentions "autoplay" before clicking. Avoids us hitting an
+                // unrelated button if .ytp-autonav-toggle-button gets reused for
+                // something else in a future YT release.
+                //
+                // Observer auto-disconnects: once we've successfully toggled the
+                // button, or after 30s (player chrome is loaded by then in every
+                // case I've seen), we stop watching. Without this, we'd run a
+                // querySelector on every DOM mutation forever — YouTube mutates
+                // the DOM dozens of times per second during playback, so the
+                // ambient cost is non-trivial.
+                "var _ytObs=null,_ytKilled=false;" +
+                "function killYtAutoplay(){" +
+                "if(_ytKilled)return;" +
+                "try{var t=document.querySelector('.ytp-autonav-toggle-button');" +
+                "if(!t)return;" +
+                "var label=(t.getAttribute('aria-label')||'').toLowerCase();" +
+                "if(label.indexOf('autoplay')===-1)return;" + // wrong button — bail
+                "if(t.getAttribute('aria-checked')==='true'){try{t.click();}catch(_e){}}" +
+                "_ytKilled=true;" +
+                "if(_ytObs){_ytObs.disconnect();_ytObs=null;}" +
+                "}catch(_e){}" +
+                "}" +
+                "setTimeout(killYtAutoplay,800);" +
+                "setTimeout(killYtAutoplay,2500);" +
+                "setTimeout(killYtAutoplay,5000);" +
+                "try{_ytObs=new MutationObserver(killYtAutoplay);" +
+                "_ytObs.observe(document.body||document.documentElement,{childList:true,subtree:true});" +
+                "setTimeout(function(){if(_ytObs){_ytObs.disconnect();_ytObs=null;}},30000);" +
+                "}catch(_e){}" +
                 "var _sent=false;" +
                 "function notifyEnded(){" +
                 "var id=window.__motdItemId||0;" +
@@ -3240,6 +3290,25 @@ namespace WebsiteMOTD
                         Plugin.HasLocalVotedSkip());
                 }
                 _queueNowPlayingBox.Add(_voteSkipBtn);
+
+                // Admin force-skip — always visible to admins regardless of
+                // ownership, so the same admin can drop someone else's video
+                // (e.g. inappropriate content, broken stream) without rounding
+                // up votes. Server validates the admin status independently.
+                // Height 28 (not 26) so the 12pt bold label sits cleanly inside
+                // the button's 7px top/bottom padding without clipping the
+                // line-height on Unity's UI Toolkit text renderer.
+                if (Plugin.IsLocalClientAdmin())
+                {
+                    var fSkip = CreateStyledButton(
+                        "Force Skip (admin)",
+                        new Color(0.55f, 0.18f, 0.18f),
+                        Plugin.AdminForceSkip);
+                    fSkip.style.height = 28f;
+                    fSkip.style.marginTop = 6f;
+                    fSkip.style.fontSize = 12f;
+                    _queueNowPlayingBox.Add(fSkip);
+                }
             }
 
             // ── Queue list ──

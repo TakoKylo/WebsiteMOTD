@@ -39,7 +39,7 @@ namespace WebsiteMOTD
     public class Plugin : IPuckPlugin
     {
         public static string MOD_NAME = "WebsiteMOTD";
-        public static string MOD_VERSION = "1.1.0";
+        public static string MOD_VERSION = "1.1.1";
 
         private Harmony _harmony;
 
@@ -1218,15 +1218,24 @@ namespace WebsiteMOTD
                 // Normal path: spawn our own A/B screens.
                 MOTDWorldScreen.SpawnScreens();
             }
-            else if (hasTheatre)
+            else if (hasTheatre || TheatreVideoScreenBridge.ApiPresent)
             {
-                // Server disabled level screens, but the theatre screen is claimed —
-                // run a headless driver so the WebView still pumps content to it.
+                // Server disabled level screens, but EITHER the theatre is
+                // already claimed OR OWP is installed (theatre not yet attached
+                // but could become available later when the player enters open
+                // world). Spawn a headless driver so:
+                //   1. The WebView is ready to pump content to the theatre.
+                //   2. The driver's per-frame Update keeps polling the OWP
+                //      bridge for a claim. OWP doesn't fire ClaimChanged on
+                //      its FIRST attach when there's no surviving claim
+                //      (see TheatreVideoScreen.AttachToFound), so the
+                //      polling is the only signal we get that the screen
+                //      became available.
                 MOTDWorldScreen.EnsureDriver();
             }
             else
             {
-                // No regular screens, no theatre claim — nothing to do.
+                // No regular screens, no theatre, no OWP at all — nothing to do.
                 return;
             }
 

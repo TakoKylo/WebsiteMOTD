@@ -690,6 +690,13 @@ namespace WebsiteMOTD
 
         // ─── Per-frame update ───────────────────────────────────────
 
+        // How often to retry the OpenWorld theatre claim when we don't currently
+        // hold it. OWP's ClaimChanged event isn't fired on the *initial* theatre
+        // spawn (per its contract — only on re-creations), so a player who joins
+        // a regular hockey lobby and later enters open-world otherwise never gets
+        // notified. Cheap reflective call; one probe per second is free.
+        private const int TheatreReclaimFrameInterval = 60;
+
         void Update()
         {
             // Only the primary screen drives the shared webview
@@ -699,6 +706,18 @@ namespace WebsiteMOTD
                 // bombard the WebView with EvaluateJS calls every frame.
                 if (Time.frameCount % ProxUpdateFrameInterval == 0)
                     UpdatePositionalVolume();
+
+                // Late-spawn theatre catcher: if we don't currently hold the
+                // OWP theatre claim (either OWP hasn't spawned it yet, or we
+                // missed the ClaimChanged event), retry once a second. Stops
+                // automatically as soon as the claim succeeds — the
+                // _theatreScreen check skips the work after that.
+                if (_theatreScreen == null
+                    && TheatreVideoScreenBridge.ApiPresent
+                    && Time.frameCount % TheatreReclaimFrameInterval == 0)
+                {
+                    EnsureTheatreClaim();
+                }
 
 
                 // Pump message queue (always, even when not refreshing bitmap)

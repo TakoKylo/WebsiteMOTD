@@ -3270,17 +3270,21 @@ namespace WebsiteMOTD
                 // (single-click button). Everyone else gets a progress-bar vote-skip:
                 // a clickable track whose fill = current votes / threshold, so you can
                 // see the tally fill up as players vote without needing to read text.
+                //
+                // Sizing rule: explicit pixel height + flexShrink=0. The previous
+                // implementation used flexGrow=1, which Yoga can resolve to zero
+                // when the column parent has already laid itself out around earlier
+                // content (the bug that ate the vote-skip bar). flexShrink=0 keeps
+                // the child at its requested size regardless of what the parent's
+                // remaining-space algorithm decides.
                 if (Plugin.IsLocalOwnerOfCurrent())
                 {
                     _voteSkipBtn = CreateStyledButton(
                         "Skip (your video)",
                         new Color(0.6f, 0.35f, 0.2f),
                         Plugin.OwnerVetoCurrent);
-                    // Matches the progress-bar height below and the Add/Use buttons
-                    // further down the panel. 28 was too short for the bold label
-                    // to read; 36 (the earlier attempt) was visually oversized.
                     _voteSkipBtn.style.height = 30f;
-                    _voteSkipBtn.style.flexGrow = 1f;
+                    _voteSkipBtn.style.flexShrink = 0f;
                 }
                 else
                 {
@@ -3288,6 +3292,7 @@ namespace WebsiteMOTD
                         current.VoteSkippers.Count,
                         Plugin.GetVoteSkipThreshold(),
                         Plugin.HasLocalVotedSkip());
+                    _voteSkipBtn.style.flexShrink = 0f;
                 }
                 _queueNowPlayingBox.Add(_voteSkipBtn);
 
@@ -3295,18 +3300,20 @@ namespace WebsiteMOTD
                 // ownership, so the same admin can drop someone else's video
                 // (e.g. inappropriate content, broken stream) without rounding
                 // up votes. Server validates the admin status independently.
-                // Height 28 (not 26) so the 12pt bold label sits cleanly inside
-                // the button's 7px top/bottom padding without clipping the
-                // line-height on Unity's UI Toolkit text renderer.
                 if (Plugin.IsLocalClientAdmin())
                 {
                     var fSkip = CreateStyledButton(
                         "Force Skip (admin)",
                         new Color(0.55f, 0.18f, 0.18f),
                         Plugin.AdminForceSkip);
-                    fSkip.style.height = 28f;
+                    fSkip.style.height = 26f;
                     fSkip.style.marginTop = 6f;
                     fSkip.style.fontSize = 12f;
+                    fSkip.style.flexShrink = 0f;
+                    // Tighter vertical padding than CreateStyledButton's 7px default
+                    // so the 12pt label sits centered inside the 26px button.
+                    fSkip.style.paddingTop = 3f;
+                    fSkip.style.paddingBottom = 3f;
                     _queueNowPlayingBox.Add(fSkip);
                 }
             }
@@ -3403,10 +3410,11 @@ namespace WebsiteMOTD
             Color fillColor  = voted ? new Color(0.85f, 0.62f, 0.30f) : new Color(0.85f, 0.30f, 0.30f);
 
             var track = new VisualElement();
-            // 28 was too short for the centered label to read clearly; 30 matches
-            // the owner-veto button height and the rest of the queue panel buttons.
+            // Explicit height + no flexGrow. Caller sets flexShrink=0 on the
+            // returned element so Yoga can't collapse it in the column parent —
+            // the v1.0.1 bug where the bar disappeared was flexGrow=1 letting
+            // the remaining-space algorithm resolve to zero.
             track.style.height = 30f;
-            track.style.flexGrow = 1f;
             track.style.position = Position.Relative;
             track.style.overflow = Overflow.Hidden;
             track.style.backgroundColor = trackColor;

@@ -39,7 +39,7 @@ namespace WebsiteMOTD
     public class Plugin : IPuckPlugin
     {
         public static string MOD_NAME = "WebsiteMOTD";
-        public static string MOD_VERSION = "1.1.4";
+        public static string MOD_VERSION = "1.1.5";
 
         private Harmony _harmony;
 
@@ -420,8 +420,9 @@ namespace WebsiteMOTD
                     MOTDUI.Hide();
                     // Hand the OpenWorld theatre back to OWP's showcase video
                     // — we're no longer receiving queue state, so holding the
-                    // claim would just leave the theatre stuck on the last
-                    // frame of whatever was playing when we dropped.
+                    // claim or overlay would just leave the theatre stuck on
+                    // the last frame of whatever was playing when we dropped.
+                    MOTDWorldScreen.DestroyTheatreOverlay();
                     MOTDWorldScreen.ReleaseTheatreClaim();
                 }
             }
@@ -1214,28 +1215,45 @@ namespace WebsiteMOTD
             // Dedicated servers have no renderer — skip entirely
             if (IsDedicatedServer()) return;
 
-            // Theatre claim policy: hold the OpenWorld theatre ONLY when
-            //   (a) we have queue content to show, AND
-            //   (b) the user hasn't placed OWP's WorkingSpeakers prefab.
+            // Theatre display mode picks between three states:
+            //   • CLAIM   — queue active, no WorkingSpeakers. Full takeover via
+            //               OWP's TryClaim. OWP's VideoPlayer stops, only the
+            //               WebView audio (Windows mixer) is audible.
+            //   • OVERLAY — queue active + WorkingSpeakers placed. Child quad
+            //               in front of OWP's screen; OWP's VideoPlayer keeps
+            //               running so TheatreAudioBuffer + SpeakerRelay can
+            //               keep feeding the user's spatial speakers. User
+            //               sees our queue on the theatre AND hears OWP's
+            //               showcase audio from the speakers.
+            //   • NONE    — queue idle. Drop both, let OWP play its showcase
+            //               normally.
             //
-            // Speakers veto the claim because OWP's spatial audio rig taps
-            // the theatre VideoPlayer's AudioSource (see
-            // WorkingSpeakers.TheatreAudioBuffer). When we claim, OWP's
-            // StopDefaultVideo halts that source — speakers go silent. There's
-            // no way to route WebView2's audio (Windows mixer) back into
-            // Unity's audio graph, so we'd be trading "queue on theatre" for
-            // "speakers around the arena go dead". The user explicitly opted
-            // into the speaker setup; respect it.
-            //
-            // When the user removes the speakers (or we're on a server where
-            // they were never placed), behaviour reverts to claim-when-queue-
-            // -active.
+            // We can't deliver "queue audio out of the speakers" because
+            // WebView2 plays through the Windows mixer, not Unity's audio
+            // graph — see TheatreAudioBuffer.OnAudioFilterRead in OWP's
+            // WorkingSpeakers.cs for the capture point that we'd need to feed.
+            // Overlay mode is the best compromise that keeps both visuals
+            // and spatial speakers working simultaneously.
             bool hasQueueContent = _current != null;
-            bool deferToSpeakers = MOTDWorldScreen.HasWorkingSpeakers();
-            if (hasQueueContent && !deferToSpeakers)
-                MOTDWorldScreen.EnsureTheatreClaim();
-            else
+            bool speakersPresent = MOTDWorldScreen.HasWorkingSpeakers();
+            if (hasQueueContent && speakersPresent)
+            {
+                // Overlay mode: drop any prior claim, stand up the quad.
                 MOTDWorldScreen.ReleaseTheatreClaim();
+                MOTDWorldScreen.EnsureTheatreOverlay();
+            }
+            else if (hasQueueContent)
+            {
+                // Claim mode: drop any prior overlay, take the theatre.
+                MOTDWorldScreen.DestroyTheatreOverlay();
+                MOTDWorldScreen.EnsureTheatreClaim();
+            }
+            else
+            {
+                // Queue idle: release both so OWP's showcase plays unobstructed.
+                MOTDWorldScreen.DestroyTheatreOverlay();
+                MOTDWorldScreen.ReleaseTheatreClaim();
+            }
 
             bool hasTheatre = MOTDWorldScreen.HasTheatreScreen;
 

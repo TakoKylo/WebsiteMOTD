@@ -135,6 +135,21 @@ namespace WebsiteMOTD
         /// <summary>True if we currently hold the OpenWorld theatre screen claim.</summary>
         public static bool HasTheatreScreen => _theatreScreen != null && _theatreRenderer != null;
 
+        // Theatre overlay quad: rendered slightly in front of OWP's theatre
+        // screen WITHOUT calling TryClaim. OWP's VideoPlayer keeps running
+        // (so its AudioSource produces samples, TheatreAudioBuffer captures
+        // them, WorkingSpeakers re-emit spatially), while the user visually
+        // sees our queue WebView content on top. The only way to satisfy both
+        // "queue on theatre" AND "speakers play audio" simultaneously given
+        // WebView2 plays audio through the Windows mixer (unreachable from
+        // Unity's audio graph).
+        private static GameObject _theatreOverlayGO;
+        private static MeshRenderer _theatreOverlayRenderer;
+        private static Material _theatreOverlayMaterial;
+
+        /// <summary>True if the overlay quad is currently active (alternative to claim).</summary>
+        public static bool HasTheatreOverlay => _theatreOverlayGO != null && _theatreOverlayMaterial != null;
+
         /// <summary>
         /// True when OWP's WorkingSpeakers prefab is present in the scene. When
         /// it is, we deliberately don't claim the theatre — the user has set
@@ -243,6 +258,98 @@ namespace WebsiteMOTD
                 _theatreScreen = null;
                 _theatreRenderer = null;
             }
+        }
+
+        /// <summary>
+        /// Drop a quad GameObject as a child of OWP's theatre screen renderer,
+        /// bound to our shared WebView texture. Lets us display queue content
+        /// on the theatre WITHOUT calling OWP's TryClaim — OWP's VideoPlayer
+        /// keeps running, AudioSource keeps producing samples, TheatreAudioBuffer
+        /// keeps capturing, WorkingSpeakers keep re-emitting. Visually our
+        /// overlay sits in front of OWP's screen content via a small local-Z
+        /// offset and a higher render queue.
+        ///
+        /// Caller must arrange that the OWP claim is NOT held; if it is, OWP's
+        /// VideoPlayer.Stop has already halted the audio pipeline and this
+        /// overlay would only deliver a video without the spatial speakers
+        /// that motivated this code path.
+        /// </summary>
+        public static GameObject EnsureTheatreOverlay()
+        {
+            if (_theatreOverlayGO != null) return _theatreOverlayGO;
+            if (!TheatreVideoScreenBridge.ApiPresent) return null;
+
+            // OWP exposes Screen/ScreenRenderer publicly without a claim, so
+            // we can reach into the prefab without triggering ClaimChanged.
+            var theatreRenderer = TheatreVideoScreenBridge.GetScreenRenderer();
+            if (theatreRenderer == null) return null;
+
+            var theatreMF = theatreRenderer.GetComponent<MeshFilter>();
+            if (theatreMF == null || theatreMF.sharedMesh == null)
+            {
+                Plugin.LogError("Theatre overlay: ScreenRenderer has no MeshFilter; can't size the quad.");
+                return null;
+            }
+
+            try
+            {
+                _theatreOverlayGO = new GameObject("MOTD_TheatreOverlay");
+                _theatreOverlayGO.transform.SetParent(theatreRenderer.transform, false);
+                // Same mesh as theatre, same orientation. Tiny local-Z offset
+                // toward the viewer: OWP's screen mesh is a flat panel with
+                // normal pointing along +Z by convention; -0.005 sits us a
+                // hair in front. If the prefab ever flips this we'll see the
+                // overlay disappear behind the OWP frame and need to invert
+                // the sign — easy fix when it happens.
+                _theatreOverlayGO.transform.localPosition = new Vector3(0f, 0f, -0.005f);
+                _theatreOverlayGO.transform.localRotation = Quaternion.identity;
+                _theatreOverlayGO.transform.localScale = Vector3.one;
+
+                var mf = _theatreOverlayGO.AddComponent<MeshFilter>();
+                mf.sharedMesh = theatreMF.sharedMesh;
+
+                _theatreOverlayRenderer = _theatreOverlayGO.AddComponent<MeshRenderer>();
+                _theatreOverlayRenderer.shadowCastingMode = ShadowCastingMode.Off;
+                _theatreOverlayRenderer.receiveShadows = false;
+
+                // Unlit so the WebView texture lights itself (matches what
+                // OWP does with its own materials via the Unlit fallback in
+                // PrepareMaterial). High render queue so we draw AFTER OWP's
+                // VideoPlayer-driven frame writes, even at the same depth.
+                Shader shader = Shader.Find("Unlit/Texture")
+                             ?? Shader.Find("Universal Render Pipeline/Unlit")
+                             ?? Shader.Find("Sprites/Default")
+                             ?? Shader.Find("Standard");
+                _theatreOverlayMaterial = new Material(shader);
+                _theatreOverlayMaterial.color = Color.white;
+                _theatreOverlayMaterial.renderQueue = 3100; // Geometry + 100
+                _theatreOverlayRenderer.material = _theatreOverlayMaterial;
+
+                Plugin.Log("Theatre overlay quad placed in front of '" + theatreRenderer.gameObject.name + "'.");
+                return _theatreOverlayGO;
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("EnsureTheatreOverlay failed: " + ex.Message);
+                DestroyTheatreOverlay();
+                return null;
+            }
+        }
+
+        /// <summary>Tear down the overlay quad and free its material.</summary>
+        public static void DestroyTheatreOverlay()
+        {
+            if (_theatreOverlayMaterial != null)
+            {
+                try { UnityEngine.Object.Destroy(_theatreOverlayMaterial); } catch { }
+                _theatreOverlayMaterial = null;
+            }
+            if (_theatreOverlayGO != null)
+            {
+                try { UnityEngine.Object.Destroy(_theatreOverlayGO); } catch { }
+                _theatreOverlayGO = null;
+            }
+            _theatreOverlayRenderer = null;
         }
 
         /// <summary>Release the theatre claim so OpenWorld can resume its own video.</summary>
@@ -509,7 +616,9 @@ namespace WebsiteMOTD
         {
             // Release the OpenWorld claim BEFORE destroying the webview/screens
             // so the OpenWorld mod can swap back to its showcase video while its
-            // GameObject is still alive.
+            // GameObject is still alive. Same for the overlay quad — drop it
+            // before the parent renderer disappears under us.
+            DestroyTheatreOverlay();
             ReleaseTheatreClaim();
 
             if (_screenA != null) { _screenA.Cleanup(); _screenA = null; }
@@ -745,34 +854,46 @@ namespace WebsiteMOTD
                 if (Time.frameCount % ProxUpdateFrameInterval == 0)
                     UpdatePositionalVolume();
 
-                // Theatre claim management runs once per ~second:
+                // Theatre display management runs once per ~second. Three modes:
+                //   - speakers + queue active → OVERLAY mode (own visual via
+                //     child quad, leave OWP audio pipeline alive)
+                //   - no speakers + queue active → CLAIM mode (full theatre
+                //     takeover, OWP audio stops, only WebView audio available)
+                //   - no queue → neither (OWP showcase + speakers play normally)
                 //
-                //   • If speakers became present AFTER we claimed (user spawned
-                //     the prefab mid-session, or open-world re-attached): yield
-                //     the screen back to OWP so its VideoPlayer resumes and
-                //     SpeakerRelay can re-emit through the AudioSource the user
-                //     set up. The audio rig outranks "queue on theatre" because
-                //     it's an explicit user-built setup we can't replicate
-                //     (WebView2 audio is unreachable from Unity).
-                //
-                //   • Otherwise — no speakers, queue has content, theatre not
-                //     yet claimed (e.g. OWP attached after our message-arrival
-                //     claim attempt) — retry. OWP doesn't fire ClaimChanged on
-                //     initial attach when no surviving owner exists, so polling
-                //     is the only signal we get.
+                // Transitioning between modes is OK at any time — we tear down
+                // the unused mode and stand up the other. Late OWP attach is
+                // also caught here: OWP doesn't fire ClaimChanged on initial
+                // spawn without a surviving owner, so polling is the only
+                // signal we get that the theatre became reachable.
                 if (Time.frameCount % TheatreReclaimFrameInterval == 0
                     && TheatreVideoScreenBridge.ApiPresent)
                 {
-                    if (_theatreScreen != null && HasWorkingSpeakers())
+                    bool hasSpeakers = HasWorkingSpeakers();
+                    bool hasQueue   = Plugin.Current != null;
+
+                    if (hasQueue && hasSpeakers)
                     {
-                        Plugin.Log("WorkingSpeakers detected — releasing theatre claim so OWP's audio rig can drive the speakers.");
-                        ReleaseTheatreClaim();
+                        if (_theatreScreen != null)
+                        {
+                            Plugin.Log("WorkingSpeakers detected — switching from claim to overlay mode.");
+                            ReleaseTheatreClaim();
+                        }
+                        if (_theatreOverlayGO == null && TheatreVideoScreenBridge.IsAvailable)
+                            EnsureTheatreOverlay();
                     }
-                    else if (_theatreScreen == null
-                             && Plugin.Current != null
-                             && !HasWorkingSpeakers())
+                    else if (hasQueue && !hasSpeakers)
                     {
-                        EnsureTheatreClaim();
+                        if (_theatreOverlayGO != null) DestroyTheatreOverlay();
+                        if (_theatreScreen == null) EnsureTheatreClaim();
+                    }
+                    else // !hasQueue
+                    {
+                        if (_theatreOverlayGO != null) DestroyTheatreOverlay();
+                        // Claim release happens in Plugin.LoadCurrentOnWorldScreens
+                        // (state-change driven); don't ReleaseTheatreClaim here or
+                        // we'd fight against a freshly-acquired claim when queue
+                        // restarts within the same polling tick.
                     }
                 }
 
@@ -932,6 +1053,27 @@ namespace WebsiteMOTD
                 && _theatreRenderer.material != null)
             {
                 BindTextureToScreenMaterial(_theatreRenderer.material, _sharedTexture);
+            }
+
+            // Overlay mode (used when WorkingSpeakers are present): we don't
+            // hold OWP's claim, so the theatre renderer keeps showing OWP's
+            // showcase video; our quad sits in front of it. Bind the WebView
+            // texture every frame so live frames show up.
+            if (_isPrimary
+                && _sharedTexture != null
+                && _theatreOverlayMaterial != null)
+            {
+                BindTextureToScreenMaterial(_theatreOverlayMaterial, _sharedTexture);
+
+                // Detach detection: if OWP recreates the theatre (open-world
+                // teardown / re-entry), our overlay's parent disappears and
+                // Unity destroys us. Don't keep stale refs around — the
+                // periodic retry below will recreate when ready.
+                if (_theatreOverlayGO == null || _theatreOverlayGO.transform == null
+                    || _theatreOverlayGO.transform.parent == null)
+                {
+                    DestroyTheatreOverlay();
+                }
             }
         }
 

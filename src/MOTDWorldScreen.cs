@@ -709,10 +709,17 @@ namespace WebsiteMOTD
 
                 // Late-spawn theatre catcher: if we don't currently hold the
                 // OWP theatre claim (either OWP hasn't spawned it yet, or we
-                // missed the ClaimChanged event), retry once a second. Stops
-                // automatically as soon as the claim succeeds — the
-                // _theatreScreen check skips the work after that.
+                // missed the ClaimChanged event), retry once a second.
+                //
+                // Gated on Plugin.Current — we only want the theatre while
+                // we actually have queue content. Otherwise OWP's showcase
+                // video and the WorkingSpeakers prefab should play normally,
+                // not be silently overridden by an idle MOTD page.
+                //
+                // Stops automatically once the claim succeeds (the
+                // _theatreScreen check) or when the queue empties.
                 if (_theatreScreen == null
+                    && Plugin.Current != null
                     && TheatreVideoScreenBridge.ApiPresent
                     && Time.frameCount % TheatreReclaimFrameInterval == 0)
                 {

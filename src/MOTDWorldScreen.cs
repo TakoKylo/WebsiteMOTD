@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using UnityEngine;
@@ -89,6 +90,21 @@ namespace WebsiteMOTD
         private static float _globalAudioMultiplier = 0.5f;  // from MOTDUI volume slider / mute
         private static float _positionalMultiplier = 1f;     // computed from listener distance
         private static AudioListener _cachedListener;        // resolved lazily, refreshed on miss
+
+        // OWP "WorkingSpeakers" prefab — placed around the minigame area to
+        // re-emit theatre audio spatially. When we hold the theatre claim, OWP
+        // stops its VideoPlayer (the speakers' audio source), so we use the
+        // SPEAKER positions instead of the theatre screen for the WebView
+        // volume attenuation. Effectively: WebView audio gets loud near the
+        // speakers, quiet at the theatre screen — matching the UX OWP set up.
+        //
+        // OWP doesn't expose a public API for these so we name-scan; cached
+        // for SpeakerCacheRefreshSec to avoid the FindObjectsByType cost on
+        // every UpdatePositionalVolume tick.
+        private const string SpeakerNamePrefix = "WorkingSpeakers";
+        private const float SpeakerCacheRefreshSec = 5f;
+        private static readonly List<Transform> _cachedSpeakers = new List<Transform>();
+        private static float _lastSpeakerScanUT;
 
         // ─── Per-instance ───────────────────────────────────────────
         private MeshRenderer _renderer;
@@ -499,6 +515,11 @@ namespace WebsiteMOTD
             _lastTickRxUT        = 0d;
             _lastDriftSeekUT     = 0d;
             _lastLoadTime        = 0f;
+
+            // Drop cached speaker transforms — they're scene-bound and will
+            // be re-scanned on next SpawnScreens / EnsureDriver cycle.
+            _cachedSpeakers.Clear();
+            _lastSpeakerScanUT = 0f;
         }
 
         // ─── Goal Finding ───────────────────────────────────────────
@@ -976,13 +997,26 @@ namespace WebsiteMOTD
 
         /// <summary>
         /// Sample listener position and update <see cref="_positionalMultiplier"/>.
-        /// Every active screen — the two arena screens AND the OWP theatre screen
-        /// when we've claimed it — contributes an attenuation value; the sum is
-        /// clamped to 1.0. Standing between any two of them gives full volume from
-        /// both "speakers". Treating the theatre screen as just another source
-        /// matches the audio feel of the arena screens and lets a player in the
-        /// open-world hub hear queue audio without it staying at full volume from
-        /// across the map.
+        ///
+        /// Audio sources contributing to the attenuation sum:
+        ///   • Arena screens A and B — straightforward, attenuate against their
+        ///     own world positions.
+        ///   • Theatre area — when we hold the OWP claim AND OWP's WorkingSpeakers
+        ///     are placed in the world, use the SPEAKER positions instead of the
+        ///     theatre screen. Reason: OWP designed the speakers to be the
+        ///     apparent audio source for the theatre, and our WebView's audio
+        ///     bypasses Unity's audio graph entirely (WebView2 goes straight to
+        ///     the Windows mixer), so we can't literally route it through
+        ///     SpeakerRelay. The next best thing is to make the WebView volume
+        ///     curve peak at the speakers rather than at the screen — same end-
+        ///     user UX (audio "comes from" the speakers).
+        ///   • Falls back to attenuating against the theatre screen position if
+        ///     no speakers are found (single-mod OWP-only-without-speakers
+        ///     setup, or pre-attach window before OWP wires them up).
+        ///
+        /// Multiple speakers contribute additively (clamped at the end), so a
+        /// player surrounded by speakers gets full volume from anywhere in the
+        /// minigame area rather than only at one speaker.
         /// </summary>
         private static void UpdatePositionalVolume()
         {
@@ -997,13 +1031,64 @@ namespace WebsiteMOTD
                 ? LogAttenuate(Vector3.Distance(lp, _screenA.transform.position)) : 0f;
             float attenB = _screenB != null
                 ? LogAttenuate(Vector3.Distance(lp, _screenB.transform.position)) : 0f;
-            float attenT = _theatreScreen != null
-                ? LogAttenuate(Vector3.Distance(lp, _theatreScreen.transform.position)) : 0f;
+
+            float attenT = 0f;
+            if (_theatreScreen != null)
+            {
+                RefreshSpeakerCacheIfStale();
+                if (_cachedSpeakers.Count > 0)
+                {
+                    for (int i = 0; i < _cachedSpeakers.Count; i++)
+                    {
+                        var sp = _cachedSpeakers[i];
+                        if (sp == null) continue;
+                        attenT += LogAttenuate(Vector3.Distance(lp, sp.position));
+                    }
+                }
+                else
+                {
+                    // No speakers — fall back to the theatre screen position
+                    // so the player isn't left without theatre-area audio.
+                    attenT = LogAttenuate(Vector3.Distance(lp, _theatreScreen.transform.position));
+                }
+            }
 
             float combined = Mathf.Clamp01(attenA + attenB + attenT);
             if (Mathf.Abs(combined - _positionalMultiplier) < ProxVolumeEpsilon) return;
             _positionalMultiplier = combined;
             ApplyVolume();
+        }
+
+        /// <summary>
+        /// Re-scan for OWP's "WorkingSpeakers" GameObjects every
+        /// <see cref="SpeakerCacheRefreshSec"/> seconds. OWP attaches them on
+        /// open-world client spawn; once cached they're effectively static (no
+        /// per-frame cost), but we periodically re-scan to catch teardown /
+        /// re-entry cycles. Cleared on plugin teardown.
+        /// </summary>
+        private static void RefreshSpeakerCacheIfStale()
+        {
+            float now = Time.unscaledTime;
+            if (_cachedSpeakers.Count > 0 && now - _lastSpeakerScanUT < SpeakerCacheRefreshSec)
+                return;
+            _lastSpeakerScanUT = now;
+            _cachedSpeakers.Clear();
+            try
+            {
+                var all = UnityEngine.Object.FindObjectsByType<Transform>(FindObjectsSortMode.None);
+                foreach (var t in all)
+                {
+                    if (t == null) continue;
+                    string n = t.gameObject.name;
+                    if (string.IsNullOrEmpty(n)) continue;
+                    if (n.IndexOf(SpeakerNamePrefix, StringComparison.OrdinalIgnoreCase) >= 0)
+                        _cachedSpeakers.Add(t);
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("RefreshSpeakerCache failed: " + ex.Message);
+            }
         }
 
         private static void InjectWorldAdBlockJS()

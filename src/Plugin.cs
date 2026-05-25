@@ -39,7 +39,7 @@ namespace WebsiteMOTD
     public class Plugin : IPuckPlugin
     {
         public static string MOD_NAME = "WebsiteMOTD";
-        public static string MOD_VERSION = "1.1.2";
+        public static string MOD_VERSION = "1.1.3";
 
         private Harmony _harmony;
 

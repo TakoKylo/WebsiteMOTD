@@ -39,7 +39,7 @@ namespace WebsiteMOTD
     public class Plugin : IPuckPlugin
     {
         public static string MOD_NAME = "WebsiteMOTD";
-        public static string MOD_VERSION = "1.1.3";
+        public static string MOD_VERSION = "1.1.4";
 
         private Harmony _harmony;
 
@@ -1214,19 +1214,25 @@ namespace WebsiteMOTD
             // Dedicated servers have no renderer — skip entirely
             if (IsDedicatedServer()) return;
 
-            // Theatre claim policy: ONLY hold the OpenWorld theatre while we
-            // have actual queue content to display. The A/B level screens fall
-            // back to showing the MOTD URL when nothing's queued — that's fine
-            // for a passive background, but stealing the theatre to show an
-            // idle MOTD page wrecks OWP's showcase experience (its default
-            // video stops, the WorkingSpeakers prefab goes silent because no
-            // VideoPlayer is producing audio samples).
+            // Theatre claim policy: hold the OpenWorld theatre ONLY when
+            //   (a) we have queue content to show, AND
+            //   (b) the user hasn't placed OWP's WorkingSpeakers prefab.
             //
-            // Transition into a queue item → claim. Transition out (queue
-            // empties, last video ended) → release so OWP's StartDefaultVideo
-            // path resumes. Re-claim happens automatically on the next add.
+            // Speakers veto the claim because OWP's spatial audio rig taps
+            // the theatre VideoPlayer's AudioSource (see
+            // WorkingSpeakers.TheatreAudioBuffer). When we claim, OWP's
+            // StopDefaultVideo halts that source — speakers go silent. There's
+            // no way to route WebView2's audio (Windows mixer) back into
+            // Unity's audio graph, so we'd be trading "queue on theatre" for
+            // "speakers around the arena go dead". The user explicitly opted
+            // into the speaker setup; respect it.
+            //
+            // When the user removes the speakers (or we're on a server where
+            // they were never placed), behaviour reverts to claim-when-queue-
+            // -active.
             bool hasQueueContent = _current != null;
-            if (hasQueueContent)
+            bool deferToSpeakers = MOTDWorldScreen.HasWorkingSpeakers();
+            if (hasQueueContent && !deferToSpeakers)
                 MOTDWorldScreen.EnsureTheatreClaim();
             else
                 MOTDWorldScreen.ReleaseTheatreClaim();

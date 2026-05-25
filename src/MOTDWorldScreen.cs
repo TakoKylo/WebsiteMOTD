@@ -135,6 +135,23 @@ namespace WebsiteMOTD
         /// <summary>True if we currently hold the OpenWorld theatre screen claim.</summary>
         public static bool HasTheatreScreen => _theatreScreen != null && _theatreRenderer != null;
 
+        /// <summary>
+        /// True when OWP's WorkingSpeakers prefab is present in the scene. When
+        /// it is, we deliberately don't claim the theatre — the user has set
+        /// up a spatial audio rig that taps OWP's own VideoPlayer audio, and
+        /// claiming would silence that pipeline (StopDefaultVideo halts the
+        /// AudioSource that OWP's SpeakerRelay components copy from).
+        /// WebView2 audio bypasses Unity entirely, so there's no way to feed
+        /// our queue audio into those speakers — best to leave them alone.
+        ///
+        /// Refreshes the cache on demand so the answer is current.
+        /// </summary>
+        public static bool HasWorkingSpeakers()
+        {
+            RefreshSpeakerCacheIfStale();
+            return _cachedSpeakers.Count > 0;
+        }
+
         // ─── Static API ─────────────────────────────────────────────
 
         /// <summary>
@@ -728,23 +745,35 @@ namespace WebsiteMOTD
                 if (Time.frameCount % ProxUpdateFrameInterval == 0)
                     UpdatePositionalVolume();
 
-                // Late-spawn theatre catcher: if we don't currently hold the
-                // OWP theatre claim (either OWP hasn't spawned it yet, or we
-                // missed the ClaimChanged event), retry once a second.
+                // Theatre claim management runs once per ~second:
                 //
-                // Gated on Plugin.Current — we only want the theatre while
-                // we actually have queue content. Otherwise OWP's showcase
-                // video and the WorkingSpeakers prefab should play normally,
-                // not be silently overridden by an idle MOTD page.
+                //   • If speakers became present AFTER we claimed (user spawned
+                //     the prefab mid-session, or open-world re-attached): yield
+                //     the screen back to OWP so its VideoPlayer resumes and
+                //     SpeakerRelay can re-emit through the AudioSource the user
+                //     set up. The audio rig outranks "queue on theatre" because
+                //     it's an explicit user-built setup we can't replicate
+                //     (WebView2 audio is unreachable from Unity).
                 //
-                // Stops automatically once the claim succeeds (the
-                // _theatreScreen check) or when the queue empties.
-                if (_theatreScreen == null
-                    && Plugin.Current != null
-                    && TheatreVideoScreenBridge.ApiPresent
-                    && Time.frameCount % TheatreReclaimFrameInterval == 0)
+                //   • Otherwise — no speakers, queue has content, theatre not
+                //     yet claimed (e.g. OWP attached after our message-arrival
+                //     claim attempt) — retry. OWP doesn't fire ClaimChanged on
+                //     initial attach when no surviving owner exists, so polling
+                //     is the only signal we get.
+                if (Time.frameCount % TheatreReclaimFrameInterval == 0
+                    && TheatreVideoScreenBridge.ApiPresent)
                 {
-                    EnsureTheatreClaim();
+                    if (_theatreScreen != null && HasWorkingSpeakers())
+                    {
+                        Plugin.Log("WorkingSpeakers detected — releasing theatre claim so OWP's audio rig can drive the speakers.");
+                        ReleaseTheatreClaim();
+                    }
+                    else if (_theatreScreen == null
+                             && Plugin.Current != null
+                             && !HasWorkingSpeakers())
+                    {
+                        EnsureTheatreClaim();
+                    }
                 }
 
 

@@ -39,7 +39,7 @@ namespace WebsiteMOTD
     public class Plugin : IPuckPlugin
     {
         public static string MOD_NAME = "WebsiteMOTD";
-        public static string MOD_VERSION = "1.1.1";
+        public static string MOD_VERSION = "1.1.2";
 
         private Harmony _harmony;
 
@@ -416,7 +416,14 @@ namespace WebsiteMOTD
                 OnQueueChanged?.Invoke();
 
                 if (!IsDedicatedServer())
+                {
                     MOTDUI.Hide();
+                    // Hand the OpenWorld theatre back to OWP's showcase video
+                    // — we're no longer receiving queue state, so holding the
+                    // claim would just leave the theatre stuck on the last
+                    // frame of whatever was playing when we dropped.
+                    MOTDWorldScreen.ReleaseTheatreClaim();
+                }
             }
         }
 
@@ -1207,23 +1214,35 @@ namespace WebsiteMOTD
             // Dedicated servers have no renderer — skip entirely
             if (IsDedicatedServer()) return;
 
-            // Always try to claim the OpenWorld TheatreVideoScreen — when present,
-            // it should receive the WebView texture regardless of server/client
-            // screens settings (cooperative API; see TheatreVideoScreenBridge).
-            MOTDWorldScreen.EnsureTheatreClaim();
+            // Theatre claim policy: ONLY hold the OpenWorld theatre while we
+            // have actual queue content to display. The A/B level screens fall
+            // back to showing the MOTD URL when nothing's queued — that's fine
+            // for a passive background, but stealing the theatre to show an
+            // idle MOTD page wrecks OWP's showcase experience (its default
+            // video stops, the WorkingSpeakers prefab goes silent because no
+            // VideoPlayer is producing audio samples).
+            //
+            // Transition into a queue item → claim. Transition out (queue
+            // empties, last video ended) → release so OWP's StartDefaultVideo
+            // path resumes. Re-claim happens automatically on the next add.
+            bool hasQueueContent = _current != null;
+            if (hasQueueContent)
+                MOTDWorldScreen.EnsureTheatreClaim();
+            else
+                MOTDWorldScreen.ReleaseTheatreClaim();
+
             bool hasTheatre = MOTDWorldScreen.HasTheatreScreen;
 
             if (_serverScreensEnabled)
             {
-                // Normal path: spawn our own A/B screens.
+                // Normal path: spawn our own A/B screens. They handle both
+                // the idle MOTD-URL and the active queue-item case.
                 MOTDWorldScreen.SpawnScreens();
             }
-            else if (hasTheatre || TheatreVideoScreenBridge.ApiPresent)
+            else if (hasQueueContent && (hasTheatre || TheatreVideoScreenBridge.ApiPresent))
             {
-                // Server disabled level screens, but EITHER the theatre is
-                // already claimed OR OWP is installed (theatre not yet attached
-                // but could become available later when the player enters open
-                // world). Spawn a headless driver so:
+                // Server disabled level screens AND we have content to push.
+                // Spawn a headless driver so:
                 //   1. The WebView is ready to pump content to the theatre.
                 //   2. The driver's per-frame Update keeps polling the OWP
                 //      bridge for a claim. OWP doesn't fire ClaimChanged on
@@ -1235,7 +1254,8 @@ namespace WebsiteMOTD
             }
             else
             {
-                // No regular screens, no theatre, no OWP at all — nothing to do.
+                // No regular screens AND (no queue content OR no OWP) —
+                // nothing to do; let OWP keep its showcase running.
                 return;
             }
 

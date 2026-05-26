@@ -977,26 +977,13 @@ namespace WebsiteMOTD
 
         /// <summary>
         /// Sample listener position and update <see cref="_positionalMultiplier"/>.
-        ///
-        /// Sources contributing to the attenuation sum:
-        ///   • Arena screens A and B — attenuated against their own world
-        ///     positions.
-        ///   • Theatre area — when we hold the OWP claim AND OWP's
-        ///     WorkingSpeakers are placed in the world, attenuates against
-        ///     the SPEAKER positions instead of the theatre screen.  Reason:
-        ///     the speakers are where OWP wants the theatre audio to feel
-        ///     like it's coming from, and our WebView's audio bypasses
-        ///     Unity entirely so we can't literally drive their AudioSources.
-        ///     Scaling the WebView's Windows-mixer volume against speaker
-        ///     proximity is the next best thing — same end-user feel as
-        ///     "audio comes from the speakers", without touching the
-        ///     native plugin.  Falls back to the theatre screen position
-        ///     when no speakers exist (e.g. pre-attach window or single-
-        ///     mod setup).
-        ///
-        /// Multiple speakers contribute additively (clamped at the end), so a
-        /// player surrounded by speakers gets full volume from anywhere in the
-        /// minigame area rather than only standing at one speaker.
+        /// Every active screen — the two arena screens AND the OWP theatre screen
+        /// when we've claimed it — contributes an attenuation value; the sum is
+        /// clamped to 1.0. Standing between any two of them gives full volume from
+        /// both "speakers". Treating the theatre screen as just another source
+        /// matches the audio feel of the arena screens and lets a player in the
+        /// open-world hub hear queue audio without it staying at full volume from
+        /// across the map.
         /// </summary>
         private static void UpdatePositionalVolume()
         {

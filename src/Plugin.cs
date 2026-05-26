@@ -39,7 +39,7 @@ namespace WebsiteMOTD
     public class Plugin : IPuckPlugin
     {
         public static string MOD_NAME = "WebsiteMOTD";
-        public static string MOD_VERSION = "1.1.2";
+        public static string MOD_VERSION = "1.1.6";
 
         private Harmony _harmony;
 
@@ -674,6 +674,18 @@ namespace WebsiteMOTD
         {
             try
             {
+                // Listen-server host is implicit admin: if you're hosting the
+                // lobby (IsHost = IsServer && IsClient), you already control
+                // every server-authoritative action MOTD exposes. Making you
+                // additionally edit admin_steam_ids.json to wield moderation
+                // is friction without security. Dedicated servers are NOT
+                // covered by this — IsHost is false there, no player exists
+                // for the server's localClientId anyway, so it falls through
+                // to the AdminLevel check (returns false on the null player).
+                var nm = NetworkManager.Singleton;
+                if (nm != null && nm.IsHost && clientId == nm.LocalClientId)
+                    return true;
+
                 var pm = MonoBehaviourSingleton<PlayerManager>.Instance;
                 var player = pm?.GetPlayerByClientId(clientId);
                 if (player == null) return false;
@@ -711,7 +723,7 @@ namespace WebsiteMOTD
         {
             var nm = NetworkManager.Singleton;
             if (nm == null) return 1;
-            // Majority of connected clients (server counts too)
+            // Majority of connected clients (server counts too).
             int total = nm.ConnectedClientsIds.Count;
             return Mathf.Max(1, (total / 2) + 1);
         }
@@ -1168,6 +1180,12 @@ namespace WebsiteMOTD
         /// Indexes can shift between client→server roundtrips (e.g. when another
         /// player's item plays out), so removing by index would race; the id-based
         /// lookup always targets the intended item.
+        ///
+        /// Authorization: the queued-item's owner may always remove it. Admins
+        /// may also remove anyone's queued item (moderation, mirrors the
+        /// existing admin force-skip for the currently-playing item). All other
+        /// clients are silently ignored — the UI hides the button for them and
+        /// the server enforces independently to keep the wire honest.
         /// </summary>
         private static void ServerRemoveItem(ulong clientId, long itemId)
         {
@@ -1175,8 +1193,13 @@ namespace WebsiteMOTD
             {
                 var item = _queue[i];
                 if (item.Id != itemId) continue;
-                if (item.ClientId != clientId) return; // not the owner — silently ignore
+                bool isOwner = item.ClientId == clientId;
+                bool isAdmin = IsClientAdmin(clientId);
+                if (!isOwner && !isAdmin) return; // not authorized — silently drop
                 _queue.RemoveAt(i);
+                if (isAdmin && !isOwner)
+                    Log("Admin " + clientId + " removed queued item " + itemId
+                        + " (owner=" + item.ClientId + ").");
                 ServerBroadcastQueueState();
                 return;
             }

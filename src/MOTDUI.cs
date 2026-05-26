@@ -3056,6 +3056,11 @@ namespace WebsiteMOTD
 
             // Now playing box
             _queueNowPlayingBox = new VisualElement();
+            // Explicit column direction defends against the (rare but real)
+            // case where an ancestor's flex-direction inheritance bleeds in
+            // and stacks our children horizontally, causing the green
+            // "Now Playing" header to render at the same Y as the username.
+            _queueNowPlayingBox.style.flexDirection = FlexDirection.Column;
             _queueNowPlayingBox.style.backgroundColor = new Color(0.14f, 0.14f, 0.18f);
             _queueNowPlayingBox.style.borderTopLeftRadius = 6f;
             _queueNowPlayingBox.style.borderTopRightRadius = 6f;
@@ -3066,6 +3071,13 @@ namespace WebsiteMOTD
             _queueNowPlayingBox.style.paddingTop = 10f;
             _queueNowPlayingBox.style.paddingBottom = 10f;
             _queueNowPlayingBox.style.marginBottom = 10f;
+            // flexShrink=0 so the column-flex parent (_queueContent, which has
+            // a flexGrow=1 ScrollView for the queue list) can't compress this
+            // card. Without it the box shrinks below its content height and the
+            // child buttons — which themselves have flexShrink=0 — render
+            // outside the visible dark background, colliding with the "Up Next"
+            // header below.
+            _queueNowPlayingBox.style.flexShrink = 0f;
             _queueContent.Add(_queueNowPlayingBox);
 
             // Queue list
@@ -3111,7 +3123,7 @@ namespace WebsiteMOTD
             _queueUrlField = new TextField();
             _queueUrlField.value = "";
             _queueUrlField.style.height = 28f;
-            _queueUrlField.style.marginBottom = 6f;
+            _queueUrlField.style.marginBottom = 10f;
             var qInput = _queueUrlField.Q<VisualElement>("unity-text-input");
             if (qInput != null)
             {
@@ -3138,7 +3150,7 @@ namespace WebsiteMOTD
             var addBtn = CreateStyledButton("Add to Queue", new Color(0.25f, 0.55f, 0.3f), SubmitQueueUrl);
             addBtn.style.flexGrow = 1f;
             addBtn.style.height = 30f;
-            addBtn.style.marginRight = 4f;
+            addBtn.style.marginRight = 8f;
             addRow.Add(addBtn);
 
             var useCurrentBtn = CreateStyledButton("Use Current", new Color(0.3f, 0.4f, 0.6f), () =>
@@ -3159,17 +3171,29 @@ namespace WebsiteMOTD
             // copy its URL without alt-tabbing. NavigateTo handles the trusted-
             // domain bypass and goes through the same WebView the rest of the
             // overlay uses.
+            // Visual separator + extra vertical gap before the Browse row.
+            // marginTop alone (even at 14-20px) read as the same "section" as
+            // the Add-to-Queue / Use-Current row above; a hairline divider
+            // lets the eye anchor on the section change without taking much
+            // vertical space.
+            var browseSeparator = new VisualElement();
+            browseSeparator.style.height = 1f;
+            browseSeparator.style.backgroundColor = new Color(0.22f, 0.22f, 0.28f);
+            browseSeparator.style.marginTop = 16f;
+            browseSeparator.style.marginBottom = 12f;
+            _queueContent.Add(browseSeparator);
+
             var browseRow = new VisualElement();
             browseRow.style.flexDirection = FlexDirection.Row;
-            browseRow.style.marginTop = 8f;
+            browseRow.style.alignItems = Align.Center;
             _queueContent.Add(browseRow);
 
             var browseLabel = new Label("Browse:");
             browseLabel.style.fontSize = 11f;
             browseLabel.style.color = new Color(0.6f, 0.6f, 0.65f);
             browseLabel.style.unityTextAlign = TextAnchor.MiddleLeft;
-            browseLabel.style.marginRight = 6f;
-            browseLabel.style.minWidth = 48f;
+            browseLabel.style.marginRight = 8f;
+            browseLabel.style.minWidth = 52f;
             browseRow.Add(browseLabel);
 
             var ytBtn = CreateStyledButton("YouTube", new Color(0.7f, 0.15f, 0.15f),
@@ -3179,7 +3203,7 @@ namespace WebsiteMOTD
             ytBtn.style.fontSize = 12f;
             ytBtn.style.paddingLeft = 6f;
             ytBtn.style.paddingRight = 6f;
-            ytBtn.style.marginRight = 4f;
+            ytBtn.style.marginRight = 8f;
             browseRow.Add(ytBtn);
 
             var twitchBtn = CreateStyledButton("Twitch", new Color(0.4f, 0.25f, 0.65f),
@@ -3246,23 +3270,59 @@ namespace WebsiteMOTD
             }
             else
             {
-                var nowHeader = new Label("Now Playing");
-                nowHeader.style.fontSize = 11f;
-                nowHeader.style.color = new Color(0.5f, 0.8f, 0.5f);
-                nowHeader.style.unityFontStyleAndWeight = FontStyle.Bold;
-                nowHeader.style.marginBottom = 2f;
-                _queueNowPlayingBox.Add(nowHeader);
+                // Username + "Now Playing" chip inline. Saves the vertical
+                // row the column layout used. alignItems=FlexEnd lines up the
+                // bottoms of the two label boxes so the small chip reads as
+                // a tag trailing the larger username instead of floating.
+                // Explicit height + flexShrink=0 — relying only on Yoga's
+                // auto-size with FlexEnd alignment under-measured the row in
+                // our build, letting the next sibling (urlLabel) overlap the
+                // baseline. Pinning the row size makes the marginBottom gap
+                // deterministic.
+                var headerRow = new VisualElement();
+                headerRow.style.flexDirection = FlexDirection.Row;
+                headerRow.style.alignItems = Align.FlexEnd;
+                headerRow.style.height = 20f;
+                headerRow.style.flexShrink = 0f;
+                headerRow.style.marginBottom = 2f;
+                _queueNowPlayingBox.Add(headerRow);
 
+                // Plain label — no flexShrink / overflow / ellipsis tricks
+                // here. The flexShrink+overflow:Hidden+NoWrap+Ellipsis combo
+                // on a child label without an explicit min-width collapses
+                // it to invisible (UI Toolkit's min-width:auto default keeps
+                // it from clipping cleanly, the renderer just drops it).
+                // Server enforces a 32-char username cap so this never needs
+                // a long-name truncation path anyway.
                 var playerLabel = new Label(current.Username);
                 playerLabel.style.fontSize = 14f;
                 playerLabel.style.color = Color.white;
                 playerLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
-                _queueNowPlayingBox.Add(playerLabel);
+                playerLabel.style.marginRight = 8f;
+                headerRow.Add(playerLabel);
 
-                var urlLabel = new Label(Truncate(current.Url, 48));
+                var nowHeader = new Label("Now Playing");
+                nowHeader.style.fontSize = 11f;
+                nowHeader.style.color = new Color(0.5f, 0.8f, 0.5f);
+                nowHeader.style.unityFontStyleAndWeight = FontStyle.Bold;
+                nowHeader.style.flexShrink = 0f;
+                headerRow.Add(nowHeader);
+
+                // Character-level truncation with a trailing "…" — see
+                // Truncate() below, it appends the ellipsis when it cuts.
+                // Tried the CSS recipe (NoWrap + overflow:Hidden +
+                // textOverflow:Ellipsis + width:100%) and the label
+                // collapsed to invisible in our Unity build; UI Toolkit's
+                // min-width:auto interacts badly with that combo. The 42
+                // cap is the sweet spot for the 300px-wide queue panel at
+                // fontSize 11 — fits without wrap, leaves room for ".../".
+                // NoWrap is belt-and-braces against a future layout pass
+                // making the panel narrow enough to want to wrap anyway.
+                var urlLabel = new Label(Truncate(current.Url, 42));
                 urlLabel.style.fontSize = 11f;
                 urlLabel.style.color = new Color(0.65f, 0.8f, 1f);
-                urlLabel.style.whiteSpace = WhiteSpace.Normal;
+                urlLabel.style.whiteSpace = WhiteSpace.NoWrap;
+                urlLabel.style.flexShrink = 0f;
                 urlLabel.style.marginBottom = 8f;
                 _queueNowPlayingBox.Add(urlLabel);
 
@@ -3371,10 +3431,18 @@ namespace WebsiteMOTD
                     urlLabel.style.whiteSpace = WhiteSpace.Normal;
                     info.Add(urlLabel);
 
-                    // Remove button (only for your own items)
-                    if (item.ClientId == localClientId)
+                    // Remove button: visible for your own items always, and for
+                    // any item if you're an admin (moderation). The label uses
+                    // the ASCII letter "X" rather than the U+2715 multiplication-
+                    // sign glyph the old code had — Puck's UI font ships without
+                    // most non-BMP symbols, so the prior version rendered as a
+                    // blank red square. The server enforces the permission
+                    // independently in ServerRemoveItem.
+                    bool isOwn = item.ClientId == localClientId;
+                    bool canModerate = Plugin.IsLocalClientAdmin();
+                    if (isOwn || canModerate)
                     {
-                        var rmBtn = CreateStyledButton("✕", new Color(0.55f, 0.2f, 0.2f), () =>
+                        var rmBtn = CreateStyledButton("X", new Color(0.55f, 0.2f, 0.2f), () =>
                         {
                             Plugin.RemoveFromQueue(itemId);
                         });
@@ -3382,8 +3450,19 @@ namespace WebsiteMOTD
                         rmBtn.style.height = 24f;
                         rmBtn.style.paddingLeft = 0f;
                         rmBtn.style.paddingRight = 0f;
+                        rmBtn.style.paddingTop = 0f;
+                        rmBtn.style.paddingBottom = 0f;
                         rmBtn.style.fontSize = 12f;
+                        rmBtn.style.unityFontStyleAndWeight = FontStyle.Bold;
                         rmBtn.style.marginLeft = 4f;
+                        // Admin-removing someone else's video: tint slightly darker
+                        // to hint that this is a moderation action, not a regular
+                        // "drop my own queue entry" click.
+                        if (!isOwn)
+                        {
+                            rmBtn.style.backgroundColor = new Color(0.45f, 0.14f, 0.14f);
+                            rmBtn.tooltip = "Force-remove (admin)";
+                        }
                         row.Add(rmBtn);
                     }
 

@@ -39,7 +39,7 @@ namespace WebsiteMOTD
     public class Plugin : IPuckPlugin
     {
         public static string MOD_NAME = "WebsiteMOTD";
-        public static string MOD_VERSION = "1.1.5";
+        public static string MOD_VERSION = "1.1.1";
 
         private Harmony _harmony;
 
@@ -416,15 +416,7 @@ namespace WebsiteMOTD
                 OnQueueChanged?.Invoke();
 
                 if (!IsDedicatedServer())
-                {
                     MOTDUI.Hide();
-                    // Hand the OpenWorld theatre back to OWP's showcase video
-                    // — we're no longer receiving queue state, so holding the
-                    // claim or overlay would just leave the theatre stuck on
-                    // the last frame of whatever was playing when we dropped.
-                    MOTDWorldScreen.DestroyTheatreOverlay();
-                    MOTDWorldScreen.ReleaseTheatreClaim();
-                }
             }
         }
 
@@ -1215,58 +1207,23 @@ namespace WebsiteMOTD
             // Dedicated servers have no renderer — skip entirely
             if (IsDedicatedServer()) return;
 
-            // Theatre display mode picks between three states:
-            //   • CLAIM   — queue active, no WorkingSpeakers. Full takeover via
-            //               OWP's TryClaim. OWP's VideoPlayer stops, only the
-            //               WebView audio (Windows mixer) is audible.
-            //   • OVERLAY — queue active + WorkingSpeakers placed. Child quad
-            //               in front of OWP's screen; OWP's VideoPlayer keeps
-            //               running so TheatreAudioBuffer + SpeakerRelay can
-            //               keep feeding the user's spatial speakers. User
-            //               sees our queue on the theatre AND hears OWP's
-            //               showcase audio from the speakers.
-            //   • NONE    — queue idle. Drop both, let OWP play its showcase
-            //               normally.
-            //
-            // We can't deliver "queue audio out of the speakers" because
-            // WebView2 plays through the Windows mixer, not Unity's audio
-            // graph — see TheatreAudioBuffer.OnAudioFilterRead in OWP's
-            // WorkingSpeakers.cs for the capture point that we'd need to feed.
-            // Overlay mode is the best compromise that keeps both visuals
-            // and spatial speakers working simultaneously.
-            bool hasQueueContent = _current != null;
-            bool speakersPresent = MOTDWorldScreen.HasWorkingSpeakers();
-            if (hasQueueContent && speakersPresent)
-            {
-                // Overlay mode: drop any prior claim, stand up the quad.
-                MOTDWorldScreen.ReleaseTheatreClaim();
-                MOTDWorldScreen.EnsureTheatreOverlay();
-            }
-            else if (hasQueueContent)
-            {
-                // Claim mode: drop any prior overlay, take the theatre.
-                MOTDWorldScreen.DestroyTheatreOverlay();
-                MOTDWorldScreen.EnsureTheatreClaim();
-            }
-            else
-            {
-                // Queue idle: release both so OWP's showcase plays unobstructed.
-                MOTDWorldScreen.DestroyTheatreOverlay();
-                MOTDWorldScreen.ReleaseTheatreClaim();
-            }
-
+            // Always try to claim the OpenWorld TheatreVideoScreen — when present,
+            // it should receive the WebView texture regardless of server/client
+            // screens settings (cooperative API; see TheatreVideoScreenBridge).
+            MOTDWorldScreen.EnsureTheatreClaim();
             bool hasTheatre = MOTDWorldScreen.HasTheatreScreen;
 
             if (_serverScreensEnabled)
             {
-                // Normal path: spawn our own A/B screens. They handle both
-                // the idle MOTD-URL and the active queue-item case.
+                // Normal path: spawn our own A/B screens.
                 MOTDWorldScreen.SpawnScreens();
             }
-            else if (hasQueueContent && (hasTheatre || TheatreVideoScreenBridge.ApiPresent))
+            else if (hasTheatre || TheatreVideoScreenBridge.ApiPresent)
             {
-                // Server disabled level screens AND we have content to push.
-                // Spawn a headless driver so:
+                // Server disabled level screens, but EITHER the theatre is
+                // already claimed OR OWP is installed (theatre not yet attached
+                // but could become available later when the player enters open
+                // world). Spawn a headless driver so:
                 //   1. The WebView is ready to pump content to the theatre.
                 //   2. The driver's per-frame Update keeps polling the OWP
                 //      bridge for a claim. OWP doesn't fire ClaimChanged on
@@ -1278,8 +1235,7 @@ namespace WebsiteMOTD
             }
             else
             {
-                // No regular screens AND (no queue content OR no OWP) —
-                // nothing to do; let OWP keep its showcase running.
+                // No regular screens, no theatre, no OWP at all — nothing to do.
                 return;
             }
 

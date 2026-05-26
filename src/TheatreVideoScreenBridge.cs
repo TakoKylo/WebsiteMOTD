@@ -22,14 +22,23 @@ namespace WebsiteMOTD
     /// </summary>
     internal static class TheatreVideoScreenBridge
     {
-        public const string OwnerId = "WebsiteMOTD";
+        // Identifier passed to OWP's TryClaim/Release. Mirrored from Plugin.MOD_NAME
+        // so a rename can't silently desync the two. static readonly (not const)
+        // because const fields can't initialize from a non-const source.
+        public static readonly string OwnerId = Plugin.MOD_NAME;
 
-        private static bool _resolveAttempted;
+        // Timestamp of the last attempted Resolve when _type was still null.
+        // Lets us retry periodically without iterating every loaded assembly on
+        // every property access — important because OWP can load AFTER MOTD
+        // (the previous one-shot _resolveAttempted flag missed that case
+        // permanently until a plugin disable/enable cycle).
+        private const float ResolveRetryBackoffSec = 5f;
+        private static float _lastResolveAttemptUT;
+
         private static Type _type;
         private static MethodInfo _tryClaim;
         private static MethodInfo _release;
         private static PropertyInfo _isAvailable;
-        private static PropertyInfo _isClaimed;
         private static PropertyInfo _currentOwner;
         private static PropertyInfo _screen;
         private static PropertyInfo _screenRenderer;
@@ -177,12 +186,11 @@ namespace WebsiteMOTD
         public static void ResetCachedState()
         {
             UnsubscribeClaimChanged();
-            _resolveAttempted = false;
+            _lastResolveAttemptUT = 0f;
             _type = null;
             _tryClaim = null;
             _release = null;
             _isAvailable = null;
-            _isClaimed = null;
             _currentOwner = null;
             _screen = null;
             _screenRenderer = null;
@@ -206,18 +214,28 @@ namespace WebsiteMOTD
 
         private static void Resolve()
         {
-            if (_resolveAttempted) return;
-            _resolveAttempted = true;
+            // Already resolved — fast path, no work.
+            if (_type != null) return;
 
-            // Per the current OWP docs the canonical type name is
-            // MyPuckMod.TheatreVideoScreen. Older builds may have shipped under
-            // OpenWorldPracticeMod.* or an unnamespaced TheatreVideoScreen — try
-            // those as fallbacks so we don't break if the mod gets re-namespaced.
+            // Recent unsuccessful attempt — back off so we don't iterate every
+            // loaded assembly on every property access. The retry window catches
+            // late-loading OWP (e.g. user toggles the mod on after MOTD is
+            // already running) without thrashing the reflection layer between.
+            float now = Time.unscaledTime;
+            if (_lastResolveAttemptUT > 0f && now - _lastResolveAttemptUT < ResolveRetryBackoffSec)
+                return;
+            _lastResolveAttemptUT = now;
+
+            // Canonical OWP namespace as of current builds. The legacy
+            // "OpenWorldPracticeMod.*" fallback covers older mod versions that
+            // shipped before the rename. Bare "TheatreVideoScreen" used to be
+            // here too as a last-ditch fallback, but with OWP's namespace stable
+            // for several releases now the risk of binding to an unrelated
+            // global-namespace class outweighs the benefit.
             string[] candidates =
             {
                 "MyPuckMod.TheatreVideoScreen",
                 "OpenWorldPracticeMod.TheatreVideoScreen",
-                "TheatreVideoScreen",
             };
 
             foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
@@ -233,13 +251,12 @@ namespace WebsiteMOTD
                 }
                 catch { }
             }
-            if (_type == null) return;
+            if (_type == null) return;  // backoff timestamp guards the retry
 
             var flags = BindingFlags.Public | BindingFlags.Static;
             _tryClaim       = _type.GetMethod("TryClaim", flags, null, new[] { typeof(string) }, null);
             _release        = _type.GetMethod("Release",  flags, null, new[] { typeof(string) }, null);
             _isAvailable    = _type.GetProperty("IsAvailable",    flags);
-            _isClaimed      = _type.GetProperty("IsClaimed",      flags);
             _currentOwner   = _type.GetProperty("CurrentOwner",   flags);
             _screen         = _type.GetProperty("Screen",         flags);
             _screenRenderer = _type.GetProperty("ScreenRenderer", flags);

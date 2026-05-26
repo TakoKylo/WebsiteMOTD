@@ -170,12 +170,31 @@ namespace WebsiteMOTD
         /// <summary>
         /// Cache the screen GameObject + resolve its renderer. Centralised so the
         /// event-driven re-attach path and the initial-claim path stay in sync.
+        ///
+        /// Primary source is the bridge's GetScreenRenderer() (which mirrors OWP's
+        /// own ScreenRenderer property — the renderer OWP chose internally and
+        /// drives its VideoPlayer against). Fallback uses GetComponentsInChildren
+        /// matching OWP's deepest-first ordering so we don't pick a different
+        /// renderer in a multi-renderer prefab. The fallback also logs so we know
+        /// if it's triggering in production.
         /// </summary>
         private static void BindToTheatreScreen(GameObject go)
         {
             _theatreScreen = go;
-            _theatreRenderer = TheatreVideoScreenBridge.GetScreenRenderer()
-                ?? (go != null ? (go.GetComponent<Renderer>() ?? go.GetComponentInChildren<Renderer>()) : null);
+            _theatreRenderer = TheatreVideoScreenBridge.GetScreenRenderer();
+
+            if (_theatreRenderer == null && go != null)
+            {
+                // OWP's SetupVideoPlayer assigns ScreenRenderer = allRenderers[0]
+                // from GetComponentsInChildren<Renderer>(true). Mirror that pick
+                // so we drive the same renderer OWP's VideoPlayer would have.
+                var renderers = go.GetComponentsInChildren<Renderer>(true);
+                if (renderers != null && renderers.Length > 0)
+                {
+                    _theatreRenderer = renderers[0];
+                    Plugin.Log("Theatre renderer fell back to GetComponentsInChildren[0] — bridge.GetScreenRenderer() returned null.");
+                }
+            }
 
             if (go != null && _theatreRenderer == null)
                 Plugin.LogError("TheatreVideoScreen claimed but no Renderer found on the screen GameObject.");
@@ -195,7 +214,17 @@ namespace WebsiteMOTD
             if (newOwner == TheatreVideoScreenBridge.OwnerId)
             {
                 BindToTheatreScreen(screen);
-                Plugin.Log("TheatreVideoScreen re-attached (we still own it) — re-bound to new GameObject.");
+                // OWP fires ClaimChanged(us, Screen) both on re-attach AFTER a
+                // detach (Screen is the fresh GameObject) AND on the detach
+                // itself (Screen is null because OWP nulled it before
+                // notifying — the claim survives so we still get called).
+                // The log line needs to differentiate so a stale "re-attached"
+                // doesn't fire when we're actually being told the screen is
+                // gone — the polling reclaim in Update will re-bind when the
+                // screen comes back.
+                Plugin.Log(screen != null
+                    ? "TheatreVideoScreen re-attached (we still own it) — re-bound to new GameObject."
+                    : "TheatreVideoScreen detached (claim survives) — awaiting re-spawn.");
             }
             else if (string.IsNullOrEmpty(newOwner))
             {

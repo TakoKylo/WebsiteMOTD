@@ -122,17 +122,24 @@ namespace WebsiteMOTD
 
         /// <summary>
         /// Subscribe to ClaimChanged. Replaces any prior subscriber — the bridge tracks
-        /// a single consumer (MOTDWorldScreen). Safe to call repeatedly; idempotent
-        /// when the same handler is already wired. No-ops if OWP isn't loaded or its
-        /// API doesn't expose a ClaimChanged event of the expected shape.
+        /// a single consumer (MOTDWorldScreen). Safe to call repeatedly. No-ops if OWP
+        /// isn't loaded or its API doesn't expose a ClaimChanged event of the expected
+        /// shape.
+        ///
+        /// Always does Unsubscribe → Subscribe rather than early-returning when the
+        /// handler matches the cached one. The early-return optimisation broke the
+        /// "OWP disabled and re-enabled while MOTD stays alive" case: OWP's
+        /// ResetSubscribers clears its event invocation list, but our cached
+        /// _eventDelegateInstance reference stayed non-null, so we'd believe we
+        /// were still subscribed when we weren't. The double-call cost is a
+        /// no-op RemoveEventHandler plus one AddEventHandler — both O(N) in
+        /// subscribers, N≤2 in practice, and called at most once per second from
+        /// EnsureTheatreClaim's polling path.
         /// </summary>
         public static void SubscribeClaimChanged(Action<string, GameObject> handler)
         {
             Resolve();
             if (_type == null || _claimChangedEvent == null) return;
-
-            // Already subscribed with this exact handler — no-op.
-            if (_onClaimChanged == handler && _eventDelegateInstance != null) return;
 
             UnsubscribeClaimChanged();
             _onClaimChanged = handler;

@@ -217,6 +217,14 @@ namespace WebsiteMOTD
                 // which falls back to the Steam overlay rather than touching the
                 // Windows-only WebView native plugin.
                 MOTDUI.EnableHotkeys();
+
+                // If OpenWorldPracticeMod is loaded, hand it a button that opens
+                // MOTD from inside OWP's welcome panel. The OnMessageReceived
+                // join path also suppresses the auto-overlay when this bridge
+                // is present, so the user gets one welcome surface — OWP's —
+                // with the MOTD entry point inside it. Idempotent + lazy: the
+                // call no-ops cleanly when OWP isn't loaded.
+                OWPUIBridge.TryRegisterWelcomeButton(() => MOTDUI.Show(MOTD_URL));
             }
 
             TrySetupNetwork();
@@ -342,6 +350,7 @@ namespace WebsiteMOTD
             // Drop the reflective OWP bridge cache so a re-enable cycle re-resolves
             // it cleanly (defends against OWP being reloaded between sessions).
             TheatreVideoScreenBridge.ResetCachedState();
+            OWPUIBridge.ResetCachedState();
 
             MOTDWebContent.Cleanup();
             OnQueueChanged?.Invoke();
@@ -523,7 +532,15 @@ namespace WebsiteMOTD
 
                 if (!IsDedicatedServer())
                 {
-                    MOTDUI.Show(url);
+                    // Suppress the auto-overlay only when OpenWorldPracticeMod is
+                    // loaded — OWP's welcome panel pops on join and now hosts a
+                    // "MOTD" button (registered from Plugin.Setup via
+                    // OWPUIBridge), so two stacked overlays would be redundant.
+                    // F2 / chat /web / /motd still open the overlay normally —
+                    // this only changes the unsolicited-on-join behaviour, not
+                    // the user-driven entry points.
+                    if (!OWPUIBridge.ApiPresent)
+                        MOTDUI.Show(url);
                     // Always call LoadCurrentOnWorldScreens — it handles both the
                     // server-enabled path and the theatre-claim path internally, so
                     // OpenWorld's TheatreVideoScreen still gets content when the

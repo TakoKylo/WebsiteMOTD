@@ -84,6 +84,16 @@ namespace WebsiteMOTD
         // so the player hears both when standing between them.
         private const float ProxMinDistance = 5f;
         private const float ProxMaxDistance = 60f;
+        // Speaker anchors mirror OWP's WorkingSpeaker AudioSource curve so
+        // walking up to a speaker raises MOTD's volume on the same loudness
+        // profile as the showcase audio that plays through the same speaker
+        // when MOTD isn't claimed.  Values intentionally match
+        // WorkingSpeakerAudio.{AUDIO_MIN_DISTANCE, AUDIO_MAX_DISTANCE}.
+        private const float SpeakerProxMinDistance = 1.25f;
+        private const float SpeakerProxMaxDistance = 25f;
+        // Half the main-screen contribution per-speaker — matches the
+        // 0.1 vs 0.2 AudioSource.volume split between speaker and screen.
+        private const float SpeakerVolumeScale = 0.5f;
         private const int   ProxUpdateFrameInterval = 4;     // re-evaluate every N frames
         private const float ProxVolumeEpsilon = 0.02f;       // skip JS update for tiny deltas
         private static float _globalAudioMultiplier = 0.5f;  // from MOTDUI volume slider / mute
@@ -969,10 +979,20 @@ namespace WebsiteMOTD
         /// </summary>
         private static float LogAttenuate(float distance)
         {
-            if (distance <= ProxMinDistance) return 1f;
-            if (distance >= ProxMaxDistance) return 0f;
-            return Mathf.Log(ProxMaxDistance / distance) /
-                   Mathf.Log(ProxMaxDistance / ProxMinDistance);
+            return LogAttenuate(distance, ProxMinDistance, ProxMaxDistance);
+        }
+
+        /// <summary>
+        /// Same curve as <see cref="LogAttenuate(float)"/> but parameterised
+        /// on min/max so the speaker anchors can use their own tighter
+        /// falloff range without affecting the screen contributions.
+        /// </summary>
+        private static float LogAttenuate(float distance, float minDistance, float maxDistance)
+        {
+            if (distance <= minDistance) return 1f;
+            if (distance >= maxDistance) return 0f;
+            return Mathf.Log(maxDistance / distance) /
+                   Mathf.Log(maxDistance / minDistance);
         }
 
         private static Transform GetListenerTransform()
@@ -1031,7 +1051,25 @@ namespace WebsiteMOTD
             float attenT = _theatreScreen != null
                 ? LogAttenuate(Vector3.Distance(lp, _theatreScreen.transform.position)) : 0f;
 
-            float combined = Mathf.Clamp01(attenA + attenB + attenT);
+            // Working speakers contribute additively too — walking up to a
+            // speaker raises the WebView's volume on the same loudness
+            // profile the showcase audio uses through the same speaker
+            // (tighter Speaker* distances, half-volume scale).  Sum-then-
+            // clamp matches the existing multi-screen behaviour: being
+            // surrounded by anchors saturates at full speaker contribution
+            // rather than averaging down.
+            float attenSpeakers = 0f;
+            var speakerPositions = TheatreVideoScreenBridge.GetSpeakerPositions();
+            for (int i = 0; i < speakerPositions.Length; i++)
+            {
+                attenSpeakers += SpeakerVolumeScale * LogAttenuate(
+                    Vector3.Distance(lp, speakerPositions[i]),
+                    SpeakerProxMinDistance,
+                    SpeakerProxMaxDistance);
+                if (attenSpeakers >= SpeakerVolumeScale) break;  // saturated at speaker max
+            }
+
+            float combined = Mathf.Clamp01(attenA + attenB + attenT + attenSpeakers);
             if (Mathf.Abs(combined - _positionalMultiplier) < ProxVolumeEpsilon) return;
             _positionalMultiplier = combined;
             ApplyVolume();

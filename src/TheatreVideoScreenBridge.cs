@@ -44,6 +44,14 @@ namespace WebsiteMOTD
         private static PropertyInfo _screenRenderer;
         private static EventInfo _claimChangedEvent;
 
+        // OWP's WorkingSpeakers helper — separate type from TheatreVideoScreen
+        // but resolved through the same lazy path so MOTD picks up the
+        // speaker-positions API the moment OWP loads.  Used by
+        // MOTDWorldScreen.UpdatePositionalVolume to make MOTD's WebView
+        // volume feel like it's also coming from the in-world speakers.
+        private static Type _speakersType;
+        private static MethodInfo _getSpeakerPositions;
+
         // Active subscriber (single consumer — MOTDWorldScreen). The bridge owns
         // the strongly-typed delegate instance it added to the event, so we can
         // remove it later via the same reference.
@@ -118,6 +126,31 @@ namespace WebsiteMOTD
             if (_screen == null) return null;
             try { return _screen.GetValue(null) as GameObject; }
             catch { return null; }
+        }
+
+        /// <summary>
+        /// World-space positions of OWP's active WorkingSpeakers.  Returns an
+        /// empty array (never null) when OWP isn't loaded, the WorkingSpeakers
+        /// API isn't present (older OWP build), or no speakers are spawned —
+        /// so callers can iterate without null-checking.  MOTD adds each
+        /// position's distance-attenuation to its WebView volume sum, which
+        /// makes the WebView feel like it's playing through the speakers
+        /// even though its audio is on the Windows mixer and can't be
+        /// routed through Unity AudioSources.
+        /// </summary>
+        public static Vector3[] GetSpeakerPositions()
+        {
+            Resolve();
+            if (_getSpeakerPositions == null) return Array.Empty<Vector3>();
+            try
+            {
+                return (_getSpeakerPositions.Invoke(null, null) as Vector3[]) ?? Array.Empty<Vector3>();
+            }
+            catch (Exception ex)
+            {
+                Plugin.LogError("WorkingSpeakers.GetSpeakerPositions threw: " + ex.Message);
+                return Array.Empty<Vector3>();
+            }
         }
 
         /// <summary>
@@ -202,6 +235,8 @@ namespace WebsiteMOTD
             _screen = null;
             _screenRenderer = null;
             _claimChangedEvent = null;
+            _speakersType = null;
+            _getSpeakerPositions = null;
         }
 
         // Reflective event target — invoked by OWP and forwards to the user callback.
@@ -269,8 +304,53 @@ namespace WebsiteMOTD
             _screenRenderer = _type.GetProperty("ScreenRenderer", flags);
             _claimChangedEvent = _type.GetEvent("ClaimChanged", flags);
 
+            // WorkingSpeakers lives in the same OWP assembly — same namespace
+            // candidates apply.  Search every loaded assembly (not just
+            // _type.Assembly) defensively: if OWP got reloaded into a fresh
+            // assembly identity at any point, the cached _type might point
+            // at the old one while the new one carries WorkingSpeakers.
+            // Older OWP builds (pre-speakers) gracefully degrade to "no
+            // speaker positions" via GetSpeakerPositions's null-method
+            // early-out — same pattern as ClaimChanged's null-event case.
+            string[] speakerCandidates =
+            {
+                "MyPuckMod.WorkingSpeakers",
+                "OpenWorldPracticeMod.WorkingSpeakers",
+            };
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    foreach (var name in speakerCandidates)
+                    {
+                        var t = asm.GetType(name, false);
+                        if (t != null) { _speakersType = t; break; }
+                    }
+                    if (_speakersType != null) break;
+                }
+                catch { }
+            }
+            if (_speakersType != null)
+            {
+                // 2-arg overload (matches the GetProperty/GetEvent style above).
+                // Earlier we used the 5-arg overload with Type.EmptyTypes to be
+                // explicit about a zero-param signature, but it returned null
+                // in practice on a known-good API — the simpler form just
+                // works.  GetSpeakerPositions takes no overloads, so name +
+                // Public|Static is unambiguous.
+                _getSpeakerPositions = _speakersType.GetMethod(
+                    "GetSpeakerPositions",
+                    BindingFlags.Public | BindingFlags.Static);
+            }
+
+            string speakersStatus =
+                _getSpeakerPositions != null ? "yes" :
+                _speakersType != null       ? "method-missing" :
+                                              "type-missing";
+
             Plugin.Log("TheatreVideoScreen API resolved from " + _type.Assembly.GetName().Name
-                       + " (event=" + (_claimChangedEvent != null ? "yes" : "no") + ").");
+                       + " (event=" + (_claimChangedEvent != null ? "yes" : "no")
+                       + ", speakers=" + speakersStatus + ").");
         }
     }
 }

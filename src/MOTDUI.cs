@@ -3196,24 +3196,41 @@ namespace WebsiteMOTD
             browseLabel.style.minWidth = 52f;
             browseRow.Add(browseLabel);
 
-            var ytBtn = CreateStyledButton("YouTube", new Color(0.7f, 0.15f, 0.15f),
-                () => NavigateTo("https://www.youtube.com/"));
-            ytBtn.style.height = 26f;
-            ytBtn.style.flexGrow = 1f;
-            ytBtn.style.fontSize = 12f;
-            ytBtn.style.paddingLeft = 6f;
-            ytBtn.style.paddingRight = 6f;
-            ytBtn.style.marginRight = 8f;
-            browseRow.Add(ytBtn);
+            // One button per server-defined browse link (synced via the queue-state
+            // header; falls back to YouTube + Twitch defaults). Edit browse_links in
+            // ServerMOTD.json to change these.
+            var links = Plugin.BrowseLinks;
+            for (int i = 0; i < links.Count; i++)
+            {
+                var link = BrowseLink.Parse(links[i]);   // "Name|URL"
+                if (string.IsNullOrWhiteSpace(link.Url)) continue;
+                string capturedUrl = link.Url;
+                string label = string.IsNullOrWhiteSpace(link.Name) ? capturedUrl : link.Name;
 
-            var twitchBtn = CreateStyledButton("Twitch", new Color(0.4f, 0.25f, 0.65f),
-                () => NavigateTo("https://www.twitch.tv/directory"));
-            twitchBtn.style.height = 26f;
-            twitchBtn.style.flexGrow = 1f;
-            twitchBtn.style.fontSize = 12f;
-            twitchBtn.style.paddingLeft = 6f;
-            twitchBtn.style.paddingRight = 6f;
-            browseRow.Add(twitchBtn);
+                var btn = CreateStyledButton(label, BrowseButtonColor(label, capturedUrl),
+                    () => NavigateTo(capturedUrl));
+                btn.style.height = 26f;
+                btn.style.flexGrow = 1f;
+                btn.style.fontSize = 12f;
+                btn.style.paddingLeft = 6f;
+                btn.style.paddingRight = 6f;
+                if (i < links.Count - 1) btn.style.marginRight = 8f;
+                browseRow.Add(btn);
+            }
+        }
+
+        /// <summary>
+        /// Pick a button accent for a browse link. Keeps YouTube/Twitch/Kick on
+        /// their brand-ish colours; anything else gets a neutral blue so custom
+        /// server links still look intentional.
+        /// </summary>
+        private static Color BrowseButtonColor(string name, string url)
+        {
+            string s = ((name ?? "") + " " + (url ?? "")).ToLowerInvariant();
+            if (s.Contains("youtube") || s.Contains("youtu.be")) return new Color(0.7f, 0.15f, 0.15f);
+            if (s.Contains("twitch"))                              return new Color(0.4f, 0.25f, 0.65f);
+            if (s.Contains("kick.com"))                            return new Color(0.18f, 0.5f, 0.2f);
+            return new Color(0.25f, 0.4f, 0.55f);
         }
 
         private static void ToggleQueuePanel()

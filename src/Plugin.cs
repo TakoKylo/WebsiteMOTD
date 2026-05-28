@@ -115,9 +115,25 @@ namespace WebsiteMOTD
         // Server config flags received by clients (default: all enabled)
         private static bool _serverScreensEnabled = true;
         private static bool _serverQueueEnabled = true;
+        // Guards the once-per-host-session load of ServerMOTD.json on a listen
+        // host (see ApplyHostServerConfigOnce). Reset in Teardown so leaving and
+        // re-hosting re-reads the file.
+        private static bool _hostServerConfigApplied;
+
+        // Browse-row buttons ("Name|URL" strings). On the server this is the
+        // loaded ServerConfig list; on clients it's whatever the server synced via
+        // the queue-state header. Defaults to YouTube + Twitch so the row is never
+        // empty (pre-sync, or against an older server that doesn't send the list).
+        private static List<string> _browseLinks = ServerConfig.DefaultBrowseLinks();
 
         /// <summary>Whether the server allows the queue system (readable by UI).</summary>
         public static bool IsQueueEnabled => _serverQueueEnabled;
+
+        /// <summary>Browse-row buttons ("Name|URL", server-defined, synced). Never empty.</summary>
+        public static IReadOnlyList<string> BrowseLinks =>
+            (_browseLinks != null && _browseLinks.Count > 0)
+                ? _browseLinks
+                : ServerConfig.DefaultBrowseLinks();
 
         /// <summary>Read-only snapshot for the UI.</summary>
         public static IReadOnlyList<QueueItem> Queue => _queue;
@@ -195,12 +211,16 @@ namespace WebsiteMOTD
             if (_isSetup) return;
             _isSetup = true;
 
-            ServerConfig.Load();
-            // Server applies its own config locally
+            // Dedicated servers load + apply their config now. Listen-server hosts
+            // defer this to ApplyHostServerConfigOnce() (fired when hosting starts)
+            // so a pure client never creates a stray ServerMOTD.json. The role
+            // isn't known yet for listen hosts at Setup() time anyway.
             if (IsDedicatedServer())
             {
+                ServerConfig.Load();
                 _serverScreensEnabled = ServerConfig.ScreensEnabled;
                 _serverQueueEnabled   = ServerConfig.QueueEnabled;
+                _browseLinks          = ServerConfig.BrowseLinks;
                 MOTD_URL              = ServerConfig.MotdUrl;
             }
             else
@@ -325,6 +345,7 @@ namespace WebsiteMOTD
             _lastActionTimeUT.Clear();
             _serverScreensEnabled = true;
             _serverQueueEnabled = true;
+            _hostServerConfigApplied = false;
 
             var nm = NetworkManager.Singleton;
             if (nm != null)
@@ -366,10 +387,54 @@ namespace WebsiteMOTD
             var nm = NetworkManager.Singleton;
             if (nm != null && nm.IsServer)
             {
+                // Listen host: pull in config/ServerMOTD.json before we tell any
+                // client (including ourselves) what the config is. Must run first
+                // so SendMOTDToClient reflects the loaded url/flags.
+                ApplyHostServerConfigOnce();
                 SendMOTDToClient(clientId);
                 // Send current queue state to the newcomer
                 ServerSendQueueState(clientId);
             }
+        }
+
+        /// <summary>
+        /// Listen-server host: read config/ServerMOTD.json (created seeded with
+        /// screens+queue ON on first host) and apply it to the live server flags +
+        /// MOTD URL, so a locally-hosted lobby honours the same settings a
+        /// dedicated server would. Dedicated servers already did this at Setup().
+        /// Runs once per host session — Teardown resets the guard so a re-host
+        /// re-reads the file (picking up edits made since).
+        ///
+        /// Driven from TWO places: <see cref="OnClientConnected"/> (so config is
+        /// loaded before the first client is told about it) AND the per-frame
+        /// server ticker (so a SOLO listen host still applies config even when its
+        /// own connect event fired before our callback was registered, and no
+        /// remote client ever joins to trigger it). Idempotent via the guard.
+        /// </summary>
+        internal static void ApplyHostServerConfigOnce()
+        {
+            if (_hostServerConfigApplied) return;
+            if (IsDedicatedServer()) return; // handled in Setup()
+            var nm = NetworkManager.Singleton;
+            if (nm == null || !nm.IsServer) return;
+            _hostServerConfigApplied = true;
+
+            // Reload (not Load) so edits between host sessions apply without a
+            // full game restart.
+            ServerConfig.Reload(hostDefaults: true);
+            _serverScreensEnabled = ServerConfig.ScreensEnabled;
+            _serverQueueEnabled   = ServerConfig.QueueEnabled;
+            _browseLinks          = ServerConfig.BrowseLinks;
+            if (!string.IsNullOrWhiteSpace(ServerConfig.MotdUrl))
+                MOTD_URL = ServerConfig.MotdUrl;
+            Log("Listen host applied ServerMOTD.json (screens=" + _serverScreensEnabled
+                + ", queue=" + _serverQueueEnabled
+                + ", browse_links=" + (_browseLinks?.Count ?? 0)
+                + ", motd_url=" + MOTD_URL + ").");
+
+            // Any clients that connected before this ran got the default config;
+            // push the freshly-loaded state so they catch up. No-op if we're solo.
+            ServerBroadcastQueueState();
         }
 
         private void OnClientDisconnected(ulong clientId)
@@ -1440,7 +1505,11 @@ namespace WebsiteMOTD
             byte flags = 0;
             if (_serverScreensEnabled) flags |= 0x01;
             if (_serverQueueEnabled)   flags |= 0x02;
-            sb.Append("sv|").Append(B64(MOTD_URL ?? "")).Append('|').Append(flags).Append('\n');
+            // 4th field: b64(JSON) of the browse-row links. b64 keeps the inner
+            // JSON's pipes/newlines from colliding with the line/field delimiters.
+            string linksJson = JsonUtility.ToJson(new BrowseLinksWrapper { links = _browseLinks ?? new List<string>() });
+            sb.Append("sv|").Append(B64(MOTD_URL ?? "")).Append('|').Append(flags)
+              .Append('|').Append(B64(linksJson)).Append('\n');
 
             if (_current != null)
             {
@@ -1493,6 +1562,23 @@ namespace WebsiteMOTD
                         {
                             _serverScreensEnabled = (svFlags & 0x01) != 0;
                             _serverQueueEnabled   = (svFlags & 0x02) != 0;
+                        }
+                        // 4th field (optional — absent from older servers): the
+                        // server-defined browse links. Leave the defaults in place
+                        // if it's missing or unparseable.
+                        if (parts.Length >= 4)
+                        {
+                            try
+                            {
+                                string linksJson = FromB64(parts[3]);
+                                if (!string.IsNullOrEmpty(linksJson))
+                                {
+                                    var wrap = JsonUtility.FromJson<BrowseLinksWrapper>(linksJson);
+                                    if (wrap?.links != null && wrap.links.Count > 0)
+                                        _browseLinks = wrap.links;
+                                }
+                            }
+                            catch (Exception ex) { LogError("Parse browse_links failed: " + ex.Message); }
                         }
                     }
                     continue;
@@ -1819,6 +1905,11 @@ namespace WebsiteMOTD
             {
                 var nm = Unity.Netcode.NetworkManager.Singleton;
                 if (nm == null || !nm.IsServer) return;
+
+                // Ensures a solo listen host reads ServerMOTD.json even if its own
+                // connect event was missed. Idempotent — cheap early-return after
+                // the first successful apply.
+                Plugin.ApplyHostServerConfigOnce();
 
                 Plugin.ServerCheckItemDeadline();
 

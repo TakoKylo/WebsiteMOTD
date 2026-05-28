@@ -52,6 +52,42 @@ namespace WebsiteMOTD
     }
 
     // ────────────────────────────────────────────────────────────────
+    //  Browse-shortcut link (server-defined, synced to clients)
+    // ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A browse-row button parsed from its <c>"Name|URL"</c> string form.
+    /// Stored as plain strings in config/over the wire because JsonUtility does
+    /// not reliably (de)serialize List&lt;custom-class&gt; — but it handles
+    /// List&lt;string&gt; fine (same as queue_allowed_sites).
+    /// </summary>
+    public struct BrowseLink
+    {
+        public string Name;
+        public string Url;
+
+        /// <summary>Parse "Name|URL" (split on the first pipe). No pipe = URL only.</summary>
+        public static BrowseLink Parse(string entry)
+        {
+            string e = (entry ?? "").Trim();
+            int bar = e.IndexOf('|');
+            if (bar < 0) return new BrowseLink { Name = e, Url = e };
+            return new BrowseLink
+            {
+                Name = e.Substring(0, bar).Trim(),
+                Url  = e.Substring(bar + 1).Trim(),
+            };
+        }
+    }
+
+    /// <summary>JsonUtility can't (de)serialize a bare List, so wrap it.</summary>
+    [Serializable]
+    public class BrowseLinksWrapper
+    {
+        public List<string> links = new List<string>();
+    }
+
+    // ────────────────────────────────────────────────────────────────
     //  Server-only config
     // ────────────────────────────────────────────────────────────────
 
@@ -61,6 +97,12 @@ namespace WebsiteMOTD
         public bool screens_enabled = false;
         public bool queue_enabled = false;
         public string motd_url = "https://poncepuck.net/motd/";
+
+        // Buttons shown in the overlay's "Browse:" row. Server-defined and synced
+        // to every client. Each entry is "Name|URL". Seeded with YouTube + Twitch;
+        // edit/add/remove freely. (List<string>, not List<object>, because
+        // JsonUtility silently fails to parse arrays of custom classes.)
+        public List<string> browse_links = ServerConfig.DefaultBrowseLinks();
 
         // Hard cap on how long a single queue item is allowed to remain
         // "current" before the server force-advances. Defends against the
@@ -95,6 +137,19 @@ namespace WebsiteMOTD
         public static bool ScreensEnabled => _data.screens_enabled;
         public static bool QueueEnabled   => _data.queue_enabled;
         public static string MotdUrl      => _data.motd_url;
+
+        /// <summary>Browse-row buttons ("Name|URL" entries), defaults if cleared.</summary>
+        public static List<string> BrowseLinks =>
+            (_data.browse_links != null && _data.browse_links.Count > 0)
+                ? _data.browse_links
+                : DefaultBrowseLinks();
+
+        /// <summary>The seed/fallback browse buttons (YouTube + Twitch).</summary>
+        public static List<string> DefaultBrowseLinks() => new List<string>
+        {
+            "YouTube|https://www.youtube.com/",
+            "Twitch|https://www.twitch.tv/directory",
+        };
         public static int MaxItemSeconds  => _data.max_item_seconds;
 
         public static IReadOnlyList<string> QueueAllowedSites =>
@@ -129,12 +184,22 @@ namespace WebsiteMOTD
         private static ServerConfigData _data = new ServerConfigData();
         private static bool _loaded;
 
-        public static void Load()
+        /// <summary>
+        /// Load <c>config/ServerMOTD.json</c>, creating it with defaults on first
+        /// run. The caller decides WHEN this runs: dedicated servers call it at
+        /// setup; listen-server hosts call it via
+        /// <see cref="Plugin.ApplyHostServerConfigOnce"/> when hosting starts.
+        /// Pure clients never call it, so they never get a stray ServerMOTD.json.
+        ///
+        /// <paramref name="hostDefaults"/> only affects first-run file creation:
+        /// when true (listen host), screens+queue are seeded ON to preserve the
+        /// prior listen-server behaviour; when false (dedicated), they stay OFF
+        /// (opt-in). An existing file is always honoured as-is regardless.
+        /// </summary>
+        public static void Load(bool hostDefaults = false)
         {
             if (_loaded) return;
             _loaded = true;
-
-            if (!Plugin.IsDedicatedServer()) return;
 
             string configDir = ConfigPaths.ConfigDir();
             string dllDir    = ConfigPaths.DllDir();
@@ -178,10 +243,23 @@ namespace WebsiteMOTD
                     if (parsed != null) _data = parsed;
                     if (string.IsNullOrWhiteSpace(_data.motd_url))
                         _data.motd_url = "https://poncepuck.net/motd/";
+                    if (_data.browse_links == null || _data.browse_links.Count == 0)
+                        _data.browse_links = DefaultBrowseLinks();
                     Plugin.Log("Server config loaded from " + jsonPath
                                + " (screens=" + _data.screens_enabled
                                + ", queue=" + _data.queue_enabled
+                               + ", browse_links=" + _data.browse_links.Count
                                + ", motd_url=" + _data.motd_url + ").");
+
+                    // Schema backfill: a file written by an older build won't have
+                    // newer fields (e.g. browse_links). Rewrite it so the full
+                    // current schema — with sensible defaults — is present for the
+                    // admin to edit. Parsed values (incl. manual edits) are kept.
+                    if (!raw.Contains("browse_links"))
+                    {
+                        Save(jsonPath);
+                        Plugin.Log("Backfilled new fields into ServerMOTD.json.");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -190,7 +268,14 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // First run: migrate from legacy .ini if present, else defaults.
+            // First run: seed defaults, then let a legacy .ini override if present.
+            // Listen hosts seed screens+queue ON (preserving prior behaviour);
+            // dedicated servers keep the class-default OFF.
+            if (hostDefaults)
+            {
+                _data.screens_enabled = true;
+                _data.queue_enabled = true;
+            }
             if (File.Exists(iniPath))
             {
                 try
@@ -221,6 +306,16 @@ namespace WebsiteMOTD
             }
 
             Save(jsonPath);
+        }
+
+        /// <summary>
+        /// Force a fresh read from disk. Used when a listen host (re)starts a
+        /// lobby so edits made between sessions apply without a game restart.
+        /// </summary>
+        public static void Reload(bool hostDefaults = false)
+        {
+            _loaded = false;
+            Load(hostDefaults);
         }
 
         private static void Save(string path)

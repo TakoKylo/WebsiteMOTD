@@ -260,6 +260,28 @@ namespace WebsiteMOTD
             TheatreVideoScreenBridge.UnsubscribeClaimChanged();
 
             if (_theatreScreen == null && !TheatreVideoScreenBridge.IsClaimedByUs) return;
+
+            // Park the shared WebView on about:blank before handing the screen
+            // back to OWP. Without this, if YouTube's autoplay-next slipped past
+            // our killer (selector miss, late observer disconnect, fresh profile
+            // with no PREF cookie), the WebView keeps playing the recommended
+            // video's AUDIO after the visual has already reverted to OWP's r607
+            // showcase. about:blank has no media elements, so playback stops
+            // unconditionally.
+            //
+            // Pause + mute all media FIRST: LoadURL is async on the STA thread, so
+            // a few frames of audio can leak between the call and about:blank
+            // actually loading. EvaluateJS is faster (no page load) and gives us
+            // an instant cutoff. About:blank is the durable kill that also defeats
+            // YouTube's "Up next in 5..." autoplay countdown, which a pause alone
+            // would not stop. The next queue item just navigates away.
+            if (_sharedWebView != IntPtr.Zero)
+            {
+                _CWebViewPlugin_EvaluateJS(_sharedWebView,
+                    "try{document.querySelectorAll('video,audio').forEach(function(m){try{m.pause();m.muted=true;}catch(_e){}});}catch(_e){}");
+                _CWebViewPlugin_LoadURL(_sharedWebView, "about:blank");
+            }
+
             _theatreScreen = null;
             _theatreRenderer = null;
             TheatreVideoScreenBridge.Release();

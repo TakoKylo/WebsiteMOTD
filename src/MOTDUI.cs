@@ -87,6 +87,9 @@ namespace WebsiteMOTD
         private static Button _miniMuteBtn;
         private static Action<float> _zoomSliderSetter;
         private static Button _muteSettingsBtn;
+        // In-rink video screen capture tuning (smoothness ↔ sharpness/CPU).
+        private static int   _screenCaptureFps = 60;
+        private static float _screenResolutionScale = 1.0f;
 
         // ── Settings persistence (delegated to ClientConfig) ──
         private static bool _settingsLoaded;
@@ -2073,6 +2076,56 @@ namespace WebsiteMOTD
                     container.Add(_screenToggleBtn);
                 });
 
+            // Screen Frame Rate (in-rink video screens)
+            AddSettingsRow(inner, "Screen Frame Rate",
+                "Capture rate for the in-rink video screens. Higher is smoother if your CPU keeps up; lower is steadier on weaker machines.",
+                container =>
+                {
+                    var fpsLabel = new Label(_screenCaptureFps + " fps");
+                    fpsLabel.style.fontSize = 13f;
+                    fpsLabel.style.color    = Color.white;
+                    fpsLabel.style.width    = 52f;
+                    fpsLabel.style.unityTextAlign = TextAnchor.MiddleRight;
+                    fpsLabel.style.marginLeft = 10f;
+
+                    float initFps = (_screenCaptureFps - 30f) / 110f; // 30–140 fps → 0–1
+                    AddCustomSlider(container, 200f, initFps,
+                        onChange: v =>
+                        {
+                            _screenCaptureFps = Mathf.Clamp(Mathf.RoundToInt(30f + v * 110f), 30, 140);
+                            fpsLabel.text = _screenCaptureFps + " fps";
+                            MOTDWorldScreen.ApplyCaptureFps(_screenCaptureFps);
+                            SaveSettings();
+                        },
+                        setter: out _);
+                    container.Add(fpsLabel);
+                });
+
+            // Screen Resolution (in-rink video screens)
+            AddSettingsRow(inner, "Screen Resolution",
+                "Capture sharpness for the in-rink video screens. Lower frees up CPU so the target frame rate is easier to hold on weaker machines.",
+                container =>
+                {
+                    var resLabel = new Label(Mathf.RoundToInt(1080f * _screenResolutionScale) + "p");
+                    resLabel.style.fontSize = 13f;
+                    resLabel.style.color    = Color.white;
+                    resLabel.style.width    = 52f;
+                    resLabel.style.unityTextAlign = TextAnchor.MiddleRight;
+                    resLabel.style.marginLeft = 10f;
+
+                    float initRes = (_screenResolutionScale - 0.4f) / 0.6f; // 0.4–1.0 → 0–1
+                    AddCustomSlider(container, 200f, initRes,
+                        onChange: v =>
+                        {
+                            _screenResolutionScale = Mathf.Clamp(0.4f + v * 0.6f, 0.4f, 1.0f);
+                            resLabel.text = Mathf.RoundToInt(1080f * _screenResolutionScale) + "p";
+                            MOTDWorldScreen.ApplyResolutionScale(_screenResolutionScale);
+                            SaveSettings();
+                        },
+                        setter: out _);
+                    container.Add(resLabel);
+                });
+
             // ════════════════════════════════════════════════════════
             // PLAYBACK
             // ════════════════════════════════════════════════════════
@@ -2234,11 +2287,13 @@ namespace WebsiteMOTD
             if (Plugin.IsDedicatedServer()) return; // client-only config
 
             ClientConfig.EnsureLoaded();
-            _globalVolume    = ClientConfig.Volume;
-            _isMuted         = ClientConfig.Muted;
-            _screensDisabled = ClientConfig.ScreensDisabled;
-            _zoomLevel       = ClientConfig.Zoom;
-            _settingsLoaded  = true;
+            _globalVolume          = ClientConfig.Volume;
+            _isMuted               = ClientConfig.Muted;
+            _screensDisabled       = ClientConfig.ScreensDisabled;
+            _zoomLevel             = ClientConfig.Zoom;
+            _screenCaptureFps      = ClientConfig.CaptureFps;
+            _screenResolutionScale = ClientConfig.ScreenResolutionScale;
+            _settingsLoaded        = true;
             Plugin.Log("MOTD settings loaded from ClientMOTD.json.");
         }
 
@@ -2251,8 +2306,9 @@ namespace WebsiteMOTD
         private static void SaveSettings()
         {
             if (Plugin.IsDedicatedServer()) return; // client-only config
-            // Single disk write for all four fields (task 4: batch saves).
-            ClientConfig.SaveSettings(_globalVolume, _isMuted, _screensDisabled, _zoomLevel);
+            // Single disk write for all settings fields (batched save).
+            ClientConfig.SaveSettings(_globalVolume, _isMuted, _screensDisabled, _zoomLevel,
+                                      _screenCaptureFps, _screenResolutionScale);
         }
 
         private static void ShowConfirmDialog(string url, string domain)

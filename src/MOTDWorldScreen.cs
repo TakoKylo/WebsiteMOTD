@@ -29,11 +29,15 @@ namespace WebsiteMOTD
         [DllImport("WebView")]
         private static extern void _CWebViewPlugin_Update(IntPtr instance, bool refreshBitmap, int devicePixelRatio);
         [DllImport("WebView")]
+        private static extern void _CWebViewPlugin_SetCaptureLoop(IntPtr instance, bool enabled, int intervalMs);
+        [DllImport("WebView")]
         private static extern int _CWebViewPlugin_BitmapWidth(IntPtr instance);
         [DllImport("WebView")]
         private static extern int _CWebViewPlugin_BitmapHeight(IntPtr instance);
         [DllImport("WebView")]
         private static extern void _CWebViewPlugin_Render(IntPtr instance, IntPtr textureBuffer);
+        [DllImport("WebView")]
+        private static extern int _CWebViewPlugin_RenderInto(IntPtr instance, IntPtr buffer, int bufferLen, out int outW, out int outH);
         [DllImport("WebView")]
         private static extern ulong _CWebViewPlugin_BitmapGeneration(IntPtr instance);
         [DllImport("WebView")]
@@ -74,6 +78,22 @@ namespace WebsiteMOTD
         private const float MinCaptureIntervalSec = 1f / 120f;
         private static int  _consecutiveStaticChecks;
         private static float _lastCaptureUT;
+
+        // ─── Fixed-cadence native capture loop ──────────────────────
+        // Preferred path: the native plugin captures on its own steady timer
+        // (see _CWebViewPlugin_SetCaptureLoop) so frames arrive evenly paced
+        // rather than at the mercy of per-capture JPEG cost. Even pacing is what
+        // actually cures the "nauseating judder" — uneven frame intervals read
+        // far worse than a low-but-steady rate. We keep the loop's target
+        // interval synced to active/idle and upload only genuinely new frames
+        // (the native side now bumps BitmapGeneration on real pixel change only).
+        private static bool  _captureLoopSupported = true;   // false → fall back to pull mode (old DLL)
+        private static bool  _renderIntoSupported = true;    // false → fall back to BitmapWidth/Height + Render (old DLL)
+        private static int   _activeCaptureMs = 16;          // ~60fps; derived from ClientConfig.CaptureFps at init
+        private const  int   IdleCaptureMs = 150;            // ~6.7fps when the page is static
+        private const  float IdleAfterSec = 0.4f;            // no new frame this long → relax to idle cadence
+        private static int   _captureIntervalMs = -1;        // last interval pushed to native (-1 = unset)
+        private static float _lastGenChangeUT;               // unscaled time of the last real (changed) frame
 
         // ─── Proximity audio ────────────────────────────────────────
         // WebView2 plays audio directly to the Windows mixer — we can't route it
@@ -561,6 +581,11 @@ namespace WebsiteMOTD
             _lastTickRxUT        = 0d;
             _lastDriftSeekUT     = 0d;
             _lastLoadTime        = 0f;
+
+            // Capture-loop state: force the next spawn to re-push its interval and
+            // re-baseline the idle timer (the native timer dies with the webview).
+            _captureIntervalMs   = -1;
+            _lastGenChangeUT     = 0f;
         }
 
         // ─── Goal Finding ───────────────────────────────────────────
@@ -694,9 +719,17 @@ namespace WebsiteMOTD
 
             MOTDWebView.EnsureStaticInit();
 
+            // Capture resolution: full 1080p by default (sharp up close), but a
+            // client can scale it down to give each capture more headroom and
+            // hold the target fps on weaker CPUs. The display texture auto-sizes
+            // from the native bitmap, so only the webview rect changes here.
+            int capW = TEX_WIDTH, capH = TEX_HEIGHT;
+            try { ComputeCaptureSize(ClientConfig.ScreenResolutionScale, out capW, out capH); }
+            catch { capW = TEX_WIDTH; capH = TEX_HEIGHT; }
+
             _sharedWebView = _CWebViewPlugin_Init(
                 goName, true, false,
-                TEX_WIDTH, TEX_HEIGHT, "", false);
+                capW, capH, "", false);
 
             if (_sharedWebView == IntPtr.Zero)
             {
@@ -705,7 +738,7 @@ namespace WebsiteMOTD
             }
 
             _CWebViewPlugin_SetVisibility(_sharedWebView, true);
-            _CWebViewPlugin_SetRect(_sharedWebView, TEX_WIDTH, TEX_HEIGHT);
+            _CWebViewPlugin_SetRect(_sharedWebView, capW, capH);
 
             // Volume hook runs before any page script, so freshly-created media
             // elements can't sneak through at the default 1.0 volume. Tolerate older
@@ -728,6 +761,15 @@ namespace WebsiteMOTD
             // profile. Profile-bound + once-per-process, so this is a no-op
             // when the overlay WebView already triggered the load.
             MOTDWebView.TryLoadBundledExtensions(_sharedWebView);
+
+            // Start the native fixed-cadence capture loop for even frame pacing.
+            // Cadence comes from client config (default ~30fps). Falls back to
+            // pull-mode automatically if the DLL predates the export.
+            try { _activeCaptureMs = Mathf.Max(4, 1000 / Mathf.Max(1, ClientConfig.CaptureFps)); }
+            catch { _activeCaptureMs = 16; }
+            _captureIntervalMs = _activeCaptureMs;
+            _lastGenChangeUT = Time.unscaledTime;
+            TrySetCaptureLoop(true, _activeCaptureMs);
         }
 
         private static void DestroySharedWebView()
@@ -844,85 +886,34 @@ namespace WebsiteMOTD
                     }
                 }
 
-                // Adaptive refresh: full-speed during the post-load grace window OR
-                // whenever the page is actively producing new bitmaps (video, anim,
-                // scrolling). Only throttle once content has been static for a beat.
-                float idleSec = Time.unscaledTime - _lastLoadTime;
-                bool nearLoad = idleSec < LoadActiveSec;
-                bool pageActive = _consecutiveStaticChecks < StaticChecksForIdle;
-
-                bool shouldRefresh;
-                if (!_bitmapGenSupported)
-                    shouldRefresh = (Time.frameCount % NoBitmapGenFrameInterval == 0);
-                else if (nearLoad || pageActive)
-                    shouldRefresh = true;
-                else
-                    shouldRefresh = (Time.frameCount % IdleFrameInterval == 0);
-
-                // Real-time rate cap. Frame-count throttling doesn't help here
-                // because the rate it produces varies with Unity's FPS, while
-                // WebView2 paints at a fixed cadence (≈ vsync of its own DComp
-                // surface). Pin the capture rate so we don't outpace it.
-                if (shouldRefresh && Time.unscaledTime - _lastCaptureUT < MinCaptureIntervalSec)
-                    shouldRefresh = false;
-
-                _CWebViewPlugin_Update(_sharedWebView, shouldRefresh, 1);
-                if (shouldRefresh) _lastCaptureUT = Time.unscaledTime;
-
-                if (shouldRefresh)
+                // Frame capture & upload. Preferred path: the native plugin runs a
+                // steady fixed-cadence capture loop (even pacing → no judder); we
+                // just keep its target interval synced to active/idle and upload
+                // whenever a genuinely new frame arrives. Pull mode is the fallback
+                // for DLLs that predate the capture-loop export.
+                if (_captureLoopSupported)
                 {
-                    // Check if native bitmap actually changed since last upload
-                    bool bitmapChanged = true;
-                    if (_bitmapGenSupported)
+                    // Upload first so a frame arriving after an idle stretch updates
+                    // _lastGenChangeUT before we pick this frame's cadence — that
+                    // flips us back to active with no extra-frame delay.
+                    UploadSharedFrameIfChanged();
+
+                    // BitmapGeneration advances only on real pixel change, so "no new
+                    // frame for IdleAfterSec" means the page is static and we can relax
+                    // the cadence. A recent load forces active.
+                    float sinceGen  = Time.unscaledTime - _lastGenChangeUT;
+                    float sinceLoad = Time.unscaledTime - _lastLoadTime;
+                    bool wantActive = sinceLoad < LoadActiveSec || sinceGen < IdleAfterSec;
+                    int  wantInterval = wantActive ? _activeCaptureMs : IdleCaptureMs;
+                    if (wantInterval != _captureIntervalMs)
                     {
-                        try
-                        {
-                            ulong gen = _CWebViewPlugin_BitmapGeneration(_sharedWebView);
-                            bitmapChanged = (gen != _sharedLastGen);
-                            if (bitmapChanged)
-                            {
-                                _sharedLastGen = gen;
-                                _consecutiveStaticChecks = 0; // page is moving — stay fast
-                            }
-                            else if (_consecutiveStaticChecks < int.MaxValue)
-                            {
-                                _consecutiveStaticChecks++;   // count toward idle decision
-                            }
-                        }
-                        catch (System.EntryPointNotFoundException)
-                        {
-                            _bitmapGenSupported = false;
-                            Plugin.LogError("WorldScreen: _CWebViewPlugin_BitmapGeneration not found — falling back to unconditional refresh.");
-                        }
+                        _captureIntervalMs = wantInterval;
+                        TrySetCaptureLoop(true, wantInterval);
                     }
-
-                    if (bitmapChanged)
-                    {
-                        int w = _CWebViewPlugin_BitmapWidth(_sharedWebView);
-                        int h = _CWebViewPlugin_BitmapHeight(_sharedWebView);
-                        if (w > 0 && h > 0)
-                        {
-                            if (_sharedTexture == null || _sharedTexture.width != w || _sharedTexture.height != h)
-                            {
-                                if (_sharedTexture != null) Destroy(_sharedTexture);
-                                bool linear = QualitySettings.activeColorSpace == ColorSpace.Linear;
-                                _sharedTexture = new Texture2D(w, h, TextureFormat.RGBA32, false, !linear);
-                                _sharedTexture.filterMode = FilterMode.Bilinear;
-                                _sharedTexture.wrapMode = TextureWrapMode.Clamp;
-                                _sharedTextureBuffer = new byte[w * h * 4];
-                            }
-
-                            if (_sharedTextureBuffer != null)
-                            {
-                                var gch = GCHandle.Alloc(_sharedTextureBuffer, GCHandleType.Pinned);
-                                _CWebViewPlugin_Render(_sharedWebView, gch.AddrOfPinnedObject());
-                                gch.Free();
-
-                                _sharedTexture.LoadRawTextureData(_sharedTextureBuffer);
-                                _sharedTexture.Apply(false);
-                            }
-                        }
-                    }
+                }
+                else
+                {
+                    LegacyPullRefresh();
                 }
             }
             // All screens apply the shared texture to their material
@@ -947,6 +938,178 @@ namespace WebsiteMOTD
             }
         }
 
+        // ─── Frame capture helpers ──────────────────────────────────
+
+        /// <summary>
+        /// Enable/disable the native fixed-cadence capture loop. On a DLL that
+        /// predates the export, flip to pull mode permanently and degrade
+        /// gracefully (the next Update falls into <see cref="LegacyPullRefresh"/>).
+        /// </summary>
+        private static void TrySetCaptureLoop(bool enabled, int intervalMs)
+        {
+            if (_sharedWebView == IntPtr.Zero || !_captureLoopSupported) return;
+            try { _CWebViewPlugin_SetCaptureLoop(_sharedWebView, enabled, intervalMs); }
+            catch (EntryPointNotFoundException)
+            {
+                _captureLoopSupported = false;
+                Plugin.Log("WorldScreen: WebView.dll predates the steady capture loop — using pull-mode refresh (rebuild the native plugin for smoother video).");
+            }
+            catch (Exception ex)
+            {
+                _captureLoopSupported = false;
+                Plugin.LogError("WorldScreen: SetCaptureLoop threw: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Upload the latest native bitmap to the shared texture iff a new frame
+        /// has been produced since the last upload. Used by the capture-loop path:
+        /// the native side bumps BitmapGeneration only on real pixel change, so
+        /// this skips redundant GPU uploads and feeds the active/idle cadence
+        /// decision via <see cref="_lastGenChangeUT"/>.
+        /// </summary>
+        private static void UploadSharedFrameIfChanged()
+        {
+            if (_sharedWebView == IntPtr.Zero) return;
+
+            ulong gen;
+            try { gen = _CWebViewPlugin_BitmapGeneration(_sharedWebView); }
+            catch (EntryPointNotFoundException)
+            {
+                // No generation counter at all — abandon the loop path for good.
+                _bitmapGenSupported = false;
+                _captureLoopSupported = false;
+                return;
+            }
+            if (gen == _sharedLastGen) return;   // no new frame yet
+            _sharedLastGen = gen;
+            _lastGenChangeUT = Time.unscaledTime;
+
+            UploadSharedBitmap();
+        }
+
+        /// <summary>
+        /// Copy the current native bitmap into the shared <see cref="Texture2D"/>,
+        /// (re)allocating it on a size change. Shared by the loop and pull paths.
+        ///
+        /// The staging buffer is sized to the maximum possible capture (full 1080p;
+        /// the resolution scale is clamped ≤ 1.0), never to the current w×h. This
+        /// matters because the resolution slider changes the capture size at runtime
+        /// (SetRect): the native frame can grow between a size query and the copy,
+        /// and a w×h-sized buffer could then be overflowed by the native memcpy.
+        /// RenderInto additionally reports the size of the exact frame it copied
+        /// under the same lock, so the upload size always matches the pixels.
+        /// </summary>
+        private static void UploadSharedBitmap()
+        {
+            int maxBytes = TEX_WIDTH * TEX_HEIGHT * 4;
+            if (_sharedTextureBuffer == null || _sharedTextureBuffer.Length != maxBytes)
+                _sharedTextureBuffer = new byte[maxBytes];
+
+            var gch = GCHandle.Alloc(_sharedTextureBuffer, GCHandleType.Pinned);
+            try
+            {
+                IntPtr ptr = gch.AddrOfPinnedObject();
+
+                if (_renderIntoSupported)
+                {
+                    int w, h;
+                    int copied;
+                    try { copied = _CWebViewPlugin_RenderInto(_sharedWebView, ptr, maxBytes, out w, out h); }
+                    catch (EntryPointNotFoundException)
+                    {
+                        _renderIntoSupported = false;
+                        copied = 0; w = 0; h = 0;
+                    }
+                    if (_renderIntoSupported)
+                    {
+                        if (copied > 0) UploadPixels(ptr, w, h);
+                        return;
+                    }
+                }
+
+                // Fallback (DLL predates RenderInto): separate size query + copy. The
+                // max-size buffer still makes the native copy overflow-safe; a resize
+                // racing in can produce one torn frame that self-corrects next frame.
+                int fw = _CWebViewPlugin_BitmapWidth(_sharedWebView);
+                int fh = _CWebViewPlugin_BitmapHeight(_sharedWebView);
+                if (fw <= 0 || fh <= 0) return;
+                _CWebViewPlugin_Render(_sharedWebView, ptr);
+                UploadPixels(ptr, fw, fh);
+            }
+            finally { gch.Free(); }
+        }
+
+        /// <summary>
+        /// Upload <paramref name="w"/>×<paramref name="h"/> RGBA32 pixels at
+        /// <paramref name="ptr"/> into the shared texture, (re)allocating it on a
+        /// size change. Skips if w×h×4 exceeds the staging buffer so a malformed
+        /// size can never make LoadRawTextureData read past it.
+        /// </summary>
+        private static void UploadPixels(IntPtr ptr, int w, int h)
+        {
+            long need = (long)w * h * 4;
+            if (need <= 0 || _sharedTextureBuffer == null || need > _sharedTextureBuffer.Length) return;
+
+            if (_sharedTexture == null || _sharedTexture.width != w || _sharedTexture.height != h)
+            {
+                if (_sharedTexture != null) Destroy(_sharedTexture);
+                bool linear = QualitySettings.activeColorSpace == ColorSpace.Linear;
+                _sharedTexture = new Texture2D(w, h, TextureFormat.RGBA32, false, !linear);
+                _sharedTexture.filterMode = FilterMode.Bilinear;
+                _sharedTexture.wrapMode = TextureWrapMode.Clamp;
+            }
+            _sharedTexture.LoadRawTextureData(ptr, w * h * 4);
+            _sharedTexture.Apply(false);
+        }
+
+        /// <summary>
+        /// Fallback for WebView.dll builds that predate the capture-loop export:
+        /// pull-drive captures from Unity's Update at up to
+        /// <see cref="MinCaptureIntervalSec"/>, throttling once the page has been
+        /// static for a while. Uneven pacing, but works on any DLL.
+        /// </summary>
+        private static void LegacyPullRefresh()
+        {
+            float idleSec = Time.unscaledTime - _lastLoadTime;
+            bool nearLoad = idleSec < LoadActiveSec;
+            bool pageActive = _consecutiveStaticChecks < StaticChecksForIdle;
+
+            bool shouldRefresh;
+            if (!_bitmapGenSupported)
+                shouldRefresh = (Time.frameCount % NoBitmapGenFrameInterval == 0);
+            else if (nearLoad || pageActive)
+                shouldRefresh = true;
+            else
+                shouldRefresh = (Time.frameCount % IdleFrameInterval == 0);
+
+            if (shouldRefresh && Time.unscaledTime - _lastCaptureUT < MinCaptureIntervalSec)
+                shouldRefresh = false;
+
+            _CWebViewPlugin_Update(_sharedWebView, shouldRefresh, 1);
+            if (!shouldRefresh) return;
+            _lastCaptureUT = Time.unscaledTime;
+
+            bool bitmapChanged = true;
+            if (_bitmapGenSupported)
+            {
+                try
+                {
+                    ulong gen = _CWebViewPlugin_BitmapGeneration(_sharedWebView);
+                    bitmapChanged = (gen != _sharedLastGen);
+                    if (bitmapChanged) { _sharedLastGen = gen; _consecutiveStaticChecks = 0; }
+                    else if (_consecutiveStaticChecks < int.MaxValue) _consecutiveStaticChecks++;
+                }
+                catch (EntryPointNotFoundException)
+                {
+                    _bitmapGenSupported = false;
+                    Plugin.LogError("WorldScreen: _CWebViewPlugin_BitmapGeneration not found — falling back to unconditional refresh.");
+                }
+            }
+
+            if (bitmapChanged) UploadSharedBitmap();
+        }
+
         // ─── Cleanup ────────────────────────────────────────────────
 
         public void Cleanup()
@@ -968,6 +1131,39 @@ namespace WebsiteMOTD
                 _screenA._renderer.enabled = visible;
             if (_screenB != null && _screenB._renderer != null)
                 _screenB._renderer.enabled = visible;
+        }
+
+        /// <summary>Capture width/height for a given resolution scale (×1080p), clamped + even.</summary>
+        private static void ComputeCaptureSize(float scale, out int w, out int h)
+        {
+            scale = Mathf.Clamp(scale, 0.4f, 1.0f);
+            w = Mathf.Max(640, Mathf.RoundToInt(TEX_WIDTH  * scale)) & ~1;
+            h = Mathf.Max(360, Mathf.RoundToInt(TEX_HEIGHT * scale)) & ~1;
+        }
+
+        /// <summary>
+        /// Live-apply a new capture frame rate to the in-world video screens.
+        /// Takes effect on the next Update tick (forces a re-push of the native
+        /// capture-loop interval). No-op for the idle cadence, which Update keeps
+        /// managing. Persisted separately via ClientConfig.
+        /// </summary>
+        public static void ApplyCaptureFps(int fps)
+        {
+            _activeCaptureMs   = Mathf.Max(4, 1000 / Mathf.Clamp(fps, 30, 140));
+            _captureIntervalMs = -1; // force Update() to re-push the active interval
+        }
+
+        /// <summary>
+        /// Live-apply a new capture resolution scale (×1080p) to the shared
+        /// world-screen webview. The display texture re-allocates automatically on
+        /// the next frame when the native bitmap size changes. No-op until the
+        /// webview exists (the value still persists and applies on next spawn).
+        /// </summary>
+        public static void ApplyResolutionScale(float scale)
+        {
+            if (_sharedWebView == IntPtr.Zero) return;
+            ComputeCaptureSize(scale, out int w, out int h);
+            _CWebViewPlugin_SetRect(_sharedWebView, w, h);
         }
 
         /// <summary>

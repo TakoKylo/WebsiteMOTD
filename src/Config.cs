@@ -344,6 +344,18 @@ namespace WebsiteMOTD
         public bool screens_disabled = false;
         public float zoom = 1.0f;
         public List<string> trusted_sites = new List<string>();
+
+        // ── World/theatre video tuning (smoothness ↔ sharpness/CPU) ──
+        // Target capture rate for the in-world video screens. The native plugin
+        // captures on a fixed-cadence loop at this rate (even pacing kills the
+        // judder). 60 is a good default for high-refresh monitors; lower if the
+        // CPU can't finish captures in time, raise for very high-refresh setups.
+        // Actual rate is still bounded by capture throughput. 30–140.
+        public int screen_capture_fps = 60;
+        // Capture resolution scale (×1920×1080). 1.0 = full sharpness (default);
+        // drop to e.g. 0.67 (→1280×720) on weaker CPUs to give each capture more
+        // headroom and hold the target fps. Clamped 0.4–1.0.
+        public float screen_resolution_scale = 1.0f;
     }
 
     /// <summary>
@@ -378,6 +390,18 @@ namespace WebsiteMOTD
             set { EnsureLoaded(); _data.zoom = value; Save(); }
         }
 
+        /// <summary>Target capture rate (fps) for the in-world video screens. 30–140.</summary>
+        public static int CaptureFps
+        {
+            get { EnsureLoaded(); return Mathf.Clamp(_data.screen_capture_fps, 30, 140); }
+        }
+
+        /// <summary>Capture resolution scale for the world screens (×1080p). 0.4–1.0.</summary>
+        public static float ScreenResolutionScale
+        {
+            get { EnsureLoaded(); return Mathf.Clamp(_data.screen_resolution_scale, 0.4f, 1.0f); }
+        }
+
         public static bool IsTrusted(string domain)
         {
             EnsureLoaded();
@@ -404,13 +428,16 @@ namespace WebsiteMOTD
         /// Persist all four UI settings in a single disk write. Cheaper than
         /// setting each property individually (each setter would Save() on its own).
         /// </summary>
-        public static void SaveSettings(float volume, bool muted, bool screensDisabled, float zoom)
+        public static void SaveSettings(float volume, bool muted, bool screensDisabled, float zoom,
+                                        int captureFps, float resolutionScale)
         {
             EnsureLoaded();
-            _data.volume           = Mathf.Clamp01(volume);
-            _data.muted            = muted;
-            _data.screens_disabled = screensDisabled;
-            _data.zoom             = Mathf.Clamp(zoom, 0.5f, 2.0f);
+            _data.volume                  = Mathf.Clamp01(volume);
+            _data.muted                   = muted;
+            _data.screens_disabled        = screensDisabled;
+            _data.zoom                    = Mathf.Clamp(zoom, 0.5f, 2.0f);
+            _data.screen_capture_fps      = Mathf.Clamp(captureFps, 10, 60);
+            _data.screen_resolution_scale = Mathf.Clamp(resolutionScale, 0.4f, 1.0f);
             Save();
         }
 
@@ -470,6 +497,8 @@ namespace WebsiteMOTD
                     if (parsed != null) _data = parsed;
                     _data.volume = Mathf.Clamp01(_data.volume);
                     _data.zoom   = Mathf.Clamp(_data.zoom, 0.5f, 2.0f);
+                    _data.screen_capture_fps       = Mathf.Clamp(_data.screen_capture_fps, 30, 140);
+                    _data.screen_resolution_scale  = Mathf.Clamp(_data.screen_resolution_scale, 0.4f, 1.0f);
                     if (_data.trusted_sites == null)
                         _data.trusted_sites = new List<string>();
                     Plugin.Log("Client config loaded (" + _data.trusted_sites.Count + " trusted sites).");

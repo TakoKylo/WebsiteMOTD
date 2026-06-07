@@ -373,7 +373,6 @@ namespace WebsiteMOTD
             TheatreVideoScreenBridge.ResetCachedState();
             OWPUIBridge.ResetCachedState();
 
-            MOTDWebContent.Cleanup();
             OnQueueChanged?.Invoke();
         }
 
@@ -803,11 +802,20 @@ namespace WebsiteMOTD
 
         public static int GetVoteSkipThreshold()
         {
-            var nm = NetworkManager.Singleton;
-            if (nm == null) return 1;
-            // Majority of connected clients (server counts too).
-            int total = nm.ConnectedClientsIds.Count;
-            return Mathf.Max(1, (total / 2) + 1);
+            try
+            {
+                var nm = NetworkManager.Singleton;
+                if (nm == null) return 1;
+                // Majority of connected clients (server counts too). This runs on
+                // clients too (for the vote-bar label, every queue-panel refresh), so
+                // wrap it: some Netcode versions throw NotServerException reading
+                // ConnectedClientsIds off-server, and an unguarded throw here would
+                // bubble out of RefreshQueuePanel. The server stays authoritative on
+                // the real threshold regardless of what the client label shows.
+                int total = nm.ConnectedClientsIds.Count;
+                return Mathf.Max(1, (total / 2) + 1);
+            }
+            catch { return 1; }
         }
 
         /// <summary>

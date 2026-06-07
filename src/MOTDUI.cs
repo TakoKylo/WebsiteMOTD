@@ -1,7 +1,5 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.IO;
 using System.Reflection;
 using Steamworks;
 using UnityEngine;
@@ -20,29 +18,18 @@ namespace WebsiteMOTD
     public static class MOTDUI
     {
         private static VisualElement _overlay;
-        private static VisualElement _contentArea;
-        private static ScrollView _scrollView;
-        private static Label _statusLabel;
+        private static VisualElement _browserHost;   // container the WebView element lives in
         private static TextField _urlField;
         private static Button _backBtn;
         private static Button _fwdBtn;
         private static bool _isVisible;
         private static string _url;
-        private static readonly Stack<string> _history = new Stack<string>();
-        private static readonly Stack<string> _forwardHistory = new Stack<string>();
-        private static readonly List<MOTDVideoHost> _videoHosts     = new List<MOTDVideoHost>();
-        private static readonly List<Coroutine>     _gifCoroutines  = new List<Coroutine>();
-        // Decoded textures (GIF frames + downloaded images) need explicit Destroy to
-        // free GPU memory — Unity's GC handles the C# wrapper, not the underlying
-        // texture. Without tracking, every page nav with images leaks them.
-        private static readonly List<Texture2D>     _managedTextures = new List<Texture2D>();
         private static string _homeUrl;
 
-        // ── WebView mode ──
+        // ── WebView (sole rendering engine) ──
         private static MOTDWebView _webView;
         private static VisualElement _webViewElement;
         private static bool _useWebView;
-        private static Button _webViewToggleBtn;
         private static int _lastWebViewWidth;
         private static int _lastWebViewHeight;
 
@@ -97,13 +84,6 @@ namespace WebsiteMOTD
         // ── Site confirmation ──
         private static HashSet<string> _trustedDomains;
         private static VisualElement _confirmOverlay; // the confirmation dialog
-
-        // ── Async-navigation token ──
-        // Bumped on every NavigateTo / GoBack / GoForward / Hide. Fetch callbacks
-        // capture the value at request time and bail if it doesn't match anymore —
-        // otherwise a slow fetch from a previous navigation could render its result
-        // on top of the new page, or worse, into a different overlay after re-Show.
-        private static int _navToken;
 
         // The last URL we wrote into the URL field (any path). Used to detect whether
         // the user has been editing — if _urlField.value still equals this, they
@@ -183,9 +163,8 @@ namespace WebsiteMOTD
         /// <summary>
         /// Actually show the MOTD overlay after the user has approved (or the domain was trusted).
         /// On platforms where the native WebView isn't available (Linux/macOS), pop the
-        /// page in the Steam overlay browser instead of trying to render it inline — the
-        /// HTML fallback can't handle JS-heavy MOTD pages, and Steam's overlay works on
-        /// every platform the game runs on.
+        /// page in the Steam overlay browser instead — there's no inline renderer, and
+        /// Steam's overlay works on every platform the game runs on.
         /// </summary>
         private static void ShowConfirmed(string url)
         {
@@ -201,8 +180,6 @@ namespace WebsiteMOTD
 
             _url = url;
             _homeUrl = url;
-            _history.Clear();
-            _forwardHistory.Clear();
 
             var uiManager = MonoBehaviourSingleton<UIManager>.Instance;
             var root = uiManager?.RootVisualElement;
@@ -237,23 +214,60 @@ namespace WebsiteMOTD
 
             Plugin.Log("MOTD overlay shown for URL: " + url);
 
-            // Start in WebView mode by default if available
             if (InitWebViewIfNeeded())
             {
                 _useWebView = true;
                 EnsureWebViewVisible();
-                UpdateWebViewToggleButton();
+                NavigateTo(url);
             }
+            else
+            {
+                // WebView.dll is missing on a platform that should support it (broken
+                // install). We have no inline renderer anymore, so show a notice in the
+                // browser area and hand the page to the Steam / system browser. The
+                // overlay still opens so the queue panel and controls remain usable.
+                ShowWebViewUnavailable();
+                TryOpenSteamBrowser(url);
+            }
+        }
 
-            NavigateTo(url, addToHistory: false);
+        /// <summary>
+        /// Fill the browser area with a "native WebView unavailable" notice. Shown when
+        /// WebView.dll can't be loaded on a supported platform — the page itself is
+        /// opened in the Steam/system browser by the caller.
+        /// </summary>
+        private static void ShowWebViewUnavailable()
+        {
+            if (_browserHost == null) return;
+            _browserHost.Clear();
+
+            var box = new VisualElement();
+            box.style.flexGrow = 1f;
+            box.style.alignItems = Align.Center;
+            box.style.justifyContent = Justify.Center;
+            box.style.paddingLeft = 40f;
+            box.style.paddingRight = 40f;
+            _browserHost.Add(box);
+
+            var heading = new Label("Browser engine unavailable");
+            heading.style.fontSize = 18f;
+            heading.style.unityFontStyleAndWeight = FontStyle.Bold;
+            heading.style.color = new Color(1f, 0.85f, 0.4f);
+            heading.style.unityTextAlign = TextAnchor.MiddleCenter;
+            heading.style.marginBottom = 10f;
+            box.Add(heading);
+
+            var sub = new Label("WebView.dll could not be loaded, so the page has been opened "
+                + "in the Steam overlay browser instead. Use the buttons below if it didn't open.");
+            sub.style.fontSize = 13f;
+            sub.style.color = new Color(0.7f, 0.7f, 0.75f);
+            sub.style.whiteSpace = WhiteSpace.Normal;
+            sub.style.unityTextAlign = TextAnchor.MiddleCenter;
+            box.Add(sub);
         }
 
         public static void Hide()
         {
-            // Invalidate in-flight HTML fetches so their callbacks don't write into a
-            // freshly-rebuilt overlay if the user calls Show again before they resolve.
-            _navToken++;
-
             DestroyMiniBar();
             if (_confirmOverlay != null)
             {
@@ -264,9 +278,7 @@ namespace WebsiteMOTD
             {
                 _overlay.RemoveFromHierarchy();
                 _overlay = null;
-                _contentArea = null;
-                _scrollView = null;
-                _statusLabel = null;
+                _browserHost = null;
                 _urlField = null;
                 _lastUrlFieldValue = null;
                 _backBtn = null;
@@ -284,7 +296,6 @@ namespace WebsiteMOTD
                 _volumeSliderSetter = null;
                 _muteBtn = null;
                 _screenToggleBtn = null;
-                _webViewToggleBtn = null;
                 _settingsBtn = null;
                 _settingsPanel = null;
                 _minimizeBtn = null;
@@ -294,9 +305,6 @@ namespace WebsiteMOTD
                 _card = null;
                 _cardBody = null;
                 _miniBar = null;
-                _history.Clear();
-                _forwardHistory.Clear();
-                CleanupVideoHosts();
                 CleanupWebView();
                 UnityEngine.Cursor.visible = true;
                 UnityEngine.Cursor.lockState = CursorLockMode.None;
@@ -685,13 +693,6 @@ namespace WebsiteMOTD
             if (!url.StartsWith("http://") && !url.StartsWith("https://"))
                 url = "https://" + url;
 
-            // Push current page to history before navigating; clear forward on new nav
-            if (addToHistory && !string.IsNullOrEmpty(_url) && _url != url)
-            {
-                _history.Push(_url);
-                _forwardHistory.Clear();
-            }
-
             _url = url;
             if (_urlField != null)
             {
@@ -701,9 +702,9 @@ namespace WebsiteMOTD
 
             UpdateBackButton();
             UpdateForwardButton();
-            ClearContent();
 
-            // ── WebView mode: let the real browser handle everything ──
+            // WebView is the only renderer — let the real browser engine handle it.
+            // (addToHistory is vestigial: WebView keeps its own back/forward history.)
             if (_useWebView && _webView != null)
             {
                 EnsureWebViewVisible();
@@ -713,74 +714,8 @@ namespace WebsiteMOTD
                 return;
             }
 
-            // ── Direct image URL → show it inline without HTML parsing ──
-            if (IsDirectImageUrl(url))
-            {
-                ShowDirectImage(url);
-                return;
-            }
-
-            // ── Direct video URL → play it inline ──
-            if (IsDirectVideoUrl(url))
-            {
-                ShowDirectVideo(url);
-                return;
-            }
-
-            // ── Known JS-only / video platform → skip HTML, show card + Steam browser ──
-            string platformName = GetKnownPlatformName(url);
-            if (platformName != null)
-            {
-                ShowPlatformFallback(url, platformName);
-                TryOpenSteamBrowser(url);
-                return;
-            }
-
-            _statusLabel = new Label("Loading...");
-            _statusLabel.style.fontSize = 14f;
-            _statusLabel.style.color = new Color(0.6f, 0.6f, 0.6f);
-            _statusLabel.style.unityFontStyleAndWeight = FontStyle.Italic;
-            _statusLabel.style.unityTextAlign = TextAnchor.MiddleCenter;
-            _statusLabel.style.marginTop = 40f;
-            _contentArea.Add(_statusLabel);
-
-            Plugin.Log("Navigating to: " + url);
-
-            int navToken = ++_navToken;
-            MOTDWebContent.Fetch(url,
-                onSuccess: elements =>
-                {
-                    if (navToken != _navToken) return; // superseded by a later nav
-                    if (_contentArea == null || _overlay == null) return;
-                    RemoveStatusLabel();
-
-                    if (elements.Count == 0)
-                    {
-                        ShowSpaFallback();
-                        TryOpenSteamBrowser(url);
-                    }
-                    else
-                    {
-                        RenderContent(elements);
-                    }
-                },
-                onError: error =>
-                {
-                    if (navToken != _navToken) return;
-                    if (_contentArea == null || _overlay == null) return;
-                    Plugin.LogError("Fetch failed: " + error);
-                    RemoveStatusLabel();
-                    ShowErrorState(error);
-                }
-            );
-        }
-
-        private static bool IsDirectImageUrl(string url)
-        {
-            string lower = url.Split('?')[0].ToLowerInvariant();
-            return lower.EndsWith(".jpg") || lower.EndsWith(".jpeg") || lower.EndsWith(".png")
-                || lower.EndsWith(".gif")  || lower.EndsWith(".webp") || lower.EndsWith(".bmp")
-                || lower.EndsWith(".svg");
+            // No native WebView available — fall back to the external browser.
+            TryOpenSteamBrowser(url);
         }
 
         private static bool IsDirectVideoUrl(string url)
@@ -790,111 +725,6 @@ namespace WebsiteMOTD
                 || lower.EndsWith(".mov") || lower.EndsWith(".avi")  || lower.EndsWith(".mkv");
         }
 
-        private static void ShowDirectImage(string url)
-        {
-            if (_contentArea == null) return;
-            Plugin.Log("Direct image URL detected: " + url);
-            AddImage(_contentArea, url, "");
-        }
-
-        private static void ShowDirectVideo(string url)
-        {
-            if (_contentArea == null) return;
-            Plugin.Log("Direct video URL detected: " + url);
-            AddVideoElement(_contentArea, url, "", false);
-        }
-
-        /// <summary>
-        /// Returns a display name if the URL is a known JS-heavy platform
-        /// that cannot be meaningfully parsed without a real browser engine.
-        /// Returns null if normal HTML fetching should proceed.
-        /// </summary>
-        private static string GetKnownPlatformName(string url)
-        {
-            string lower = url.ToLowerInvariant();
-
-            // Video platforms
-            if (lower.Contains("youtube.com")    || lower.Contains("youtu.be"))   return "YouTube";
-            if (lower.Contains("vimeo.com"))                                       return "Vimeo";
-            if (lower.Contains("twitch.tv"))                                       return "Twitch";
-            if (lower.Contains("dailymotion.com"))                                 return "Dailymotion";
-
-            // Social / heavy SPA platforms
-            if (lower.Contains("twitter.com")    || lower.Contains("x.com"))      return "Twitter / X";
-            if (lower.Contains("instagram.com"))                                   return "Instagram";
-            if (lower.Contains("tiktok.com"))                                      return "TikTok";
-            if (lower.Contains("facebook.com")   || lower.Contains("fb.com"))     return "Facebook";
-            if (lower.Contains("reddit.com"))                                      return "Reddit";
-            if (lower.Contains("discord.com")    || lower.Contains("discord.gg")) return "Discord";
-            if (lower.Contains("netflix.com"))                                     return "Netflix";
-            if (lower.Contains("spotify.com"))                                     return "Spotify";
-
-            return null;
-        }
-
-        private static void ShowPlatformFallback(string url, string platformName)
-        {
-            if (_contentArea == null) return;
-            Plugin.Log(platformName + " detected — opening in Steam browser.");
-
-            // Icon row
-            var row = new VisualElement();
-            row.style.flexDirection  = FlexDirection.Column;
-            row.style.alignItems     = Align.Center;
-            row.style.marginTop      = 40f;
-            row.style.marginBottom   = 20f;
-            _contentArea.Add(row);
-
-            var icon = new Label("\uD83C\uDF10");
-            icon.style.fontSize = 48f;
-            icon.style.unityTextAlign = TextAnchor.MiddleCenter;
-            row.Add(icon);
-
-            var heading = new Label(platformName);
-            heading.style.fontSize = 22f;
-            heading.style.unityFontStyleAndWeight = FontStyle.Bold;
-            heading.style.color = Color.white;
-            heading.style.marginTop = 10f;
-            heading.style.unityTextAlign = TextAnchor.MiddleCenter;
-            row.Add(heading);
-
-            var sub = new Label("This site requires JavaScript and cannot be displayed inline.");
-            sub.style.fontSize = 14f;
-            sub.style.color = new Color(0.7f, 0.7f, 0.75f);
-            sub.style.marginTop = 6f;
-            sub.style.whiteSpace = WhiteSpace.Normal;
-            sub.style.unityTextAlign = TextAnchor.MiddleCenter;
-            row.Add(sub);
-
-            var openedMsg = new Label("It has been opened in the Steam overlay browser.");
-            openedMsg.style.fontSize = 13f;
-            openedMsg.style.color = new Color(0.4f, 0.85f, 0.4f);
-            openedMsg.style.marginTop = 4f;
-            openedMsg.style.unityTextAlign = TextAnchor.MiddleCenter;
-            row.Add(openedMsg);
-
-            AddSeparator(_contentArea);
-
-            // Quick action buttons
-            var btnRow = new VisualElement();
-            btnRow.style.flexDirection  = FlexDirection.Row;
-            btnRow.style.justifyContent = Justify.Center;
-            btnRow.style.flexWrap       = Wrap.Wrap;
-            btnRow.style.marginTop      = 8f;
-            _contentArea.Add(btnRow);
-
-            string capturedUrl = url;
-            var steamBtn = CreateStyledButton("Open in Steam Browser", new Color(0.2f, 0.45f, 0.7f), () =>
-                TryOpenSteamBrowser(capturedUrl));
-            steamBtn.style.marginRight = 10f;
-            steamBtn.style.marginBottom = 8f;
-            btnRow.Add(steamBtn);
-
-            var extBtn = CreateStyledButton("Open in System Browser", new Color(0.35f, 0.35f, 0.4f), () =>
-                OpenExternal(capturedUrl));
-            extBtn.style.marginBottom = 8f;
-            btnRow.Add(extBtn);
-        }
 
         private static void GoBack()
         {
@@ -902,100 +732,24 @@ namespace WebsiteMOTD
             // binding so the destination page isn't treated as the queue's
             // active item just because it happens to share a URL with one.
             _overlayQueueItemId = 0;
-            _webView?.EvaluateJS("window.__motdItemId=0;");
-
             if (_useWebView && _webView != null)
             {
+                _webView.EvaluateJS("window.__motdItemId=0;");
                 _webView.GoBack();
                 UpdateBackForwardButtons();
-                return;
             }
-            if (_history.Count == 0) return;
-            if (!string.IsNullOrEmpty(_url))
-                _forwardHistory.Push(_url);
-            string prev = _history.Pop();
-            _url = prev;
-            if (_urlField != null) { _urlField.value = prev; _lastUrlFieldValue = prev; }
-            UpdateBackButton();
-            UpdateForwardButton();
-            ClearContent();
-
-            _statusLabel = new Label("Loading...");
-            _statusLabel.style.fontSize = 14f;
-            _statusLabel.style.color = new Color(0.6f, 0.6f, 0.6f);
-            _statusLabel.style.unityFontStyleAndWeight = FontStyle.Italic;
-            _statusLabel.style.unityTextAlign = TextAnchor.MiddleCenter;
-            _statusLabel.style.marginTop = 40f;
-            _contentArea.Add(_statusLabel);
-
-            int navToken = ++_navToken;
-            MOTDWebContent.Fetch(prev,
-                onSuccess: elements =>
-                {
-                    if (navToken != _navToken) return;
-                    if (_contentArea == null || _overlay == null) return;
-                    RemoveStatusLabel();
-                    if (elements.Count == 0) { ShowSpaFallback(); TryOpenSteamBrowser(prev); }
-                    else RenderContent(elements);
-                },
-                onError: error =>
-                {
-                    if (navToken != _navToken) return;
-                    if (_contentArea == null || _overlay == null) return;
-                    RemoveStatusLabel();
-                    ShowErrorState(error);
-                }
-            );
         }
 
         private static void GoForward()
         {
             // See GoBack — same reasoning for clearing the queue-item binding.
             _overlayQueueItemId = 0;
-            _webView?.EvaluateJS("window.__motdItemId=0;");
-
             if (_useWebView && _webView != null)
             {
+                _webView.EvaluateJS("window.__motdItemId=0;");
                 _webView.GoForward();
                 UpdateBackForwardButtons();
-                return;
             }
-            if (_forwardHistory.Count == 0) return;
-            if (!string.IsNullOrEmpty(_url))
-                _history.Push(_url);
-            string next = _forwardHistory.Pop();
-            _url = next;
-            if (_urlField != null) { _urlField.value = next; _lastUrlFieldValue = next; }
-            UpdateBackButton();
-            UpdateForwardButton();
-            ClearContent();
-
-            _statusLabel = new Label("Loading...");
-            _statusLabel.style.fontSize = 14f;
-            _statusLabel.style.color = new Color(0.6f, 0.6f, 0.6f);
-            _statusLabel.style.unityFontStyleAndWeight = FontStyle.Italic;
-            _statusLabel.style.unityTextAlign = TextAnchor.MiddleCenter;
-            _statusLabel.style.marginTop = 40f;
-            _contentArea.Add(_statusLabel);
-
-            int navToken = ++_navToken;
-            MOTDWebContent.Fetch(next,
-                onSuccess: elements =>
-                {
-                    if (navToken != _navToken) return;
-                    if (_contentArea == null || _overlay == null) return;
-                    RemoveStatusLabel();
-                    if (elements.Count == 0) { ShowSpaFallback(); TryOpenSteamBrowser(next); }
-                    else RenderContent(elements);
-                },
-                onError: error =>
-                {
-                    if (navToken != _navToken) return;
-                    if (_contentArea == null || _overlay == null) return;
-                    RemoveStatusLabel();
-                    ShowErrorState(error);
-                }
-            );
         }
 
         /// <summary>
@@ -1043,7 +797,7 @@ namespace WebsiteMOTD
         {
             if (_backBtn != null)
             {
-                bool canBack = _useWebView && _webView != null ? _webView.CanGoBack : _history.Count > 0;
+                bool canBack = _useWebView && _webView != null && _webView.CanGoBack;
                 _backBtn.SetEnabled(canBack);
                 _backBtn.style.opacity = canBack ? 1f : 0.35f;
             }
@@ -1053,7 +807,7 @@ namespace WebsiteMOTD
         {
             if (_fwdBtn != null)
             {
-                bool canFwd = _useWebView && _webView != null ? _webView.CanGoForward : _forwardHistory.Count > 0;
+                bool canFwd = _useWebView && _webView != null && _webView.CanGoForward;
                 _fwdBtn.SetEnabled(canFwd);
                 _fwdBtn.style.opacity = canFwd ? 1f : 0.35f;
             }
@@ -1078,54 +832,7 @@ namespace WebsiteMOTD
             UpdateForwardButton();
         }
 
-        private static void ClearContent()
-        {
-            if (_contentArea == null) return;
-            CleanupVideoHosts();
-            _contentArea.Clear();
-            _statusLabel = null;
-
-            // Hide webview element when clearing for HTML mode
-            if (_webViewElement != null && !_useWebView)
-                _webViewElement.style.display = DisplayStyle.None;
-        }
-
-        // ─── WebView Mode ──────────────────────────────────────────
-
-        private static void ToggleWebViewMode()
-        {
-            if (_useWebView)
-            {
-                _useWebView = false;
-                UpdateWebViewToggleButton();
-                // Only touch content visibility when settings panel is closed
-                if (!_settingsOpen)
-                {
-                    HideWebViewElement();
-                    if (_scrollView != null) _scrollView.style.display = DisplayStyle.Flex;
-                    if (!string.IsNullOrEmpty(_url))
-                        NavigateTo(_url, addToHistory: false);
-                }
-            }
-            else
-            {
-                if (!InitWebViewIfNeeded())
-                {
-                    Plugin.LogError("WebView not available — WebView.dll not found.");
-                    return;
-                }
-                _useWebView = true;
-                UpdateWebViewToggleButton();
-                // Only touch content visibility when settings panel is closed
-                if (!_settingsOpen)
-                {
-                    if (_scrollView != null) _scrollView.style.display = DisplayStyle.None;
-                    EnsureWebViewVisible();
-                    if (!string.IsNullOrEmpty(_url))
-                        _webView.LoadURL(_url);
-                }
-            }
-        }
+        // ─── WebView ───────────────────────────────────────────────
 
         private static bool InitWebViewIfNeeded()
         {
@@ -1143,9 +850,13 @@ namespace WebsiteMOTD
             // Flip Y: WebView2 bitmap is top-down, Unity texture row 0 is bottom
             _webViewElement.style.scale = new StyleScale(new Scale(new Vector3(1f, -1f, 1f)));
 
-            // Insert webview element as sibling to scrollview (inside the card)
-            if (_scrollView != null && _scrollView.parent != null)
-                _scrollView.parent.Insert(_scrollView.parent.IndexOf(_scrollView) + 1, _webViewElement);
+            // Mount the webview element inside the browser host (between the queue
+            // panel and the settings panel).
+            if (_browserHost != null)
+            {
+                _browserHost.Clear();
+                _browserHost.Add(_webViewElement);
+            }
 
             // Initial viewport — replaced by the GeometryChangedEvent below as soon as
             // the element is laid out, so the texture aspect matches the card.
@@ -1272,14 +983,6 @@ namespace WebsiteMOTD
         {
             if (_webViewElement != null)
                 _webViewElement.style.display = DisplayStyle.Flex;
-            if (_scrollView != null)
-                _scrollView.style.display = DisplayStyle.None;
-        }
-
-        private static void HideWebViewElement()
-        {
-            if (_webViewElement != null)
-                _webViewElement.style.display = DisplayStyle.None;
         }
 
         private static void CleanupWebView()
@@ -1711,11 +1414,8 @@ namespace WebsiteMOTD
 
         private static void ApplyAllVolumes()
         {
-            float effectiveVol = _isMuted ? 0f : _globalVolume;
             ApplyWebViewVolume();
             ApplyWorldScreenVolume();
-            foreach (var h in _videoHosts)
-                if (h != null) h.SetVolume(effectiveVol);
         }
 
         // ─── Audio / Screen Toggle ──────────────────────────────────
@@ -1778,17 +1478,11 @@ namespace WebsiteMOTD
             _settingsOpen = !_settingsOpen;
             if (_settingsPanel != null)
                 _settingsPanel.style.display = _settingsOpen ? DisplayStyle.Flex : DisplayStyle.None;
-            if (_settingsOpen)
-            {
-                if (_scrollView != null)    _scrollView.style.display     = DisplayStyle.None;
-                if (_webViewElement != null) _webViewElement.style.display = DisplayStyle.None;
-            }
-            else
-            {
-                // Restore whatever rendering mode is currently active
-                if (_useWebView && _webView != null) EnsureWebViewVisible();
-                else if (_scrollView != null)        _scrollView.style.display = DisplayStyle.Flex;
-            }
+            // The settings panel and the browser host are siblings — show one or the
+            // other. The browser host holds the WebView element (or the unavailable
+            // notice), so toggling its display is all that's needed.
+            if (_browserHost != null)
+                _browserHost.style.display = _settingsOpen ? DisplayStyle.None : DisplayStyle.Flex;
             UpdateSettingsButton();
         }
 
@@ -1984,27 +1678,9 @@ namespace WebsiteMOTD
             inner.Add(pageHeader);
 
             // ════════════════════════════════════════════════════════
-            // RENDERING
-            // ════════════════════════════════════════════════════════
-            AddSettingsSectionHeader(inner, "RENDERING");
-
-            AddSettingsRow(inner, "Rendering Mode",
-                "Switch between the built-in WebView2 engine (full browser) and the lightweight HTML parser.",
-                container =>
-                {
-                    _webViewToggleBtn = CreateStyledButton(
-                        _useWebView ? "HTML" : "WebView",
-                        _useWebView ? new Color(0.3f, 0.55f, 0.3f) : new Color(0.5f, 0.3f, 0.6f),
-                        ToggleWebViewMode);
-                    _webViewToggleBtn.style.width  = 100f;
-                    _webViewToggleBtn.style.height = 32f;
-                    container.Add(_webViewToggleBtn);
-                });
-
-            // ════════════════════════════════════════════════════════
             // DISPLAY
             // ════════════════════════════════════════════════════════
-            AddSettingsSectionHeader(inner, "DISPLAY", firstSection: false);
+            AddSettingsSectionHeader(inner, "DISPLAY");
 
             // Page Zoom
             AddSettingsRow(inner, "Page Zoom",
@@ -2529,66 +2205,6 @@ namespace WebsiteMOTD
             DismissOpenChatInput();
         }
 
-        private static void UpdateWebViewToggleButton()
-        {
-            if (_webViewToggleBtn == null) return;
-            if (_useWebView)
-            {
-                _webViewToggleBtn.text = "HTML";
-                _webViewToggleBtn.style.backgroundColor = new Color(0.3f, 0.55f, 0.3f);
-            }
-            else
-            {
-                _webViewToggleBtn.text = "WebView";
-                _webViewToggleBtn.style.backgroundColor = new Color(0.5f, 0.3f, 0.6f);
-            }
-        }
-
-        private static void CleanupVideoHosts()
-        {
-            foreach (var host in _videoHosts)
-                if (host != null) host.Cleanup();
-            _videoHosts.Clear();
-
-            foreach (var c in _gifCoroutines)
-                MOTDWebContent.StopManagedCoroutine(c);
-            _gifCoroutines.Clear();
-
-            // Decoded textures (GIF frames + downloaded images) need explicit Destroy —
-            // GC won't free GPU memory on its own.
-            foreach (var tex in _managedTextures)
-                if (tex != null) UnityEngine.Object.Destroy(tex);
-            _managedTextures.Clear();
-        }
-
-        private static void RemoveStatusLabel()
-        {
-            if (_statusLabel != null)
-            {
-                _statusLabel.RemoveFromHierarchy();
-                _statusLabel = null;
-            }
-        }
-
-        private static void ShowSpaFallback()
-        {
-            if (_contentArea == null) return;
-            AddHeading(_contentArea, "This page uses JavaScript to render content", 16f, new Color(1f, 0.85f, 0.4f));
-            AddParagraph(_contentArea, "The page can't be displayed inline because it requires a full browser engine. " +
-                "It has been opened in the Steam overlay browser for you.");
-            AddSeparator(_contentArea);
-            AddParagraph(_contentArea, "If the Steam browser didn't open, click the buttons below.");
-        }
-
-        private static void ShowErrorState(string error)
-        {
-            if (_contentArea == null) return;
-            AddHeading(_contentArea, "Could not load page", 16f, new Color(1f, 0.5f, 0.4f));
-            AddParagraph(_contentArea, error);
-            AddSeparator(_contentArea);
-            AddParagraph(_contentArea, "Try using the browser buttons below, or enter a different URL.");
-        }
-
         private static void TryOpenSteamBrowser(string url)
         {
             if (string.IsNullOrEmpty(url)) return;
@@ -2614,93 +2230,6 @@ namespace WebsiteMOTD
                 Plugin.LogError("Steam overlay failed: " + ex.Message);
                 // Last-ditch: try the system browser so the user isn't stranded.
                 try { Application.OpenURL(url); } catch { }
-            }
-        }
-
-        // ─── Content Rendering ──────────────────────────────────────
-
-        private static void RenderContent(List<ContentElement> elements)
-        {
-            if (_contentArea == null) return;
-
-            VisualElement cardContainer = null;
-
-            foreach (var el in elements)
-            {
-                // Resolve target parent (inside card or main content)
-                var target = cardContainer ?? _contentArea;
-
-                switch (el.Type)
-                {
-                    case ContentElement.ElementType.CardOpen:
-                        cardContainer = CreateCard(el.BgColor);
-                        _contentArea.Add(cardContainer);
-                        break;
-
-                    case ContentElement.ElementType.CardClose:
-                        cardContainer = null;
-                        break;
-
-                    case ContentElement.ElementType.Heading1:
-                    {
-                        var c = el.FgColor ?? Color.white;
-                        AddHeading(target, el.Text, 24f, c);
-                        break;
-                    }
-                    case ContentElement.ElementType.Heading2:
-                    {
-                        var c = el.FgColor ?? new Color(0.3f, 0.75f, 1f);
-                        AddHeading(target, el.Text, 20f, c);
-                        break;
-                    }
-                    case ContentElement.ElementType.Heading3:
-                    {
-                        var c = el.FgColor ?? new Color(0.6f, 0.85f, 1f);
-                        AddHeading(target, el.Text, 16f, c);
-                        break;
-                    }
-                    case ContentElement.ElementType.Paragraph:
-                    {
-                        var c = el.FgColor ?? new Color(0.88f, 0.88f, 0.88f);
-                        AddRichParagraph(target, el.Text, c);
-                        break;
-                    }
-                    case ContentElement.ElementType.ListItem:
-                        AddListItem(target, el.Text);
-                        break;
-
-                    case ContentElement.ElementType.NumberedItem:
-                        AddNumberedItem(target, el.ListNumber, el.Text);
-                        break;
-
-                    case ContentElement.ElementType.Separator:
-                        AddSeparator(target);
-                        break;
-
-                    case ContentElement.ElementType.Blockquote:
-                        AddBlockquote(target, el.Text);
-                        break;
-
-                    case ContentElement.ElementType.Code:
-                        AddCodeBlock(target, el.Text);
-                        break;
-
-                    case ContentElement.ElementType.Image:
-                        AddImage(target, el.Url, el.Text);
-                        break;
-
-                    case ContentElement.ElementType.Link:
-                        AddClickableLink(target, el.Text, el.Url);
-                        break;
-
-                    case ContentElement.ElementType.Video:
-                        AddVideoElement(target, el.Url, el.Text, el.IsEmbed);
-                        break;
-
-                    case ContentElement.ElementType.SearchInput:
-                        AddSearchBar(target, el.Text, el.Url, el.ExtraData);
-                        break;
-                }
             }
         }
 
@@ -3020,20 +2549,15 @@ namespace WebsiteMOTD
             // Queue panel on the left
             BuildQueuePanel(body);
 
-            // Browser scroll view on the right
-            _scrollView = new ScrollView(ScrollViewMode.Vertical);
-            _scrollView.style.flexGrow = 1f;
-            _scrollView.style.backgroundColor = new Color(0.12f, 0.12f, 0.14f);
-            body.Add(_scrollView);
+            // Browser host on the right — the WebView element is mounted here by
+            // InitWebViewIfNeeded (or the "WebView unavailable" notice).
+            _browserHost = new VisualElement();
+            _browserHost.style.flexGrow = 1f;
+            _browserHost.style.backgroundColor = new Color(0.12f, 0.12f, 0.14f);
+            body.Add(_browserHost);
 
-            // Settings panel (replaces scroll/webview when ⚙ is active)
+            // Settings panel (replaces the browser host when ⚙ is active)
             BuildSettingsPanel(body);
-
-            _contentArea = _scrollView.contentContainer;
-            _contentArea.style.paddingLeft   = 28f;
-            _contentArea.style.paddingRight  = 28f;
-            _contentArea.style.paddingTop    = 20f;
-            _contentArea.style.paddingBottom = 24f;
 
             // Initial queue render
             RefreshQueuePanel();
@@ -3682,614 +3206,6 @@ namespace WebsiteMOTD
             }
         }
 
-        // ─── Content Element Builders ───────────────────────────────
-
-        private static void AddHeading(VisualElement parent, string text, float size, Color color)
-        {
-            var label = new Label(text);
-            label.enableRichText = true;
-            label.style.fontSize = size;
-            label.style.unityFontStyleAndWeight = FontStyle.Bold;
-            label.style.color = color;
-            label.style.whiteSpace = WhiteSpace.Normal;
-            label.style.marginTop    = 16f;
-            label.style.marginBottom = 8f;
-            parent.Add(label);
-        }
-
-        private static void AddParagraph(VisualElement parent, string text)
-        {
-            AddRichParagraph(parent, text, new Color(0.88f, 0.88f, 0.88f));
-        }
-
-        private static void AddRichParagraph(VisualElement parent, string text, Color color)
-        {
-            var label = new Label(text);
-            label.enableRichText = true;
-            label.style.fontSize   = 14f;
-            label.style.color      = color;
-            label.style.whiteSpace = WhiteSpace.Normal;
-            label.style.marginBottom = 10f;
-            parent.Add(label);
-        }
-
-        /// <summary>
-        /// Renders a clickable link that navigates within our overlay browser.
-        /// </summary>
-        private static void AddClickableLink(VisualElement parent, string text, string url)
-        {
-            var linkColor = new Color(0.4f, 0.7f, 1f);
-            var hoverColor = new Color(0.6f, 0.85f, 1f);
-
-            var label = new Label(text);
-            label.style.fontSize   = 14f;
-            label.style.color      = linkColor;
-            label.style.whiteSpace = WhiteSpace.Normal;
-            label.style.marginBottom = 6f;
-            label.style.unityFontStyleAndWeight = FontStyle.Bold;
-
-            // Navigate within our overlay on click
-            string capturedUrl = url;
-            label.RegisterCallback<MouseDownEvent>(e =>
-            {
-                if (!string.IsNullOrEmpty(capturedUrl))
-                    NavigateTo(capturedUrl);
-            });
-            label.RegisterCallback<MouseEnterEvent>(e => label.style.color = hoverColor);
-            label.RegisterCallback<MouseLeaveEvent>(e => label.style.color = linkColor);
-
-            parent.Add(label);
-        }
-
-        private static void AddListItem(VisualElement parent, string text)
-        {
-            var row = new VisualElement();
-            row.style.flexDirection = FlexDirection.Row;
-            row.style.marginBottom = 6f;
-            row.style.marginLeft = 16f;
-
-            var bullet = new Label("\u2022");
-            bullet.style.fontSize = 14f;
-            bullet.style.color = new Color(0.3f, 0.75f, 1f);
-            bullet.style.marginRight = 8f;
-            bullet.style.flexShrink = 0f;
-            row.Add(bullet);
-
-            var label = new Label(text);
-            label.enableRichText = true;
-            label.style.fontSize = 14f;
-            label.style.color = new Color(0.88f, 0.88f, 0.88f);
-            label.style.whiteSpace = WhiteSpace.Normal;
-            label.style.flexShrink = 1f;
-            label.style.flexGrow = 1f;
-            row.Add(label);
-
-            parent.Add(row);
-        }
-
-        private static void AddBlockquote(VisualElement parent, string text)
-        {
-            var container = new VisualElement();
-            container.style.borderLeftWidth = 3f;
-            container.style.borderLeftColor = new Color(0.3f, 0.6f, 1f, 0.6f);
-            container.style.paddingLeft   = 14f;
-            container.style.paddingTop    = 6f;
-            container.style.paddingBottom = 6f;
-            container.style.marginBottom  = 10f;
-            container.style.marginLeft    = 8f;
-            container.style.backgroundColor = new Color(0.14f, 0.14f, 0.17f);
-
-            var label = new Label(text);
-            label.style.fontSize   = 13f;
-            label.style.color      = new Color(0.75f, 0.75f, 0.8f);
-            label.style.whiteSpace = WhiteSpace.Normal;
-            label.style.unityFontStyleAndWeight = FontStyle.Italic;
-            container.Add(label);
-
-            parent.Add(container);
-        }
-
-        private static void AddCodeBlock(VisualElement parent, string text)
-        {
-            var container = new VisualElement();
-            container.style.backgroundColor    = new Color(0.08f, 0.08f, 0.1f);
-            container.style.borderTopLeftRadius    = 4f;
-            container.style.borderTopRightRadius   = 4f;
-            container.style.borderBottomLeftRadius  = 4f;
-            container.style.borderBottomRightRadius = 4f;
-            container.style.paddingLeft   = 14f;
-            container.style.paddingRight  = 14f;
-            container.style.paddingTop    = 10f;
-            container.style.paddingBottom = 10f;
-            container.style.marginBottom  = 10f;
-            container.style.borderTopWidth    = 1f;
-            container.style.borderBottomWidth = 1f;
-            container.style.borderLeftWidth   = 1f;
-            container.style.borderRightWidth  = 1f;
-            container.style.borderTopColor    = new Color(0.2f, 0.2f, 0.25f);
-            container.style.borderBottomColor = new Color(0.2f, 0.2f, 0.25f);
-            container.style.borderLeftColor   = new Color(0.2f, 0.2f, 0.25f);
-            container.style.borderRightColor  = new Color(0.2f, 0.2f, 0.25f);
-
-            var label = new Label(text);
-            label.style.fontSize   = 12f;
-            label.style.color      = new Color(0.7f, 0.9f, 0.7f);
-            label.style.whiteSpace = WhiteSpace.Normal;
-            container.Add(label);
-
-            parent.Add(container);
-        }
-
-        private static void AddImage(VisualElement parent, string imageUrl, string altText)
-        {
-            var imgContainer = new VisualElement();
-            imgContainer.style.marginBottom = 12f;
-            imgContainer.style.alignSelf = Align.Center;
-            imgContainer.style.maxWidth = new Length(100f, LengthUnit.Percent);
-
-            bool isGif = !string.IsNullOrEmpty(imageUrl) && imageUrl.Split('?')[0].ToLowerInvariant().EndsWith(".gif");
-
-            string placeholderText = !string.IsNullOrEmpty(altText) ? "[Image: " + altText + "]" : "[Loading image...]";
-            if (isGif) placeholderText = "[Loading GIF (static)...]";
-            var placeholder = new Label(placeholderText);
-            placeholder.style.fontSize = 12f;
-            placeholder.style.color = new Color(0.5f, 0.5f, 0.5f);
-            placeholder.style.unityFontStyleAndWeight = FontStyle.Italic;
-            placeholder.style.unityTextAlign = TextAnchor.MiddleCenter;
-            placeholder.style.paddingTop  = 16f;
-            placeholder.style.paddingBottom = 16f;
-            imgContainer.Add(placeholder);
-            parent.Add(imgContainer);
-
-            if (!string.IsNullOrEmpty(imageUrl))
-            {
-                string imgReferer = MOTDWebContent.DeriveReferer(imageUrl) ?? _url;
-
-                if (isGif)
-                {
-                    // Fetch raw bytes and decode all frames for animation
-                    MOTDWebContent.FetchGif(imageUrl, frames =>
-                    {
-                        if (imgContainer.parent == null)
-                        {
-                            // Late callback — destroy decoded frames inline so they don't
-                            // sit on the GPU forever.
-                            if (frames != null)
-                                foreach (var f in frames)
-                                    if (f.Texture != null) UnityEngine.Object.Destroy(f.Texture);
-                            return;
-                        }
-                        if (frames == null || frames.Length == 0)
-                        {
-                            placeholder.text = "[GIF failed to load]";
-                            placeholder.style.color = new Color(0.6f, 0.4f, 0.4f);
-                            return;
-                        }
-
-                        imgContainer.Clear();
-
-                        // Track each decoded frame so CleanupVideoHosts can free GPU memory —
-                        // GifDecoder allocates a fresh Texture2D per frame.
-                        for (int fi = 0; fi < frames.Length; fi++)
-                            if (frames[fi].Texture != null)
-                                _managedTextures.Add(frames[fi].Texture);
-
-                        float maxW = 900f;
-                        var first = frames[0].Texture;
-                        float scale = (first.width > maxW) ? maxW / first.width : 1f;
-
-                        var imgEl = new VisualElement();
-                        imgEl.style.width  = first.width  * scale;
-                        imgEl.style.height = first.height * scale;
-                        imgEl.style.backgroundImage = new StyleBackground(first);
-                        imgEl.style.alignSelf = Align.Center;
-                        imgContainer.Add(imgEl);
-
-                        if (frames.Length > 1)
-                        {
-                            var c = MOTDWebContent.RunCoroutine(AnimateGif(frames, imgEl, imgContainer));
-                            _gifCoroutines.Add(c);
-                        }
-                        else
-                        {
-                            var note = new Label("(GIF — single frame)");
-                            note.style.fontSize = 10f;
-                            note.style.color = new Color(0.45f, 0.45f, 0.5f);
-                            note.style.unityFontStyleAndWeight = FontStyle.Italic;
-                            note.style.unityTextAlign = TextAnchor.MiddleCenter;
-                            imgContainer.Add(note);
-                        }
-                    }, imgReferer);
-                }
-                else
-                {
-                    MOTDWebContent.FetchImage(imageUrl, tex =>
-                    {
-                        if (imgContainer.parent == null)
-                        {
-                            // Late callback for a container that's already been cleared/destroyed.
-                            // Destroy the texture inline since it'll never be tracked.
-                            if (tex != null) UnityEngine.Object.Destroy(tex);
-                            return;
-                        }
-
-                        if (tex == null)
-                        {
-                            placeholder.text = !string.IsNullOrEmpty(altText)
-                                ? "[Could not load: " + altText + "]"
-                                : "[Image failed to load]";
-                            placeholder.style.color = new Color(0.6f, 0.4f, 0.4f);
-                            return;
-                        }
-
-                        _managedTextures.Add(tex);
-
-                        imgContainer.Clear();
-
-                        float maxW = 900f;
-                        float scale = (tex.width > maxW) ? maxW / tex.width : 1f;
-
-                        var imgEl = new VisualElement();
-                        imgEl.style.width  = tex.width  * scale;
-                        imgEl.style.height = tex.height * scale;
-                        imgEl.style.backgroundImage = new StyleBackground(tex);
-                        imgEl.style.alignSelf = Align.Center;
-                        imgContainer.Add(imgEl);
-
-                        if (!string.IsNullOrEmpty(altText))
-                        {
-                            var caption = new Label(altText);
-                            caption.style.fontSize = 11f;
-                            caption.style.color = new Color(0.5f, 0.5f, 0.55f);
-                            caption.style.unityTextAlign = TextAnchor.MiddleCenter;
-                            caption.style.marginTop = 4f;
-                            imgContainer.Add(caption);
-                        }
-                    }, referer: imgReferer);
-                }
-            }
-        }
-
-        private static IEnumerator AnimateGif(GifFrame[] frames, VisualElement imgEl, VisualElement container)
-        {
-            int i = 0;
-            while (container.parent != null)
-            {
-                imgEl.style.backgroundImage = new StyleBackground(frames[i].Texture);
-                yield return new WaitForSeconds(frames[i].Delay);
-                i = (i + 1) % frames.Length;
-            }
-        }
-
-        private static void AddNumberedItem(VisualElement parent, int number, string text)
-        {
-            var row = new VisualElement();
-            row.style.flexDirection = FlexDirection.Row;
-            row.style.marginBottom = 6f;
-            row.style.marginLeft = 16f;
-
-            var numLabel = new Label(number + ".");
-            numLabel.style.fontSize = 14f;
-            numLabel.style.color = new Color(0.3f, 0.75f, 1f);
-            numLabel.style.marginRight = 8f;
-            numLabel.style.flexShrink = 0f;
-            numLabel.style.minWidth = 22f;
-            numLabel.style.unityTextAlign = TextAnchor.UpperRight;
-            row.Add(numLabel);
-
-            var label = new Label(text);
-            label.enableRichText = true;
-            label.style.fontSize = 14f;
-            label.style.color = new Color(0.88f, 0.88f, 0.88f);
-            label.style.whiteSpace = WhiteSpace.Normal;
-            label.style.flexShrink = 1f;
-            label.style.flexGrow = 1f;
-            row.Add(label);
-
-            parent.Add(row);
-        }
-
-        private static void AddSearchBar(VisualElement parent, string placeholder, string actionUrl, string paramName)
-        {
-            if (string.IsNullOrEmpty(actionUrl)) return;
-
-            var row = new VisualElement();
-            row.style.flexDirection  = FlexDirection.Row;
-            row.style.alignItems     = Align.Center;
-            row.style.marginTop      = 10f;
-            row.style.marginBottom   = 10f;
-            row.style.paddingLeft    = 4f;
-            row.style.paddingRight   = 4f;
-            row.style.paddingTop     = 6f;
-            row.style.paddingBottom  = 6f;
-            row.style.backgroundColor = new Color(0.1f, 0.1f, 0.13f);
-            row.style.borderTopLeftRadius    = 6f;
-            row.style.borderTopRightRadius   = 6f;
-            row.style.borderBottomLeftRadius  = 6f;
-            row.style.borderBottomRightRadius = 6f;
-            row.style.borderTopWidth    = 1f;
-            row.style.borderBottomWidth = 1f;
-            row.style.borderLeftWidth   = 1f;
-            row.style.borderRightWidth  = 1f;
-            row.style.borderTopColor    = new Color(0.3f, 0.3f, 0.4f);
-            row.style.borderBottomColor = new Color(0.3f, 0.3f, 0.4f);
-            row.style.borderLeftColor   = new Color(0.3f, 0.3f, 0.4f);
-            row.style.borderRightColor  = new Color(0.3f, 0.3f, 0.4f);
-
-            var field = new TextField();
-            field.style.flexGrow = 1f;
-            field.style.marginRight = 6f;
-            var textInput = field.Q<VisualElement>("unity-text-input");
-            if (textInput != null)
-            {
-                textInput.style.backgroundColor = new Color(0.07f, 0.07f, 0.1f);
-                textInput.style.color = new Color(0.9f, 0.9f, 0.9f);
-                textInput.style.fontSize = 13f;
-            }
-            // Show placeholder text via label overlay
-            var ph = new Label(!string.IsNullOrEmpty(placeholder) ? placeholder : "Search...");
-            ph.style.position = Position.Absolute;
-            ph.style.left = 8f; ph.style.top = 4f;
-            ph.style.color = new Color(0.45f, 0.45f, 0.5f);
-            ph.style.fontSize = 13f;
-            ph.style.unityFontStyleAndWeight = FontStyle.Italic;
-            ph.pickingMode = PickingMode.Ignore;
-            field.Add(ph);
-            field.RegisterValueChangedCallback(e =>
-                ph.style.display = string.IsNullOrEmpty(e.newValue) ? DisplayStyle.Flex : DisplayStyle.None);
-            row.Add(field);
-
-            string capturedAction = actionUrl;
-            string capturedParam  = string.IsNullOrEmpty(paramName) ? "q" : paramName;
-            var goBtn = CreateStyledButton("Search", new Color(0.25f, 0.5f, 0.85f), () =>
-            {
-                string query = field.value.Trim();
-                if (string.IsNullOrEmpty(query)) return;
-                string sep = capturedAction.Contains("?") ? "&" : "?";
-                NavigateTo(capturedAction + sep + capturedParam + "=" +
-                    Uri.EscapeDataString(query));
-            });
-            goBtn.style.height = 28f;
-            row.Add(goBtn);
-
-            // Also navigate on Enter key
-            field.RegisterCallback<KeyDownEvent>(e =>
-            {
-                if (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter)
-                {
-                    string query = field.value.Trim();
-                    if (!string.IsNullOrEmpty(query))
-                    {
-                        string sep = capturedAction.Contains("?") ? "&" : "?";
-                        NavigateTo(capturedAction + sep + capturedParam + "=" +
-                            Uri.EscapeDataString(query));
-                    }
-                }
-            });
-
-            parent.Add(row);
-        }
-
-        private static void AddVideoElement(VisualElement parent, string url, string title, bool isEmbed)
-        {
-            // Embeds (YouTube/Vimeo iframes) can't be decoded natively — show a card
-            if (isEmbed)
-            {
-                AddEmbedCard(parent, url, title);
-                return;
-            }
-
-            // ── Direct video URL → inline VideoPlayer ──
-            var container = new VisualElement();
-            container.style.marginBottom = 12f;
-            container.style.alignSelf = Align.Center;
-            container.style.maxWidth = new Length(100f, LengthUnit.Percent);
-            container.style.backgroundColor = new Color(0.04f, 0.04f, 0.06f);
-            container.style.borderTopLeftRadius    = 6f;
-            container.style.borderTopRightRadius   = 6f;
-            container.style.borderBottomLeftRadius  = 6f;
-            container.style.borderBottomRightRadius = 6f;
-            container.style.overflow = Overflow.Hidden;
-
-            // Video frame
-            var videoFrame = new VisualElement();
-            videoFrame.style.width  = 600f;
-            videoFrame.style.height = 340f;
-            videoFrame.style.backgroundColor = new Color(0.02f, 0.02f, 0.04f);
-            container.Add(videoFrame);
-
-            // Status label overlaid on frame
-            var statusLabel = new Label("Downloading video...");
-            statusLabel.style.fontSize = 12f;
-            statusLabel.style.color = new Color(0.5f, 0.5f, 0.5f);
-            statusLabel.style.unityFontStyleAndWeight = FontStyle.Italic;
-            statusLabel.style.unityTextAlign = TextAnchor.MiddleCenter;
-            statusLabel.style.position = Position.Absolute;
-            statusLabel.style.left  = 0f;
-            statusLabel.style.right = 0f;
-            statusLabel.style.top   = new Length(45f, LengthUnit.Percent);
-            videoFrame.Add(statusLabel);
-
-            MOTDVideoHost host = null;
-
-            // ── Progress bar row ──
-            var progressRow = new VisualElement();
-            progressRow.style.paddingLeft   = 10f;
-            progressRow.style.paddingRight  = 10f;
-            progressRow.style.paddingTop    = 6f;
-            progressRow.style.paddingBottom = 6f;
-            progressRow.style.backgroundColor = new Color(0.06f, 0.06f, 0.08f);
-            progressRow.style.flexDirection = FlexDirection.Row;
-            progressRow.style.alignItems    = Align.Center;
-
-            Action<float> setProgress = null;
-            AddCustomSlider(progressRow, -1f, 0f,
-                onChange: v => host?.SeekTo(v),
-                setter: out setProgress);
-
-            container.Add(progressRow);
-
-            // ── Controls bar ──
-            var controls = new VisualElement();
-            controls.style.flexDirection   = FlexDirection.Row;
-            controls.style.alignItems      = Align.Center;
-            controls.style.paddingLeft     = 8f;
-            controls.style.paddingRight    = 8f;
-            controls.style.paddingTop      = 5f;
-            controls.style.paddingBottom   = 5f;
-            controls.style.backgroundColor = new Color(0.06f, 0.06f, 0.08f);
-
-            // Play / Pause
-            var playPauseBtn = CreateStyledButton("\u23F8", new Color(0.25f, 0.25f, 0.3f), () =>
-                host?.TogglePlayPause());
-            playPauseBtn.style.paddingLeft  = 8f;
-            playPauseBtn.style.paddingRight = 8f;
-            playPauseBtn.style.height = 24f;
-            playPauseBtn.style.marginRight = 6f;
-            controls.Add(playPauseBtn);
-
-            // Time label
-            var timeLabel = new Label("0:00 / 0:00");
-            timeLabel.style.fontSize   = 11f;
-            timeLabel.style.color      = new Color(0.55f, 0.55f, 0.6f);
-            timeLabel.style.marginRight = 8f;
-            timeLabel.style.flexShrink  = 0f;
-            controls.Add(timeLabel);
-
-            // Spacer
-            var spacer = new VisualElement();
-            spacer.style.flexGrow = 1f;
-            controls.Add(spacer);
-
-            // Volume icon
-            var volIcon = new Label("Vol");
-            volIcon.style.fontSize   = 10f;
-            volIcon.style.color      = new Color(0.6f, 0.6f, 0.65f);
-            volIcon.style.marginRight = 4f;
-            volIcon.style.flexShrink  = 0f;
-            controls.Add(volIcon);
-
-            // Volume custom slider (starts at 1.0)
-            Action<float> setVolume = null;
-            AddCustomSlider(controls, 70f, 1f,
-                onChange: v => host?.SetVolume(v),
-                setter: out setVolume);
-            ((VisualElement)controls[controls.childCount - 1]).style.marginRight = 8f;
-
-            // Steam browser fallback
-            string capturedUrl = url;
-            var steamFallback = CreateStyledButton("Steam Browser", new Color(0.2f, 0.35f, 0.55f), () =>
-                TryOpenSteamBrowser(capturedUrl));
-            steamFallback.style.height    = 24f;
-            steamFallback.style.fontSize  = 11f;
-            controls.Add(steamFallback);
-
-            container.Add(controls);
-            parent.Add(container);
-
-            host = MOTDVideoHost.Create(url, _url, videoFrame, statusLabel);
-            host.ConnectControls(setProgress, t => timeLabel.text = t);
-            // Honour the user's global mute/volume — starting at 1.0 ignored the slider
-            // and the mute button until the user re-touched a control.
-            host.SetVolume(EffectiveVolume);
-            _videoHosts.Add(host);
-        }
-
-        /// <summary>
-        /// Renders a clickable card for embedded videos (YouTube, Vimeo)
-        /// that cannot be decoded by Unity's VideoPlayer.
-        /// </summary>
-        private static void AddEmbedCard(VisualElement parent, string url, string title)
-        {
-            var card = new VisualElement();
-            card.style.backgroundColor = new Color(0.08f, 0.08f, 0.12f);
-            card.style.borderTopLeftRadius    = 6f;
-            card.style.borderTopRightRadius   = 6f;
-            card.style.borderBottomLeftRadius  = 6f;
-            card.style.borderBottomRightRadius = 6f;
-            card.style.borderTopWidth    = 1f;
-            card.style.borderBottomWidth = 1f;
-            card.style.borderLeftWidth   = 1f;
-            card.style.borderRightWidth  = 1f;
-            card.style.borderTopColor    = new Color(0.3f, 0.3f, 0.4f);
-            card.style.borderBottomColor = new Color(0.3f, 0.3f, 0.4f);
-            card.style.borderLeftColor   = new Color(0.3f, 0.3f, 0.4f);
-            card.style.borderRightColor  = new Color(0.3f, 0.3f, 0.4f);
-            card.style.paddingLeft   = 14f;
-            card.style.paddingRight  = 14f;
-            card.style.paddingTop    = 12f;
-            card.style.paddingBottom = 12f;
-            card.style.marginBottom  = 12f;
-            card.style.flexDirection = FlexDirection.Row;
-            card.style.alignItems    = Align.Center;
-
-            var icon = new Label("\u25B6");
-            icon.style.fontSize = 20f;
-            icon.style.color = new Color(0.4f, 0.7f, 1f);
-            icon.style.marginRight = 12f;
-            icon.style.flexShrink = 0f;
-            card.Add(icon);
-
-            var textCol = new VisualElement();
-            textCol.style.flexGrow = 1f;
-            textCol.style.flexShrink = 1f;
-
-            string displayTitle = !string.IsNullOrEmpty(title) ? title : "Embedded Video";
-            var titleLabel = new Label(displayTitle);
-            titleLabel.style.fontSize = 13f;
-            titleLabel.style.color = new Color(0.9f, 0.9f, 0.9f);
-            titleLabel.style.unityFontStyleAndWeight = FontStyle.Bold;
-            titleLabel.style.whiteSpace = WhiteSpace.Normal;
-            textCol.Add(titleLabel);
-
-            var subLabel = new Label("Click to open in Steam browser");
-            subLabel.style.fontSize = 11f;
-            subLabel.style.color = new Color(0.5f, 0.5f, 0.55f);
-            subLabel.style.unityFontStyleAndWeight = FontStyle.Italic;
-            textCol.Add(subLabel);
-
-            card.Add(textCol);
-
-            string capturedUrl = url;
-            card.RegisterCallback<MouseDownEvent>(e => TryOpenSteamBrowser(capturedUrl));
-            card.RegisterCallback<MouseEnterEvent>(e =>
-            {
-                card.style.backgroundColor = new Color(0.12f, 0.12f, 0.18f);
-                icon.style.color = new Color(0.6f, 0.85f, 1f);
-            });
-            card.RegisterCallback<MouseLeaveEvent>(e =>
-            {
-                card.style.backgroundColor = new Color(0.08f, 0.08f, 0.12f);
-                icon.style.color = new Color(0.4f, 0.7f, 1f);
-            });
-
-            parent.Add(card);
-        }
-
-        private static VisualElement CreateCard(Color? bgColor)
-        {
-            var card = new VisualElement();
-            card.style.backgroundColor = bgColor ?? new Color(0.14f, 0.14f, 0.17f);
-            card.style.borderTopLeftRadius    = 6f;
-            card.style.borderTopRightRadius   = 6f;
-            card.style.borderBottomLeftRadius  = 6f;
-            card.style.borderBottomRightRadius = 6f;
-            card.style.borderTopWidth    = 1f;
-            card.style.borderBottomWidth = 1f;
-            card.style.borderLeftWidth   = 1f;
-            card.style.borderRightWidth  = 1f;
-            card.style.borderTopColor    = new Color(0.25f, 0.25f, 0.3f);
-            card.style.borderBottomColor = new Color(0.25f, 0.25f, 0.3f);
-            card.style.borderLeftColor   = new Color(0.25f, 0.25f, 0.3f);
-            card.style.borderRightColor  = new Color(0.25f, 0.25f, 0.3f);
-            card.style.paddingLeft   = 16f;
-            card.style.paddingRight  = 16f;
-            card.style.paddingTop    = 12f;
-            card.style.paddingBottom = 12f;
-            card.style.marginBottom  = 12f;
-            return card;
-        }
-
         /// <summary>
         /// Custom slider built from plain VisualElements — fully styled, works in all Unity versions.
         /// width &lt; 0 means flexGrow=1 (fill available space).
@@ -4380,16 +3296,6 @@ namespace WebsiteMOTD
             });
 
             parent.Add(track);
-        }
-
-        private static void AddSeparator(VisualElement parent)
-        {
-            var line = new VisualElement();
-            line.style.height = 1f;
-            line.style.backgroundColor = new Color(0.3f, 0.3f, 0.35f);
-            line.style.marginTop    = 12f;
-            line.style.marginBottom = 12f;
-            parent.Add(line);
         }
 
         private static Button CreateStyledButton(string text, Color accentColor, Action onClick)

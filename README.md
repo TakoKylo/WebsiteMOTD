@@ -2,8 +2,8 @@
 
 A Puck mod that shows a webpage when you join a server and lets players queue
 videos/streams onto shared in-game screens. Server admins can point it at any
-URL; clients get a built-in browser overlay with video/GIF playback, a URL
-bar, a trusted-sites prompt, and WebView2-backed rendering for JS-heavy pages.
+URL; clients get a built-in browser overlay with a URL bar, a trusted-sites
+prompt, and WebView2-backed rendering of the page.
 
 ## What's in this repo
 
@@ -11,8 +11,7 @@ bar, a trusted-sites prompt, and WebView2-backed rendering for JS-heavy pages.
   - [Plugin.cs](src/Plugin.cs) — entry point, netcode wiring, shared-queue server logic, chat commands.
   - [Config.cs](src/Config.cs) — `ServerConfig` (server-only JSON) and `ClientConfig` (client-only JSON).
   - [MOTDUI.cs](src/MOTDUI.cs) — the full-screen overlay: URL bar, back/forward, queue panel, settings, mute, zoom.
-  - [MOTDWebView.cs](src/MOTDWebView.cs) — WebView2 host for rendering modern web pages inside the overlay.
-  - [MOTDHtmlRenderer.cs](src/MOTDHtmlRenderer.cs) — lightweight fallback renderer (text/images/video tags) for when WebView2 isn't available.
+  - [MOTDWebView.cs](src/MOTDWebView.cs) — WebView2 host for rendering web pages inside the overlay.
   - [MOTDWorldScreen.cs](src/MOTDWorldScreen.cs) — the 3D in-world screens that play whatever the queue is showing.
 - **[libs/](libs/)** — Puck game DLLs referenced at build time (not copied into the output).
 - **[native/](native/)** — WebView2 native binaries, copied next to the built DLL.

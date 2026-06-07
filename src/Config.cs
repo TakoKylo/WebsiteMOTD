@@ -425,8 +425,8 @@ namespace WebsiteMOTD
         }
 
         /// <summary>
-        /// Persist all four UI settings in a single disk write. Cheaper than
-        /// setting each property individually (each setter would Save() on its own).
+        /// Persist all UI settings in a single disk write. Cheaper than setting
+        /// each property individually (each setter would Save() on its own).
         /// </summary>
         public static void SaveSettings(float volume, bool muted, bool screensDisabled, float zoom,
                                         int captureFps, float resolutionScale)
@@ -436,7 +436,10 @@ namespace WebsiteMOTD
             _data.muted                   = muted;
             _data.screens_disabled        = screensDisabled;
             _data.zoom                    = Mathf.Clamp(zoom, 0.5f, 2.0f);
-            _data.screen_capture_fps      = Mathf.Clamp(captureFps, 10, 60);
+            // Must match the 30–140 range used by the getter, loader, UI slider, and
+            // ApplyCaptureFps. The old 10–60 clamp silently capped any saved value at
+            // 60, so a user who picked a higher fps got it live but lost it on reload.
+            _data.screen_capture_fps      = Mathf.Clamp(captureFps, 30, 140);
             _data.screen_resolution_scale = Mathf.Clamp(resolutionScale, 0.4f, 1.0f);
             Save();
         }

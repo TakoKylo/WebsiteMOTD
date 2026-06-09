@@ -596,19 +596,18 @@ namespace WebsiteMOTD
 
                 if (!IsDedicatedServer())
                 {
-                    // Suppress the auto-overlay only when OpenWorldPracticeMod is
-                    // loaded — OWP's welcome panel pops on join and now hosts a
-                    // "MOTD" button (registered from Plugin.Setup via
-                    // OWPUIBridge), so two stacked overlays would be redundant.
-                    // F2 / chat /web / /motd still open the overlay normally —
-                    // this only changes the unsolicited-on-join behaviour, not
-                    // the user-driven entry points.
-                    if (!OWPUIBridge.ApiPresent)
+                    // Suppress the auto-overlay when the player has opted out (denied
+                    // the MOTD before) OR when OpenWorldPracticeMod is loaded — OWP's
+                    // welcome panel pops on join and hosts a "MOTD" button (registered
+                    // from Plugin.Setup via OWPUIBridge), so two stacked overlays would
+                    // be redundant. F2 / chat /web / /motd still open the overlay
+                    // normally — this only changes the unsolicited-on-join behaviour.
+                    if (!MOTDUI.IsOptedOut && !OWPUIBridge.ApiPresent)
                         MOTDUI.Show(url);
-                    // Always call LoadCurrentOnWorldScreens — it handles both the
-                    // server-enabled path and the theatre-claim path internally, so
-                    // OpenWorld's TheatreVideoScreen still gets content when the
-                    // server has level screens disabled.
+                    // Always call LoadCurrentOnWorldScreens — it handles the
+                    // server-enabled, theatre-claim, AND opt-out paths internally, so
+                    // OpenWorld's TheatreVideoScreen still gets content when the server
+                    // has level screens disabled, and opted-out clients get nothing.
                     LoadCurrentOnWorldScreens();
                 }
             }
@@ -1322,10 +1321,31 @@ namespace WebsiteMOTD
             ServerBroadcastQueueState();
         }
 
+        /// <summary>
+        /// Re-evaluate the local client's in-world screens/theatre. Public so the UI
+        /// can apply an opt-out change immediately: denying tears everything down,
+        /// opening a site respawns it on the next call.
+        /// </summary>
+        internal static void RefreshWorldScreens() => LoadCurrentOnWorldScreens();
+
         private static void LoadCurrentOnWorldScreens()
         {
             // Dedicated servers have no renderer — skip entirely
             if (IsDedicatedServer()) return;
+
+            // Opted-out players (denied the MOTD) get no in-world web content at all —
+            // no rink screens, no OpenWorld theatre claim, no queued videos. Tear down
+            // anything already spawned and bail. Resetting _lastLoadedWorldUrl forces a
+            // fresh load if they later opt back in by opening a site.
+            if (MOTDUI.IsOptedOut)
+            {
+                if (MOTDWorldScreen.IsActive)
+                {
+                    MOTDWorldScreen.DestroyScreens();
+                    _lastLoadedWorldUrl = null;
+                }
+                return;
+            }
 
             // Theatre claim policy: ONLY hold the OpenWorld theatre while we
             // have actual queue content to display. The A/B level screens fall

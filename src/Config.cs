@@ -345,6 +345,12 @@ namespace WebsiteMOTD
         public float zoom = 1.0f;
         public List<string> trusted_sites = new List<string>();
 
+        // Set true when the player clicks "Deny" on the MOTD join dialog. Opted-out
+        // players get no auto-overlay on join AND no in-world web content at all (no
+        // rink screens, no OpenWorld theatre claim, no queued videos). Cleared the
+        // next time they choose to open a site. Persisted so the choice sticks.
+        public bool opted_out = false;
+
         // ── World/theatre video tuning (smoothness ↔ sharpness/CPU) ──
         // Target capture rate for the in-world video screens. The native plugin
         // captures on a fixed-cadence loop at this rate (even pacing kills the
@@ -382,6 +388,17 @@ namespace WebsiteMOTD
         {
             get { EnsureLoaded(); return _data.screens_disabled; }
             set { EnsureLoaded(); _data.screens_disabled = value; Save(); }
+        }
+
+        /// <summary>
+        /// True if the player denied the MOTD on the join confirmation dialog.
+        /// Opted-out clients get no auto-overlay on join and no in-world
+        /// screens/theatre/queue content. Cleared when they next open a site.
+        /// </summary>
+        public static bool OptedOut
+        {
+            get { EnsureLoaded(); return _data.opted_out; }
+            set { EnsureLoaded(); _data.opted_out = value; Save(); }
         }
 
         public static float Zoom

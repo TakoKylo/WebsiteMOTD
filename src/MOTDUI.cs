@@ -57,6 +57,10 @@ namespace WebsiteMOTD
         private static float _globalVolume = 0.5f;
         private static bool _isMuted;
         private static bool _screensDisabled;
+        // Persistent opt-out: set by clicking "Deny" on the join dialog, cleared by
+        // opening a site. While true the client gets no auto-overlay on join and no
+        // in-world screens/theatre/queue content. Mirrors ClientConfig.OptedOut.
+        private static bool _optedOut;
         private static Action<float> _volumeSliderSetter;
         private static Button _muteBtn;
         private static Button _screenToggleBtn;
@@ -168,6 +172,11 @@ namespace WebsiteMOTD
         /// </summary>
         private static void ShowConfirmed(string url)
         {
+            // Choosing to view a site clears any prior opt-out (deny) so the in-world
+            // screens/theatre come back. Covers both the trusted-domain fast path and
+            // the "Open Website" button, since both land here.
+            SetOptedOut(false);
+
             if (!MOTDWebView.IsSupportedPlatform())
             {
                 Plugin.Log("Opening MOTD in Steam overlay (native WebView unavailable on this platform): " + url);
@@ -601,6 +610,8 @@ namespace WebsiteMOTD
             if (_confirmOverlay != null)
             {
                 Plugin.Log("ESC pressed — denying MOTD confirmation dialog.");
+                // ESC-dismiss is a deny: opt out of web content, same as the Deny button.
+                SetOptedOut(true);
                 _confirmOverlay.RemoveFromHierarchy();
                 _confirmOverlay = null;
                 if (!_isVisible)
@@ -1969,6 +1980,7 @@ namespace WebsiteMOTD
             _zoomLevel             = ClientConfig.Zoom;
             _screenCaptureFps      = ClientConfig.CaptureFps;
             _screenResolutionScale = ClientConfig.ScreenResolutionScale;
+            _optedOut              = ClientConfig.OptedOut;
             _settingsLoaded        = true;
             Plugin.Log("MOTD settings loaded from ClientMOTD.json.");
         }
@@ -1977,6 +1989,33 @@ namespace WebsiteMOTD
         public static bool ScreensDisabled
         {
             get { EnsureSettingsLoaded(); return _screensDisabled; }
+        }
+
+        /// <summary>
+        /// True if the player opted out of all MOTD web content by denying the join
+        /// dialog. Read by Plugin to suppress the auto-overlay and the in-world
+        /// screens/theatre. False on dedicated servers (no client config).
+        /// </summary>
+        public static bool IsOptedOut
+        {
+            get { EnsureSettingsLoaded(); return _optedOut; }
+        }
+
+        /// <summary>
+        /// Persist a new opt-out state and apply it immediately. Denying tears down any
+        /// live in-world screens/theatre; opening a site respawns them on the next
+        /// world-screen refresh. No-op if the state is unchanged.
+        /// </summary>
+        private static void SetOptedOut(bool value)
+        {
+            EnsureSettingsLoaded();
+            if (_optedOut == value) return;
+            _optedOut = value;
+            ClientConfig.OptedOut = value; // persists to ClientMOTD.json
+            Plugin.Log(value
+                ? "MOTD opt-out enabled — suppressing in-world screens/theatre."
+                : "MOTD opt-out cleared — restoring in-world screens/theatre.");
+            Plugin.RefreshWorldScreens();
         }
 
         private static void SaveSettings()
@@ -2176,6 +2215,10 @@ namespace WebsiteMOTD
             var denyBtn = CreateStyledButton("Deny", new Color(0.5f, 0.2f, 0.2f), () =>
             {
                 Plugin.Log("User denied MOTD for: " + url);
+                // Denying opts the player out of ALL MOTD web content: no auto-overlay
+                // on future joins, and the in-world screens/theatre are torn down now.
+                // Persisted until they choose to open a site again.
+                SetOptedOut(true);
                 _confirmOverlay?.RemoveFromHierarchy();
                 _confirmOverlay = null;
                 if (!_isVisible)

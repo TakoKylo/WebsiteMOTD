@@ -150,6 +150,15 @@ namespace WebsiteMOTD
         /// <summary>True if we currently hold the OpenWorld theatre screen claim.</summary>
         public static bool HasTheatreScreen => _theatreScreen != null && _theatreRenderer != null;
 
+        /// <summary>
+        /// True if any in-world web content is currently live — the A/B rink screens,
+        /// the headless driver, the shared WebView, or a held theatre claim. Lets the
+        /// opt-out path know whether there's anything to tear down.
+        /// </summary>
+        public static bool IsActive =>
+            _screenA != null || _screenB != null || _driver != null
+            || _sharedWebView != IntPtr.Zero || _theatreScreen != null;
+
         // ─── Static API ─────────────────────────────────────────────
 
         /// <summary>

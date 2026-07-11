@@ -233,11 +233,25 @@ namespace WebsiteMOTD
             if (_preloadAttempted) return false;
             _preloadAttempted = true;
 
+            // Single crash-safety / kill-switch chokepoint. Blocks native bring-up
+            // when a prior session crashed, the WebView2 runtime is missing, or the
+            // user disabled it — callers fall back to the Steam overlay. See WebViewGate.
+            if (!WebViewGate.Allowed)
+            {
+                Plugin.Log("WebView disabled: " + WebViewGate.DisabledReason + " — using Steam overlay fallback.");
+                return false;
+            }
+
             if (!IsSupportedPlatform())
             {
                 Plugin.Log("WebView mode skipped: native plugin is Windows-only (platform: " + Application.platform + ").");
                 return false;
             }
+
+            // Drop the crash sentinel right before we touch native code. If the
+            // process dies during WebView bring-up, the next launch sees it and
+            // enters safe-mode. Cleared on clean shutdown (WebViewGate.MarkCleanShutdown).
+            WebViewGate.MarkNativeInitStarting();
 
             // Try multiple paths where the mod might ship the DLL
             string[] searchPaths = new[]
@@ -275,6 +289,17 @@ namespace WebsiteMOTD
 
             Plugin.LogError("WebView.dll not found in any search path. WebView mode unavailable.");
             return false;
+        }
+
+        /// <summary>
+        /// Clear the one-shot "preload already attempted" latch so a fresh
+        /// <see cref="PreloadNativeDLL"/> can run after the user re-enables the
+        /// WebView mid-session (/motd webview on). Keeps <c>_nativeLoaded</c> if the
+        /// DLL was already loaded successfully — only the failed/blocked attempt retries.
+        /// </summary>
+        public static void ResetPreloadForRetry()
+        {
+            if (!_nativeLoaded) _preloadAttempted = false;
         }
 
         // ─── Factory ────────────────────────────────────────────────

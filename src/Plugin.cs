@@ -225,6 +225,11 @@ namespace WebsiteMOTD
             }
             else
             {
+                // Evaluate the WebView crash-safety gate first: detects a prior-session
+                // crash (safe-mode), checks the WebView2 runtime, and hooks clean-quit
+                // sentinel clearing — before anything tries to spawn a WebView.
+                WebViewGate.Initialize();
+
                 // Load client config eagerly. Without this, screens spawned by
                 // LoadCurrentOnWorldScreens (triggered by the MOTD/state message
                 // on connect, before any user interaction) would ignore the saved
@@ -373,6 +378,11 @@ namespace WebsiteMOTD
             TheatreVideoScreenBridge.ResetCachedState();
             OWPUIBridge.ResetCachedState();
 
+            // Plugin disable is a clean shutdown of the WebView: clear the crash
+            // sentinel + quit hook so it isn't mistaken for a crash, and let a
+            // re-enable re-evaluate the gate from scratch.
+            WebViewGate.OnPluginTeardown();
+
             OnQueueChanged?.Invoke();
         }
 
@@ -384,6 +394,13 @@ namespace WebsiteMOTD
             InitializeMessaging();
 
             var nm = NetworkManager.Singleton;
+
+            // Let the local player know (once) if the in-game browser is off — e.g.
+            // safe-mode after a crash or a missing WebView2 runtime — so the Steam
+            // overlay fallback isn't a silent surprise.
+            if (nm != null && clientId == nm.LocalClientId && !IsDedicatedServer())
+                WebViewGate.NotifyDisabledOnce(onConnect: true);
+
             if (nm != null && nm.IsServer)
             {
                 // Listen host: pull in config/ServerMOTD.json before we tell any
@@ -1337,7 +1354,11 @@ namespace WebsiteMOTD
             // no rink screens, no OpenWorld theatre claim, no queued videos. Tear down
             // anything already spawned and bail. Resetting _lastLoadedWorldUrl forces a
             // fresh load if they later opt back in by opening a site.
-            if (MOTDUI.IsOptedOut)
+            // No in-world web content when the player opted out OR the WebView is
+            // gated off (crash safe-mode / missing runtime / kill switch). Both tear
+            // down anything already spawned — the theatre claim is released too, so a
+            // safe-mode client hands OWP's screen back instead of leaving it black.
+            if (MOTDUI.IsOptedOut || !WebViewGate.Allowed)
             {
                 if (MOTDWorldScreen.IsActive)
                 {
@@ -1849,6 +1870,14 @@ namespace WebsiteMOTD
 
             if (cmd == "/web" || cmd == "/motd" || cmd == "/browser")
             {
+                // Sub-command: /motd webview [on|off]  → toggle the native in-game
+                // browser (crash kill switch). Anything else opens the page.
+                string argLower = arg.ToLowerInvariant();
+                if (argLower == "webview" || argLower.StartsWith("webview "))
+                {
+                    WebViewGate.HandleChatToggle(arg.Length > 7 ? arg.Substring(7).Trim() : "");
+                    return false;
+                }
                 MOTDUI.Show(string.IsNullOrEmpty(arg) ? Plugin.MOTD_URL : arg);
                 return false;
             }

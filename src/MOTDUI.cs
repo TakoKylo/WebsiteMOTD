@@ -177,9 +177,20 @@ namespace WebsiteMOTD
             // the "Open Website" button, since both land here.
             SetOptedOut(false);
 
-            if (!MOTDWebView.IsSupportedPlatform())
+            // Steam-overlay fallback covers BOTH unsupported platforms (Linux/macOS)
+            // AND a gate-disabled WebView on Windows (crash safe-mode, missing
+            // WebView2 runtime, or the user turned it off). In every case there's no
+            // inline renderer, so hand the page to the Steam overlay.
+            if (!MOTDWebView.IsSupportedPlatform() || !WebViewGate.Allowed)
             {
-                Plugin.Log("Opening MOTD in Steam overlay (native WebView unavailable on this platform): " + url);
+                string why = !MOTDWebView.IsSupportedPlatform()
+                    ? "native WebView unavailable on this platform"
+                    : WebViewGate.DisabledReason;
+                Plugin.Log("Opening MOTD in Steam overlay (" + why + "): " + url);
+                // Tell the player why the in-game browser didn't open + how to fix it
+                // (nothing actionable on unsupported platforms, so skip there).
+                if (MOTDWebView.IsSupportedPlatform())
+                    WebViewGate.NotifyDisabledOnce();
                 TryOpenSteamBrowser(url);
                 // Nothing is shown in-game, so make sure the ESC poller doesn't linger
                 // (the confirm-dialog "Open Website" path leaves it running until Hide).

@@ -362,6 +362,15 @@ namespace WebsiteMOTD
         // drop to e.g. 0.67 (→1280×720) on weaker CPUs to give each capture more
         // headroom and hold the target fps. Clamped 0.4–1.0.
         public float screen_resolution_scale = 1.0f;
+
+        // ── Native WebView kill switch + crash recovery (see WebViewGate) ──
+        // Master on/off for the native in-game browser. When false, every page
+        // opens in the Steam overlay instead. Toggled live via /motd webview on|off,
+        // and flipped off automatically after repeated crashes.
+        public bool webview_enabled = true;
+        // Consecutive prior-session crashes detected while the WebView was live.
+        // Reset to 0 after one clean session; drives the auto-disable escalation.
+        public int webview_crash_count = 0;
     }
 
     /// <summary>
@@ -417,6 +426,20 @@ namespace WebsiteMOTD
         public static float ScreenResolutionScale
         {
             get { EnsureLoaded(); return Mathf.Clamp(_data.screen_resolution_scale, 0.4f, 1.0f); }
+        }
+
+        /// <summary>Master on/off for the native in-game browser (WebViewGate).</summary>
+        public static bool WebViewEnabled
+        {
+            get { EnsureLoaded(); return _data.webview_enabled; }
+            set { EnsureLoaded(); if (_data.webview_enabled != value) { _data.webview_enabled = value; Save(); } }
+        }
+
+        /// <summary>Consecutive prior-session WebView crashes detected (WebViewGate).</summary>
+        public static int WebViewCrashCount
+        {
+            get { EnsureLoaded(); return _data.webview_crash_count; }
+            set { EnsureLoaded(); if (_data.webview_crash_count != value) { _data.webview_crash_count = value; Save(); } }
         }
 
         public static bool IsTrusted(string domain)
